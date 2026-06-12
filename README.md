@@ -9,7 +9,8 @@ Runs entirely client-side — no backend — so it can be hosted on GitHub Pages
 - Pipe tool with waypoints — each pipe has a size (1.5"–4", labeled on the pipe, stroke scales with size) and a color-coded type (suction, return/pressure, feature, gas, drain). Pipes stay attached to components when they move.
 - Editable labels on everything; select, rotate, duplicate, delete.
 - Projects: name + client/address, autosave to localStorage, multi-project list (open/rename/delete), JSON export/import.
-- PDF export (jsPDF): landscape letter plan sheet with title block, fitted diagram, and a legend of pipe types/sizes and component keys.
+- PDF export (jsPDF): landscape letter plan sheet with title block, fitted diagram, direction arrowheads on each pipe, and a legend of pipe types/sizes and component keys.
+- **Flow mode** (toolbar wave/Flow toggle): animates water moving along every active pipe in its flow direction (moving dashes via CSS `stroke-dashoffset`), with direction arrowheads. Tap a pipe in flow mode to toggle it active/inactive (dimmed = off) for demoing scenarios like "suction from pool, return to spa". Reverse a pipe's direction from the pipe inspector. The spillover cascades animated wavefronts when an active return pipe ends at the Spa/spillover (auto-detected), or tap the spillover to toggle it manually. The pump shows a spinning rotor + pulse so the pad reads as running. Active/direction state is saved with the project; old projects load fine (default direction = draw order, active = on). Respects `prefers-reduced-motion`.
 
 ## Run locally
 Just open `index.html`, or serve the folder:

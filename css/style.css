@@ -327,7 +327,11 @@ input,select,textarea{font:inherit;color:inherit}
 }
 @media (max-width:560px){
   .brand-text{display:none}
+  /* keep the Flow toggle icon visible; hide only its text label */
+  .btn-flow span{display:none}
+  .btn-flow{width:44px;padding:0}
   .topbar-actions .btn span,.btn#btnProjects{display:none}
+  .btn{min-height:44px}
   .project-meta{margin-left:var(--space-2)}
   .inspector{width:100vw;min-width:0}
 }
