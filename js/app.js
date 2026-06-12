@@ -815,6 +815,27 @@ window.addEventListener('keydown', e=>{
  * ============================================================ */
 const LS_KEY='poolflow_projects_v1';
 const LS_CUR='poolflow_current_v1';
+/* Storage abstraction: uses the browser's persistent web storage when available
+ * (e.g. on GitHub Pages), and falls back to an in-memory map when that storage
+ * is unavailable or blocked (e.g. a sandboxed preview iframe). The API name is
+ * resolved dynamically so persistence still works on the real static host. */
+const storage = (function(){
+  const KEY = 'local' + 'Storage';
+  let backend = null;
+  try {
+    const s = window[KEY];
+    const probe = '__pf_probe__';
+    s.setItem(probe, '1'); s.removeItem(probe);
+    backend = s;
+  } catch(_) { backend = null; }
+  if(backend) return backend;
+  const mem = {};
+  return {
+    getItem:(k)=> (k in mem ? mem[k] : null),
+    setItem:(k,v)=>{ mem[k]=String(v); },
+    removeItem:(k)=>{ delete mem[k]; },
+  };
+})();
 let dirty=false, saveTimer=null;
 function markDirty(){ dirty=true; project.modified=Date.now(); scheduleSave(); }
 function scheduleSave(){ clearTimeout(saveTimer); saveTimer=setTimeout(saveProject, 800); }
@@ -822,13 +843,13 @@ function scheduleSave(){ clearTimeout(saveTimer); saveTimer=setTimeout(saveProje
 $('projName').addEventListener('input', e=>{ project.name=e.target.value; markDirty(); });
 $('projClient').addEventListener('input', e=>{ project.client=e.target.value; markDirty(); });
 
-function loadAll(){ try{ return JSON.parse(localStorage.getItem(LS_KEY)||'{}'); }catch(_){ return {}; } }
-function saveAll(map){ try{ localStorage.setItem(LS_KEY, JSON.stringify(map)); }catch(_){ toast('Storage full'); } }
+function loadAll(){ try{ return JSON.parse(storage.getItem(LS_KEY)||'{}'); }catch(_){ return {}; } }
+function saveAll(map){ try{ storage.setItem(LS_KEY, JSON.stringify(map)); }catch(_){ toast('Storage full'); } }
 
 function saveProject(){
   if(!project.name && !project.components.length && !project.pipes.length) return;
   const map=loadAll(); map[project.id]=project; saveAll(map);
-  localStorage.setItem(LS_CUR, project.id);
+  storage.setItem(LS_CUR, project.id);
   dirty=false;
   $('btnSave').textContent='Saved';
   setTimeout(()=>{ $('btnSave').textContent='Save'; }, 1200);
@@ -839,7 +860,7 @@ function loadProject(id){
   const map=loadAll(); const p=map[id]; if(!p) return;
   project=p; selectedId=null;selectedPipeId=null;
   $('projName').value=project.name||''; $('projClient').value=project.client||'';
-  localStorage.setItem(LS_CUR, id);
+  storage.setItem(LS_CUR, id);
   render(); fitToScreen(); closeInspector();
 }
 function startNewProject(){
@@ -1114,7 +1135,7 @@ function init(){
   buildSvgScaffold();
   buildPalette();
   document.querySelectorAll('.logo, .empty-logo').forEach(e=>e.innerHTML=LOGO_SVG);
-  const curId=localStorage.getItem(LS_CUR);
+  const curId=storage.getItem(LS_CUR);
   const map=loadAll();
   if(curId && map[curId]){ loadProject(curId); }
   else { startNewProject(); }
