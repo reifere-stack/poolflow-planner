@@ -29,6 +29,10 @@
     </div>
 
     <div class="topbar-actions">
+      <button id="btnFlow" class="btn btn-flow" title="Toggle flow animation view" aria-pressed="false">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8c2.5 0 2.5 2 5 2s2.5-2 5-2 2.5 2 5 2"/><path d="M3 14c2.5 0 2.5 2 5 2s2.5-2 5-2 2.5 2 5 2"/></svg>
+        <span>Flow</span>
+      </button>
       <button id="btnProjects" class="btn" title="Projects">Projects</button>
       <button id="btnSave" class="btn" title="Save now">Save</button>
       <button id="btnExportPdf" class="btn btn-accent" title="Export PDF plan sheet">Export PDF</button>
@@ -79,6 +83,11 @@
       <div id="pipeHint" class="pipe-hint" hidden>
         Tap a component to start, tap to add bends, tap a component to finish &middot;
         <button id="pipeCancel" class="link-btn">Cancel</button>
+      </div>
+
+      <!-- Flow mode hint -->
+      <div id="flowHint" class="flow-hint" hidden>
+        <span class="flow-dot"></span>Flow mode &middot; tap a pipe to toggle it on/off &middot; tap the spillover to toggle its cascade
       </div>
 
       <!-- Empty state -->

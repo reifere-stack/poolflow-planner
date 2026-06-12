@@ -12,6 +12,7 @@ let project = newProject();
 let view = { x:0, y:0, scale:1 };   // pan offset (world->screen): screen = world*scale + (x,y)
 let snap = true;
 let tool = 'select';                // select | pipe | hand
+let flowMode = false;               // when true, render the animated water-flow view
 let selectedId = null;
 let selectedPipeId = null;
 let uidCounter = 1;
@@ -22,8 +23,22 @@ function newProject(){
     id: 'proj_'+Date.now().toString(36),
     name:'', client:'', contractor:'',
     components:[], pipes:[],
+    spillState:{},   // {componentId: true|false} manual spillover animation overrides
     created: Date.now(), modified: Date.now(),
   };
+}
+
+/* Backward-compatible migration: old saved/imported projects predate the flow
+ * schema. Default each pipe to draw-order direction (reversed=false) and active=true. */
+function migrateProject(p){
+  if(!p) return p;
+  if(!Array.isArray(p.pipes)) p.pipes=[];
+  for(const pipe of p.pipes){
+    if(typeof pipe.reversed!=='boolean') pipe.reversed=false;
+    if(typeof pipe.active!=='boolean') pipe.active=true;
+  }
+  if(!p.spillState || typeof p.spillState!=='object') p.spillState={};
+  return p;
 }
 
 /* ---------- DOM refs ---------- */
@@ -131,8 +146,67 @@ function renderComponents(){
 
     if(def.kind==='shape'){ drawShape(g, c, def); }
     else { drawFitting(g, c, def); }
+
+    // ---- Flow-mode component accents ----
+    if(flowMode){
+      if(c.type==='pump'){ g.classList.add('pump-running'); decoratePump(g, c); }
+      if(c.type==='spillover' && spilloverActive(c)){ decorateSpillover(g, c); }
+    }
     compsG.appendChild(g);
   }
+}
+
+/* Should a spillover animate? Manual override wins; otherwise auto-detect when at
+ * least one active return-type pipe ends at this spillover or at a Spa component. */
+function spilloverActive(c){
+  const manual = project.spillState ? project.spillState[c.id] : undefined;
+  if(manual===true) return true;
+  if(manual===false) return false;
+  return autoSpillover();
+}
+function autoSpillover(){
+  // any active return/feature pipe whose endpoint touches a Spa or a Spillover
+  const spaIds = new Set(project.components.filter(x=>x.type==='spa').map(x=>x.id));
+  const spillIds = new Set(project.components.filter(x=>x.type==='spillover').map(x=>x.id));
+  for(const p of project.pipes){
+    if(p.active===false) continue;
+    if(p.type!=='return' && p.type!=='feature') continue;
+    const ends=[p.from.compId, p.to.compId];
+    if(ends.some(id=> id && (spaIds.has(id)||spillIds.has(id)))) return true;
+  }
+  return false;
+}
+
+/* Pump: spinning rotor + pulsing ring so the pad reads as "running". */
+function decoratePump(g, c){
+  const box = EQUIP_BOX;
+  // pulsing ring around the pump box
+  const ring = el('circle');
+  ring.setAttribute('cx', c.x); ring.setAttribute('cy', c.y); ring.setAttribute('r', box*0.62);
+  ring.setAttribute('class','pump-ring');
+  g.appendChild(ring);
+  // small spinning rotor accent over the impeller
+  const rotor = el('g'); rotor.setAttribute('class','pump-rotor');
+  rotor.setAttribute('transform', `translate(${c.x-6} ${c.y-3})`);
+  rotor.innerHTML = `<g transform="scale(0.5)"><path d="M0 0 L9 3 L0 6 Z" fill="#3fd0e0"/><path d="M0 0 L-3 9 L-6 0 Z" fill="#3fd0e0"/><path d="M0 0 L-9 -3 L0 -6 Z" fill="#3fd0e0"/><path d="M0 0 L3 -9 L6 0 Z" fill="#3fd0e0"/></g>`;
+  g.appendChild(rotor);
+}
+
+/* Spillover: animated wavefronts cascading from spa toward pool. */
+function decorateSpillover(g, c){
+  const box = FITTING_BOX;
+  const grp = el('g'); grp.setAttribute('class','spill-cascade');
+  const w = box*0.9;
+  for(let i=0;i<3;i++){
+    const wave = el('path');
+    const y = c.y + box*0.4;
+    wave.setAttribute('d', `M ${c.x-w/2} ${y} q ${w/4} 6 ${w/2} 0 q ${w/4} -6 ${w/2} 0`);
+    wave.setAttribute('class','spill-wave');
+    wave.setAttribute('stroke-width', 2.2);
+    wave.style.animationDelay = (i*0.5)+'s';
+    grp.appendChild(wave);
+  }
+  g.appendChild(grp);
 }
 
 function drawShape(g, c, def){
@@ -249,6 +323,44 @@ function edgePoint(c, toward){
   return { x:ctr.x+dx*s, y:ctr.y+dy*s };
 }
 
+/* lighten a hex color toward white for the moving water highlight */
+function flowHighlight(hex){
+  const h=hex.replace('#','');
+  const r=parseInt(h.slice(0,2),16), g=parseInt(h.slice(2,4),16), b=parseInt(h.slice(4,6),16);
+  const mix=(c)=>Math.round(c+(255-c)*0.62);
+  return `rgb(${mix(r)},${mix(g)},${mix(b)})`;
+}
+
+/* Directed point list: forward = draw order (from->to); reversed flips it. */
+function directedPoints(p){
+  const pts = pipePoints(p);
+  return p.reversed ? pts.slice().reverse() : pts;
+}
+/* total polyline length */
+function polyLen(pts){ let L=0; for(let i=0;i<pts.length-1;i++) L+=Math.hypot(pts[i+1].x-pts[i].x, pts[i+1].y-pts[i].y); return L; }
+/* point + unit direction at a fractional distance t (0..1) along the polyline */
+function pointAt(pts, t){
+  const total = polyLen(pts); if(total<=0) return {x:pts[0].x, y:pts[0].y, ux:1, uy:0};
+  let target = t*total, acc=0;
+  for(let i=0;i<pts.length-1;i++){
+    const dx=pts[i+1].x-pts[i].x, dy=pts[i+1].y-pts[i].y, seg=Math.hypot(dx,dy);
+    if(acc+seg>=target || i===pts.length-2){
+      const f = seg>0 ? (target-acc)/seg : 0;
+      const u = seg>0 ? {x:dx/seg, y:dy/seg} : {x:1,y:0};
+      return { x:pts[i].x+dx*f, y:pts[i].y+dy*f, ux:u.x, uy:u.y };
+    }
+    acc+=seg;
+  }
+  const last=pts[pts.length-1]; return {x:last.x, y:last.y, ux:1, uy:0};
+}
+/* build an arrowhead triangle path centered at (x,y) pointing along (ux,uy) */
+function arrowPath(x,y,ux,uy,size){
+  const bx=x-ux*size, by=y-uy*size;            // back-center
+  const px=-uy, py=ux;                          // perpendicular
+  const w=size*0.62;
+  return `M ${x} ${y} L ${bx+px*w} ${by+py*w} L ${bx-px*w} ${by-py*w} Z`;
+}
+
 function renderPipes(){
   pipesG.innerHTML = '';
   for(const p of project.pipes){
@@ -256,6 +368,8 @@ function renderPipes(){
     const tdef = PIPE_TYPES[p.type];
     const d = pts.map((pt,i)=>(i?'L':'M')+pt.x+' '+pt.y).join(' ');
     const g = el('g'); g.setAttribute('data-pipe', p.id);
+    const inactive = flowMode && p.active===false;
+    if(inactive) g.classList.add('pipe-inactive');
 
     // hit area
     const hit = el('path'); hit.setAttribute('d', d); hit.setAttribute('class','pipe-hit'); hit.setAttribute('stroke-width', 18);
@@ -267,6 +381,31 @@ function renderPipes(){
     path.setAttribute('stroke-linejoin','round'); path.setAttribute('stroke-linecap','round');
     if(tdef.dash) path.setAttribute('stroke-dasharray', tdef.dash);
     g.appendChild(path);
+
+    // ---- Flow mode: animated water highlight + direction arrowheads ----
+    if(flowMode && p.active!==false){
+      const dPts = directedPoints(p);
+      const dd = dPts.map((pt,i)=>(i?'L':'M')+pt.x+' '+pt.y).join(' ');
+      const anim = el('path'); anim.setAttribute('d', dd);
+      anim.setAttribute('class','flow-anim'+(p.reversed?' rev':''));
+      anim.setAttribute('stroke', flowHighlight(tdef.color));
+      anim.setAttribute('stroke-width', Math.max(1.6, pipeStrokeWidth(p.size)*0.55));
+      anim.setAttribute('stroke-dasharray', '4 24');
+      g.appendChild(anim);
+      // arrowheads along the path (in flow direction)
+      const total = polyLen(dPts);
+      const asz = 6 + pipeStrokeWidth(p.size)*0.6;
+      const count = Math.max(1, Math.min(8, Math.round(total/110)));
+      for(let i=1;i<=count;i++){
+        const t = i/(count+1);
+        const a = pointAt(dPts, t);
+        const ar = el('path');
+        ar.setAttribute('d', arrowPath(a.x, a.y, a.ux, a.uy, asz));
+        ar.setAttribute('class','flow-arrow');
+        ar.setAttribute('fill', tdef.color);
+        g.appendChild(ar);
+      }
+    }
 
     // endpoint dots
     [pts[0], pts[pts.length-1]].forEach(pt=>{
@@ -419,11 +558,18 @@ function openInspector(){
         <div class="seg" id="insp-size">${PIPE_SIZES.map(s=>`<button data-s='${s}' class="${p.size===s?'active':''}">${s}</button>`).join('')}</div></div>
       <div class="field"><label>Type</label>
         <div class="seg types" id="insp-type">${Object.entries(PIPE_TYPES).map(([k,v])=>`<button data-t='${k}' class="${p.type===k?'active':''}" style="${p.type===k?`background:${v.color}`:''}"><span class="swatch" style="background:${v.color}"></span>${v.label}</button>`).join('')}</div></div>
+      <div class="field"><label>Flow direction</label>
+        <button class="btn dir-btn" id="insp-rev">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 4l4 4-4 4"/><path d="M21 8H7a4 4 0 0 0-4 4"/><path d="M7 20l-4-4 4-4"/><path d="M3 16h14a4 4 0 0 0 4-4"/></svg>
+          Reverse direction
+        </button>
+        <span class="dir-note">Now: ${p.reversed?'to → from':'from → to'} (draw order${p.reversed?', reversed':''})</span></div>
       <div class="insp-actions">
         <button class="btn btn-danger" id="insp-del">Delete Pipe</button>
       </div>`;
     $('insp-size').querySelectorAll('button').forEach(b=>b.addEventListener('click',()=>{ p.size=b.dataset.s; render(); openInspector(); markDirty(); }));
     $('insp-type').querySelectorAll('button').forEach(b=>b.addEventListener('click',()=>{ p.type=b.dataset.t; render(); openInspector(); markDirty(); }));
+    $('insp-rev').addEventListener('click', ()=>{ p.reversed=!p.reversed; render(); openInspector(); markDirty(); });
     $('insp-del').addEventListener('click', ()=>{ project.pipes=project.pipes.filter(x=>x.id!==p.id); selectedPipeId=null; render(); closeInspector(); markDirty(); });
   } else { closeInspector(); return; }
   insp.hidden = false;
@@ -479,6 +625,20 @@ function onPointerDown(e){
 
   const hit = pointerType(e.target);
   const w = screenToWorld(e.clientX, e.clientY);
+
+  // FLOW MODE: tapping pipes toggles active; tapping a spillover toggles its cascade.
+  // Dragging the empty canvas still pans.
+  if(flowMode){
+    if(hit.kind==='pipe'){ togglePipeActive(hit.id); return; }
+    if(hit.kind==='comp'){
+      const c=project.components.find(x=>x.id===hit.id);
+      if(c && c.type==='spillover'){ toggleSpillover(c); return; }
+    }
+    // otherwise allow panning
+    dragState = {mode:'pan', sx:e.clientX, sy:e.clientY, ox:view.x, oy:view.y};
+    canvasWrap.classList.add('panning');
+    return;
+  }
 
   // PIPE TOOL
   if(tool==='pipe'){
@@ -647,6 +807,7 @@ function finishPipe(endNode){
     id: uid('p'), type, size: pipeDraft.size,
     from:{compId:from.compId, pt:from.pt}, to:{compId:to.compId, pt:to.pt},
     waypoints: wps,
+    reversed:false, active:true,   // flow defaults: direction = draw order, active on
   });
   cancelPipe(); render(); markDirty();
   // stay in pipe mode so multiple pipes can be drawn in a row
@@ -764,6 +925,33 @@ function setTool(t){
   canvasWrap.classList.toggle('tool-hand', tool==='hand');
   if(t!=='select') clearSelection();
 }
+/* ---------- Flow mode ---------- */
+function setFlowMode(on){
+  flowMode = !!on;
+  const btn=$('btnFlow');
+  btn.classList.toggle('active', flowMode);
+  btn.setAttribute('aria-pressed', flowMode?'true':'false');
+  $('flowHint').hidden = !flowMode;
+  if(flowMode){ cancelPipe(); clearSelection(); }
+  document.body.classList.toggle('flow-on', flowMode);
+  render();
+}
+function toggleFlowMode(){ setFlowMode(!flowMode); }
+function togglePipeActive(id){
+  const p=project.pipes.find(x=>x.id===id); if(!p) return;
+  p.active = (p.active===false) ? true : false;
+  render(); markDirty();
+  toast(p.active===false ? 'Pipe off' : 'Pipe on');
+}
+function toggleSpillover(c){
+  const cur = spilloverActive(c);
+  if(!project.spillState) project.spillState={};
+  project.spillState[c.id] = !cur;   // explicit manual override
+  render(); markDirty();
+  toast(!cur ? 'Spillover on' : 'Spillover off');
+}
+$('btnFlow').onclick=toggleFlowMode;
+
 $('toolSelect').onclick=()=>setTool('select');
 $('toolPipe').onclick=()=>setTool('pipe');
 $('toolHand').onclick=()=>setTool('hand');
@@ -858,7 +1046,7 @@ $('btnSave').onclick=()=>{ saveProject(); toast('Project saved'); };
 
 function loadProject(id){
   const map=loadAll(); const p=map[id]; if(!p) return;
-  project=p; selectedId=null;selectedPipeId=null;
+  project=migrateProject(p); selectedId=null;selectedPipeId=null;
   $('projName').value=project.name||''; $('projClient').value=project.client||'';
   storage.setItem(LS_CUR, id);
   render(); fitToScreen(); closeInspector();
@@ -943,7 +1131,7 @@ $('importFile').addEventListener('change', e=>{
     const p=JSON.parse(rd.result);
     if(!p.components) throw 0;
     p.id=p.id||('proj_'+Date.now().toString(36));
-    project=p;
+    project=migrateProject(p);
     $('projName').value=project.name||''; $('projClient').value=project.client||'';
     render(); fitToScreen(); saveProject(); toast('Project imported');
   }catch(_){ toast('Invalid JSON file'); } };
@@ -1024,6 +1212,17 @@ function buildPDF(){
     if(t.dash){ const dd=t.dash.split(' ').map(n=>+n*s*0.5); doc.setLineDashPattern(dd,0);} else doc.setLineDashPattern([],0);
     for(let i=0;i<pts.length-1;i++) doc.line(TX(pts[i].x),TY(pts[i].y),TX(pts[i+1].x),TY(pts[i+1].y));
     doc.setLineDashPattern([],0);
+    // direction arrowhead at midpoint (flow direction = draw order, or reversed)
+    {
+      const dPts = p.reversed ? pts.slice().reverse() : pts;
+      const a = pointAt(dPts, 0.5);
+      const asz = Math.max(4, 5 + pipeStrokeWidth(p.size)*0.6) * s;
+      const ax=TX(a.x), ay=TY(a.y);
+      const bx=ax-a.ux*asz, by=ay-a.uy*asz;
+      const w=asz*0.6, pxv=-a.uy, pyv=a.ux;
+      doc.setFillColor(rgb[0],rgb[1],rgb[2]);
+      doc.triangle(ax,ay, bx+pxv*w,by+pyv*w, bx-pxv*w,by-pyv*w, 'F');
+    }
     // size label
     const mid=midLabelPoint(pts);
     doc.setFillColor(255,255,255); doc.setDrawColor(rgb[0],rgb[1],rgb[2]); doc.setLineWidth(0.4);
@@ -1143,7 +1342,7 @@ function init(){
   applyView();
   window.addEventListener('resize', ()=>{});
   // expose for QA
-  window.__poolflow={ get project(){return project;}, addComponent, setTool, fitToScreen, exportPDF, screenToWorld };
+  window.__poolflow={ get project(){return project;}, get flowMode(){return flowMode;}, addComponent, setTool, setFlowMode, toggleFlowMode, togglePipeActive, toggleSpillover, fitToScreen, exportPDF, screenToWorld, render };
 }
 document.addEventListener('DOMContentLoaded', init);
 })();
