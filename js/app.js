@@ -179,12 +179,16 @@ function drawFitting(g, c, def){
     circle.setAttribute('fill','#fff'); circle.setAttribute('stroke','#2b5b86'); circle.setAttribute('stroke-width',1.6);
     g.appendChild(circle);
   }
-  // icon
+  // icon — inject raw paths into a scaled <g> (NOT a nested <svg>, which has no intrinsic size)
   const iconWrap = el('g');
-  const isz = box*0.66;
+  const isz = box*0.62;
   iconWrap.setAttribute('transform', `translate(${c.x-isz/2} ${c.y-isz/2}) scale(${isz/24})`);
-  iconWrap.setAttribute('color', '#0f1b2d');
-  iconWrap.innerHTML = iconMarkup(def.icon);
+  iconWrap.setAttribute('fill','none');
+  iconWrap.setAttribute('stroke','#0f1b2d');
+  iconWrap.setAttribute('stroke-width','1.7');
+  iconWrap.setAttribute('stroke-linecap','round');
+  iconWrap.setAttribute('stroke-linejoin','round');
+  iconWrap.innerHTML = (ICONS[def.icon] || ICONS.custom);
   g.appendChild(iconWrap);
 
   // label below
@@ -644,10 +648,9 @@ function finishPipe(endNode){
     from:{compId:from.compId, pt:from.pt}, to:{compId:to.compId, pt:to.pt},
     waypoints: wps,
   });
-  const newId = project.pipes[project.pipes.length-1].id;
   cancelPipe(); render(); markDirty();
-  // keep pipe tool active; select new pipe for quick editing
-  setTool('select'); selectPipe(newId);
+  // stay in pipe mode so multiple pipes can be drawn in a row
+  toast('Pipe added');
 }
 function inferPipeType(fc, tc){
   const types=[fc&&fc.type, tc&&tc.type];
