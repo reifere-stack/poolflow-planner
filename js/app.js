@@ -1029,8 +1029,24 @@ function solveFlow() {
     if (['pool','spa'].includes(node.type)) {
       results.push({ root, end: node.label, type: node.type, id: node.id }); return;
     }
+    // Fixtures that deliver water into a body are valid terminal points.
+    // They imply which body via item.relation (set in Selected panel), or by
+    // sensible defaults (spa jets -> spa, deck jets/sheer/etc -> pool).
+    const DELIVERY_DEFAULTS = {
+      jet: 'spa', bubbler: 'spa',
+      return: 'pool', skimmer: 'pool', drain: 'pool', deckjet: 'pool',
+      sheer: 'pool', slide: 'pool', autofill: 'pool', feature: 'pool',
+      light: null, conduit: null, custom: null,
+    };
+    if (node.type in DELIVERY_DEFAULTS) {
+      const body = node.relation || DELIVERY_DEFAULTS[node.type];
+      if (body) {
+        results.push({ root, end: node.label, type: body, id: node.id, viaFixture: node.type });
+        return;
+      }
+    }
     if (!outs.length) {
-      issues.push(`${node.label} ends with no downstream body.`); return;
+      issues.push(`${node.label} ends with no downstream body. Set a Body relation (Flows to pool/spa) in the Selected panel.`); return;
     }
     outs.forEach(o => traverse(o, root, new Set(seen)));
   }
@@ -1046,9 +1062,13 @@ function solveFlow() {
 
   // Spillover check — a body receiving water must have a way back to the source body
   // either via piped return, an explicit spillsInto, or relation hint.
+  // "Receiving water" includes flow that terminates at a fixture in that body
+  // (e.g. spa jets count as water arriving at the spa).
+  const bodyReceiving = new Set(results.map(r => r.type));
   for (const body of state.items.filter(i => i.type === 'pool' || i.type === 'spa')) {
     const inToBody = state.edges.filter(e => e.to === body.id && ['return','spillover','feature'].includes(e.type) && e.active && !e.blocked);
-    if (!inToBody.length) continue;
+    const viaFixture = bodyReceiving.has(body.type);
+    if (!inToBody.length && !viaFixture) continue;
     const pipedOut = state.edges.filter(e => e.from === body.id && (e.type === 'spillover' || e.type === 'return') && e.active && !e.blocked);
     const reachesOther = pipedOut.some(e => { const t = getItem(e.to); return t && t.type !== body.type && (t.type === 'pool' || t.type === 'spa'); });
     const hasGravitySpill = !!(body.spillsInto && getItem(body.spillsInto));
