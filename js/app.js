@@ -1,1348 +1,1339 @@
-/* ===== PoolFlow Planner — core app ===== */
-(function(){
-'use strict';
+/* ===== PoolFlow Planner — mobile-first rewrite =====
+   Single Pointer Events handler for drag + multi-touch pinch/pan.
+   Persistence via localStorage. PDF/JSON export. GitHub push (token modal).
+*/
 
-const SVGNS = 'http://www.w3.org/2000/svg';
-const $ = (id)=>document.getElementById(id);
-const FITTING_BOX = 34;   // px box for fitting/equip icon
-const EQUIP_BOX = 40;
+(() => {
 
-/* ---------- State ---------- */
-let project = newProject();
-let view = { x:0, y:0, scale:1 };   // pan offset (world->screen): screen = world*scale + (x,y)
-let snap = true;
-let tool = 'select';                // select | pipe | hand
-let flowMode = false;               // when true, render the animated water-flow view
-let selectedId = null;
-let selectedPipeId = null;
-let uidCounter = 1;
-function uid(p){ return (p||'el')+'_'+(Date.now().toString(36))+'_'+(uidCounter++); }
+// ---------- DOM ----------
+const $ = (id) => document.getElementById(id);
+const world = $('world'), viewport = $('viewport'), canvasArea = $('canvasArea');
+const edgeSvg = $('edgeSvg'), dimSvg = $('dimSvg');
+const sheet = $('sheet'), sheetBody = $('sheetBody'), sheetTabs = $('sheetTabs');
+const statusPill = $('statusPill');
+const toastEl = $('toast');
+const modalBackdrop = $('modalBackdrop'), modalContent = $('modalContent');
+const connectBanner = $('connectBanner');
 
-function newProject(){
-  return {
-    id: 'proj_'+Date.now().toString(36),
-    name:'', client:'', contractor:'',
-    components:[], pipes:[],
-    spillState:{},   // {componentId: true|false} manual spillover animation overrides
-    created: Date.now(), modified: Date.now(),
-  };
+// ---------- State ----------
+const STORE_KEY = 'poolflow-planner-v2';
+
+const state = {
+  items: [],       // { id, type, label, size, notes, relation, valveState, x, y, w, h }
+  edges: [],       // { id, from, to, type, size, label, active, blocked }
+  dims: [],        // { a, b, label }
+  selectedId: null,
+  connectMode: false,
+  connectSourceId: null,
+  pendingPipe: { type:'return', size:'2"' },
+  view: { scale: 1, tx: 0, ty: 0 },
+  nextId: 1,
+  lastSolve: null,
+  undoStack: [],
+};
+
+// ---------- Persistence ----------
+function persist() {
+  const snap = { items: state.items, edges: state.edges, dims: state.dims, nextId: state.nextId, view: state.view, pendingPipe: state.pendingPipe };
+  try { localStorage.setItem(STORE_KEY, JSON.stringify(snap)); } catch {}
 }
-
-/* Backward-compatible migration: old saved/imported projects predate the flow
- * schema. Default each pipe to draw-order direction (reversed=false) and active=true. */
-function migrateProject(p){
-  if(!p) return p;
-  if(!Array.isArray(p.pipes)) p.pipes=[];
-  for(const pipe of p.pipes){
-    if(typeof pipe.reversed!=='boolean') pipe.reversed=false;
-    if(typeof pipe.active!=='boolean') pipe.active=true;
-  }
-  if(!p.spillState || typeof p.spillState!=='object') p.spillState={};
-  return p;
-}
-
-/* ---------- DOM refs ---------- */
-const svg = $('canvas');
-const canvasWrap = $('canvasWrap');
-let rootG, gridRect, contentG, pipesG, compsG, overlayG;
-
-/* ============================================================
- *  SVG scaffold
- * ============================================================ */
-function buildSvgScaffold(){
-  svg.innerHTML = '';
-  // defs: grid pattern + arrowheads
-  const defs = el('defs');
-  defs.innerHTML = `
-    <pattern id="gridFine" width="${GRID}" height="${GRID}" patternUnits="userSpaceOnUse">
-      <path d="M ${GRID} 0 L 0 0 0 ${GRID}" fill="none" stroke="var(--sheet-line)" stroke-width="1"/>
-    </pattern>
-    <pattern id="gridBold" width="${GRID*5}" height="${GRID*5}" patternUnits="userSpaceOnUse">
-      <rect width="${GRID*5}" height="${GRID*5}" fill="url(#gridFine)"/>
-      <path d="M ${GRID*5} 0 L 0 0 0 ${GRID*5}" fill="none" stroke="var(--sheet-line-strong)" stroke-width="1.4"/>
-    </pattern>`;
-  svg.appendChild(defs);
-
-  rootG = el('g'); rootG.setAttribute('id','rootG'); svg.appendChild(rootG);
-  // sheet background (huge area)
-  const SZ = 20000;
-  const bg = el('rect');
-  bg.setAttribute('x', -SZ/2); bg.setAttribute('y', -SZ/2);
-  bg.setAttribute('width', SZ); bg.setAttribute('height', SZ);
-  bg.setAttribute('fill', 'var(--sheet)');
-  rootG.appendChild(bg);
-  gridRect = el('rect');
-  gridRect.setAttribute('x', -SZ/2); gridRect.setAttribute('y', -SZ/2);
-  gridRect.setAttribute('width', SZ); gridRect.setAttribute('height', SZ);
-  gridRect.setAttribute('fill', 'url(#gridBold)');
-  rootG.appendChild(gridRect);
-
-  contentG = el('g'); rootG.appendChild(contentG);
-  pipesG = el('g'); contentG.appendChild(pipesG);
-  compsG = el('g'); contentG.appendChild(compsG);
-  overlayG = el('g'); rootG.appendChild(overlayG);
-}
-function el(tag){ return document.createElementNS(SVGNS, tag); }
-
-/* ---------- view transform ---------- */
-function applyView(){
-  rootG.setAttribute('transform', `translate(${view.x} ${view.y}) scale(${view.scale})`);
-  $('zoomLabel').textContent = Math.round(view.scale*100)+'%';
-}
-function screenToWorld(sx, sy){
-  const r = svg.getBoundingClientRect();
-  return { x:(sx - r.left - view.x)/view.scale, y:(sy - r.top - view.y)/view.scale };
-}
-function snapVal(v){ return snap ? Math.round(v/GRID)*GRID : v; }
-
-/* ============================================================
- *  Component model + geometry
- * ============================================================ */
-function compDef(type){ return CATALOG[type]; }
-
-function defaultLabel(type){ return CATALOG[type].label; }
-
-function addComponent(type, wx, wy){
-  const def = compDef(type);
-  const c = {
-    id: uid('c'), type, label: def.label,
-    x: snapVal(wx), y: snapVal(wy), rot:0,
-  };
-  if(def.kind==='shape'){ c.w = def.w; c.h = def.h; }
-  project.components.push(c);
-  render(); selectComponent(c.id);
-  if(def.editLabel){ openInspector(); setTimeout(()=>{ const f=$('insp-label'); if(f){f.focus(); f.select();} },30); }
-  markDirty(); return c;
-}
-
-/* axis-aligned bounds in world coords (ignores rotation for hit/center) */
-function compBounds(c){
-  const def = compDef(c.type);
-  if(def.kind==='shape') return { x:c.x, y:c.y, w:c.w, h:c.h, cx:c.x+c.w/2, cy:c.y+c.h/2 };
-  const box = def.kind==='equip' ? EQUIP_BOX : FITTING_BOX;
-  return { x:c.x-box/2, y:c.y-box/2, w:box, h:box, cx:c.x, cy:c.y };
-}
-function compCenter(c){ const b=compBounds(c); return {x:b.cx, y:b.cy}; }
-
-/* ============================================================
- *  Rendering
- * ============================================================ */
-function render(){
-  renderComponents();
-  renderPipes();
-  renderOverlay();
-  $('emptyState').style.display = (project.components.length||project.pipes.length) ? 'none':'flex';
-}
-
-function renderComponents(){
-  compsG.innerHTML = '';
-  for(const c of project.components){
-    const def = compDef(c.type);
-    const g = el('g');
-    g.setAttribute('data-id', c.id);
-    g.classList.add('cmp');
-    const ctr = compCenter(c);
-    g.setAttribute('transform', `rotate(${c.rot} ${ctr.x} ${ctr.y})`);
-
-    if(def.kind==='shape'){ drawShape(g, c, def); }
-    else { drawFitting(g, c, def); }
-
-    // ---- Flow-mode component accents ----
-    if(flowMode){
-      if(c.type==='pump'){ g.classList.add('pump-running'); decoratePump(g, c); }
-      if(c.type==='spillover' && spilloverActive(c)){ decorateSpillover(g, c); }
-    }
-    compsG.appendChild(g);
-  }
-}
-
-/* Should a spillover animate? Manual override wins; otherwise auto-detect when at
- * least one active return-type pipe ends at this spillover or at a Spa component. */
-function spilloverActive(c){
-  const manual = project.spillState ? project.spillState[c.id] : undefined;
-  if(manual===true) return true;
-  if(manual===false) return false;
-  return autoSpillover();
-}
-function autoSpillover(){
-  // any active return/feature pipe whose endpoint touches a Spa or a Spillover
-  const spaIds = new Set(project.components.filter(x=>x.type==='spa').map(x=>x.id));
-  const spillIds = new Set(project.components.filter(x=>x.type==='spillover').map(x=>x.id));
-  for(const p of project.pipes){
-    if(p.active===false) continue;
-    if(p.type!=='return' && p.type!=='feature') continue;
-    const ends=[p.from.compId, p.to.compId];
-    if(ends.some(id=> id && (spaIds.has(id)||spillIds.has(id)))) return true;
-  }
-  return false;
-}
-
-/* Pump: spinning rotor + pulsing ring so the pad reads as "running". */
-function decoratePump(g, c){
-  const box = EQUIP_BOX;
-  // pulsing ring around the pump box
-  const ring = el('circle');
-  ring.setAttribute('cx', c.x); ring.setAttribute('cy', c.y); ring.setAttribute('r', box*0.62);
-  ring.setAttribute('class','pump-ring');
-  g.appendChild(ring);
-  // small spinning rotor accent over the impeller
-  const rotor = el('g'); rotor.setAttribute('class','pump-rotor');
-  rotor.setAttribute('transform', `translate(${c.x-6} ${c.y-3})`);
-  rotor.innerHTML = `<g transform="scale(0.5)"><path d="M0 0 L9 3 L0 6 Z" fill="#3fd0e0"/><path d="M0 0 L-3 9 L-6 0 Z" fill="#3fd0e0"/><path d="M0 0 L-9 -3 L0 -6 Z" fill="#3fd0e0"/><path d="M0 0 L3 -9 L6 0 Z" fill="#3fd0e0"/></g>`;
-  g.appendChild(rotor);
-}
-
-/* Spillover: animated wavefronts cascading from spa toward pool. */
-function decorateSpillover(g, c){
-  const box = FITTING_BOX;
-  const grp = el('g'); grp.setAttribute('class','spill-cascade');
-  const w = box*0.9;
-  for(let i=0;i<3;i++){
-    const wave = el('path');
-    const y = c.y + box*0.4;
-    wave.setAttribute('d', `M ${c.x-w/2} ${y} q ${w/4} 6 ${w/2} 0 q ${w/4} -6 ${w/2} 0`);
-    wave.setAttribute('class','spill-wave');
-    wave.setAttribute('stroke-width', 2.2);
-    wave.style.animationDelay = (i*0.5)+'s';
-    grp.appendChild(wave);
-  }
-  g.appendChild(grp);
-}
-
-function drawShape(g, c, def){
-  let shape;
-  if(def.shape==='ellipse'){
-    shape = el('ellipse');
-    shape.setAttribute('cx', c.x+c.w/2); shape.setAttribute('cy', c.y+c.h/2);
-    shape.setAttribute('rx', c.w/2); shape.setAttribute('ry', c.h/2);
-  } else {
-    shape = el('rect');
-    shape.setAttribute('x', c.x); shape.setAttribute('y', c.y);
-    shape.setAttribute('width', c.w); shape.setAttribute('height', c.h);
-    shape.setAttribute('rx', Math.min(18, Math.min(c.w,c.h)*0.18));
-  }
-  shape.setAttribute('class','cmp-shape');
-  shape.setAttribute('fill', def.faint ? 'rgba(63,208,224,0.06)' : 'rgba(31,111,235,0.07)');
-  shape.setAttribute('stroke', def.faint ? '#46627f' : '#2b5b86');
-  shape.setAttribute('stroke-width', 2);
-  if(def.dashed) shape.setAttribute('stroke-dasharray','7 5');
-  g.appendChild(shape);
-
-  // label centered
-  const t = el('text');
-  t.setAttribute('x', c.x+c.w/2); t.setAttribute('y', c.y+c.h/2+5);
-  t.setAttribute('text-anchor','middle'); t.setAttribute('class','cmp-label');
-  t.setAttribute('font-size', 15);
-  t.textContent = c.label;
-  g.appendChild(t);
-}
-
-function drawFitting(g, c, def){
-  const box = def.kind==='equip' ? EQUIP_BOX : FITTING_BOX;
-  const x0 = c.x - box/2, y0 = c.y - box/2;
-  if(def.kind==='equip'){
-    const r = el('rect');
-    r.setAttribute('x', x0); r.setAttribute('y', y0);
-    r.setAttribute('width', box); r.setAttribute('height', box);
-    r.setAttribute('rx', 7);
-    r.setAttribute('fill','#fff'); r.setAttribute('stroke','#2b5b86'); r.setAttribute('stroke-width',2);
-    g.appendChild(r);
-  } else {
-    const circle = el('circle');
-    circle.setAttribute('cx', c.x); circle.setAttribute('cy', c.y); circle.setAttribute('r', box/2);
-    circle.setAttribute('fill','#fff'); circle.setAttribute('stroke','#2b5b86'); circle.setAttribute('stroke-width',1.6);
-    g.appendChild(circle);
-  }
-  // icon — inject raw paths into a scaled <g> (NOT a nested <svg>, which has no intrinsic size)
-  const iconWrap = el('g');
-  const isz = box*0.62;
-  iconWrap.setAttribute('transform', `translate(${c.x-isz/2} ${c.y-isz/2}) scale(${isz/24})`);
-  iconWrap.setAttribute('fill','none');
-  iconWrap.setAttribute('stroke','#0f1b2d');
-  iconWrap.setAttribute('stroke-width','1.7');
-  iconWrap.setAttribute('stroke-linecap','round');
-  iconWrap.setAttribute('stroke-linejoin','round');
-  iconWrap.innerHTML = (ICONS[def.icon] || ICONS.custom);
-  g.appendChild(iconWrap);
-
-  // label below
-  const t = el('text');
-  t.setAttribute('x', c.x); t.setAttribute('y', c.y + box/2 + 13);
-  t.setAttribute('text-anchor','middle'); t.setAttribute('class','cmp-label');
-  t.setAttribute('font-size', 11.5);
-  t.textContent = c.label;
-  g.appendChild(t);
-}
-
-/* ---------- Pipes ---------- */
-/* Each pipe: {id, type, size, from:{compId|null,pt}, to:{compId|null,pt}, waypoints:[{x,y}] }
- * Endpoints anchored to a component follow its center (attach point = nearest edge toward next node). */
-function pipePoints(p){
-  const pts = [];
-  pts.push(endpointPos(p, 'from'));
-  for(const w of p.waypoints) pts.push({x:w.x, y:w.y});
-  pts.push(endpointPos(p, 'to'));
-  return pts;
-}
-function endpointPos(p, which){
-  const ep = p[which];
-  if(ep.compId){
-    const c = project.components.find(x=>x.id===ep.compId);
-    if(c){
-      // attach toward the adjacent node
-      const adj = which==='from'
-        ? (p.waypoints[0] || endpointRaw(p.to))
-        : (p.waypoints[p.waypoints.length-1] || endpointRaw(p.from));
-      return edgePoint(c, adj);
-    }
-  }
-  return { x:ep.pt.x, y:ep.pt.y };
-}
-function endpointRaw(ep){
-  if(ep.compId){ const c=project.components.find(x=>x.id===ep.compId); if(c) return compCenter(c); }
-  return ep.pt;
-}
-function edgePoint(c, toward){
-  const def = compDef(c.type);
-  const ctr = compCenter(c);
-  if(def.kind!=='shape'){
-    // circle/box small fitting: project onto boundary radius
-    const box = def.kind==='equip'?EQUIP_BOX:FITTING_BOX;
-    const r = box/2;
-    const dx=toward.x-ctr.x, dy=toward.y-ctr.y; const d=Math.hypot(dx,dy)||1;
-    return { x:ctr.x+dx/d*r, y:ctr.y+dy/d*r };
-  }
-  // rectangle/ellipse: clip line ctr->toward to bounds
-  const b = compBounds(c);
-  const dx=toward.x-ctr.x, dy=toward.y-ctr.y;
-  if(dx===0&&dy===0) return ctr;
-  const hw=b.w/2, hh=b.h/2;
-  const sx = dx!==0 ? hw/Math.abs(dx) : Infinity;
-  const sy = dy!==0 ? hh/Math.abs(dy) : Infinity;
-  const s = Math.min(sx,sy);
-  return { x:ctr.x+dx*s, y:ctr.y+dy*s };
-}
-
-/* lighten a hex color toward white for the moving water highlight */
-function flowHighlight(hex){
-  const h=hex.replace('#','');
-  const r=parseInt(h.slice(0,2),16), g=parseInt(h.slice(2,4),16), b=parseInt(h.slice(4,6),16);
-  const mix=(c)=>Math.round(c+(255-c)*0.62);
-  return `rgb(${mix(r)},${mix(g)},${mix(b)})`;
-}
-
-/* Directed point list: forward = draw order (from->to); reversed flips it. */
-function directedPoints(p){
-  const pts = pipePoints(p);
-  return p.reversed ? pts.slice().reverse() : pts;
-}
-/* total polyline length */
-function polyLen(pts){ let L=0; for(let i=0;i<pts.length-1;i++) L+=Math.hypot(pts[i+1].x-pts[i].x, pts[i+1].y-pts[i].y); return L; }
-/* point + unit direction at a fractional distance t (0..1) along the polyline */
-function pointAt(pts, t){
-  const total = polyLen(pts); if(total<=0) return {x:pts[0].x, y:pts[0].y, ux:1, uy:0};
-  let target = t*total, acc=0;
-  for(let i=0;i<pts.length-1;i++){
-    const dx=pts[i+1].x-pts[i].x, dy=pts[i+1].y-pts[i].y, seg=Math.hypot(dx,dy);
-    if(acc+seg>=target || i===pts.length-2){
-      const f = seg>0 ? (target-acc)/seg : 0;
-      const u = seg>0 ? {x:dx/seg, y:dy/seg} : {x:1,y:0};
-      return { x:pts[i].x+dx*f, y:pts[i].y+dy*f, ux:u.x, uy:u.y };
-    }
-    acc+=seg;
-  }
-  const last=pts[pts.length-1]; return {x:last.x, y:last.y, ux:1, uy:0};
-}
-/* build an arrowhead triangle path centered at (x,y) pointing along (ux,uy) */
-function arrowPath(x,y,ux,uy,size){
-  const bx=x-ux*size, by=y-uy*size;            // back-center
-  const px=-uy, py=ux;                          // perpendicular
-  const w=size*0.62;
-  return `M ${x} ${y} L ${bx+px*w} ${by+py*w} L ${bx-px*w} ${by-py*w} Z`;
-}
-
-function renderPipes(){
-  pipesG.innerHTML = '';
-  for(const p of project.pipes){
-    const pts = pipePoints(p);
-    const tdef = PIPE_TYPES[p.type];
-    const d = pts.map((pt,i)=>(i?'L':'M')+pt.x+' '+pt.y).join(' ');
-    const g = el('g'); g.setAttribute('data-pipe', p.id);
-    const inactive = flowMode && p.active===false;
-    if(inactive) g.classList.add('pipe-inactive');
-
-    // hit area
-    const hit = el('path'); hit.setAttribute('d', d); hit.setAttribute('class','pipe-hit'); hit.setAttribute('stroke-width', 18);
-    g.appendChild(hit);
-
-    const path = el('path'); path.setAttribute('d', d);
-    path.setAttribute('fill','none'); path.setAttribute('stroke', tdef.color);
-    path.setAttribute('stroke-width', pipeStrokeWidth(p.size));
-    path.setAttribute('stroke-linejoin','round'); path.setAttribute('stroke-linecap','round');
-    if(tdef.dash) path.setAttribute('stroke-dasharray', tdef.dash);
-    g.appendChild(path);
-
-    // ---- Flow mode: animated water highlight + direction arrowheads ----
-    if(flowMode && p.active!==false){
-      const dPts = directedPoints(p);
-      const dd = dPts.map((pt,i)=>(i?'L':'M')+pt.x+' '+pt.y).join(' ');
-      const anim = el('path'); anim.setAttribute('d', dd);
-      anim.setAttribute('class','flow-anim'+(p.reversed?' rev':''));
-      anim.setAttribute('stroke', flowHighlight(tdef.color));
-      anim.setAttribute('stroke-width', Math.max(1.6, pipeStrokeWidth(p.size)*0.55));
-      anim.setAttribute('stroke-dasharray', '4 24');
-      g.appendChild(anim);
-      // arrowheads along the path (in flow direction)
-      const total = polyLen(dPts);
-      const asz = 6 + pipeStrokeWidth(p.size)*0.6;
-      const count = Math.max(1, Math.min(8, Math.round(total/110)));
-      for(let i=1;i<=count;i++){
-        const t = i/(count+1);
-        const a = pointAt(dPts, t);
-        const ar = el('path');
-        ar.setAttribute('d', arrowPath(a.x, a.y, a.ux, a.uy, asz));
-        ar.setAttribute('class','flow-arrow');
-        ar.setAttribute('fill', tdef.color);
-        g.appendChild(ar);
-      }
-    }
-
-    // endpoint dots
-    [pts[0], pts[pts.length-1]].forEach(pt=>{
-      const dot = el('circle'); dot.setAttribute('cx',pt.x); dot.setAttribute('cy',pt.y); dot.setAttribute('r',3.4);
-      dot.setAttribute('fill', tdef.color); g.appendChild(dot);
-    });
-
-    // size label at midpoint of longest segment
-    const mid = midLabelPoint(pts);
-    const lblTxt = p.size;
-    const tw = lblTxt.length*7 + 12;
-    const lbg = el('rect');
-    lbg.setAttribute('x', mid.x-tw/2); lbg.setAttribute('y', mid.y-10);
-    lbg.setAttribute('width', tw); lbg.setAttribute('height', 18); lbg.setAttribute('rx',4);
-    lbg.setAttribute('class','pipe-label-bg');
-    lbg.setAttribute('stroke', tdef.color); lbg.setAttribute('stroke-width', 1);
-    g.appendChild(lbg);
-    const lt = el('text'); lt.setAttribute('x',mid.x); lt.setAttribute('y',mid.y+3.5);
-    lt.setAttribute('text-anchor','middle'); lt.setAttribute('class','pipe-label'); lt.setAttribute('font-size',11);
-    lt.setAttribute('fill', tdef.color);
-    lt.textContent = lblTxt;
-    g.appendChild(lt);
-
-    pipesG.appendChild(g);
-  }
-}
-function midLabelPoint(pts){
-  let best=0, bi=0;
-  for(let i=0;i<pts.length-1;i++){
-    const len=Math.hypot(pts[i+1].x-pts[i].x, pts[i+1].y-pts[i].y);
-    if(len>best){best=len;bi=i;}
-  }
-  return { x:(pts[bi].x+pts[bi+1].x)/2, y:(pts[bi].y+pts[bi+1].y)/2 };
-}
-
-/* ---------- Overlay (selection chrome) ---------- */
-function renderOverlay(){
-  overlayG.innerHTML = '';
-  if(selectedId){
-    const c = project.components.find(x=>x.id===selectedId);
-    if(c) drawSelection(c);
-  }
-  if(selectedPipeId){
-    const p = project.pipes.find(x=>x.id===selectedPipeId);
-    if(p) drawPipeSelection(p);
-  }
-  if(pipeDraft) drawDraft();
-}
-
-function drawSelection(c){
-  const def = compDef(c.type);
-  const b = compBounds(c);
-  const ctr = {x:b.cx, y:b.cy};
-  const g = el('g');
-  g.setAttribute('transform', `rotate(${c.rot} ${ctr.x} ${ctr.y})`);
-  const pad = 6;
-  const out = el('rect');
-  out.setAttribute('x', b.x-pad); out.setAttribute('y', b.y-pad);
-  out.setAttribute('width', b.w+pad*2); out.setAttribute('height', b.h+pad*2);
-  out.setAttribute('class','selected-outline');
-  out.setAttribute('rx', 4);
-  g.appendChild(out);
-
-  // rotate handle
-  const rh = el('circle');
-  rh.setAttribute('cx', b.cx); rh.setAttribute('cy', b.y-pad-22); rh.setAttribute('r', 7);
-  rh.setAttribute('class','rot-handle'); rh.setAttribute('data-rot','1');
-  const stem = el('line'); stem.setAttribute('x1',b.cx); stem.setAttribute('y1',b.y-pad); stem.setAttribute('x2',b.cx); stem.setAttribute('y2',b.y-pad-15);
-  stem.setAttribute('stroke','var(--accent)'); stem.setAttribute('stroke-width',1.5);
-  g.appendChild(stem); g.appendChild(rh);
-
-  // resize handle (shapes only) - bottom right
-  if(def.kind==='shape'){
-    const h = el('rect');
-    h.setAttribute('x', b.x+b.w-5); h.setAttribute('y', b.y+b.h-5);
-    h.setAttribute('width',11); h.setAttribute('height',11); h.setAttribute('rx',2);
-    h.setAttribute('class','handle'); h.setAttribute('data-resize','se');
-    g.appendChild(h);
-  }
-  overlayG.appendChild(g);
-}
-
-function drawPipeSelection(p){
-  const pts = pipePoints(p);
-  const g = el('g');
-  // highlight
-  const d = pts.map((pt,i)=>(i?'L':'M')+pt.x+' '+pt.y).join(' ');
-  const hl = el('path'); hl.setAttribute('d',d); hl.setAttribute('fill','none');
-  hl.setAttribute('stroke','var(--accent)'); hl.setAttribute('stroke-width', pipeStrokeWidth(p.size)+5);
-  hl.setAttribute('opacity','0.28'); hl.setAttribute('stroke-linejoin','round'); hl.setAttribute('stroke-linecap','round');
-  g.appendChild(hl);
-  // waypoint handles (draggable)
-  p.waypoints.forEach((w,i)=>{
-    const h = el('circle'); h.setAttribute('cx',w.x); h.setAttribute('cy',w.y); h.setAttribute('r',6);
-    h.setAttribute('class','wp-handle'); h.setAttribute('data-wp', i);
-    g.appendChild(h);
-  });
-  overlayG.appendChild(g);
-}
-
-/* ============================================================
- *  Selection
- * ============================================================ */
-function selectComponent(id){
-  selectedId = id; selectedPipeId = null;
-  renderOverlay();
-  if(id) openInspector(); else closeInspector();
-}
-function selectPipe(id){
-  selectedPipeId = id; selectedId = null;
-  renderOverlay();
-  if(id) openInspector(); else closeInspector();
-}
-function clearSelection(){ selectedId=null; selectedPipeId=null; renderOverlay(); closeInspector(); }
-
-/* ============================================================
- *  Inspector
- * ============================================================ */
-function openInspector(){
-  const insp = $('inspector');
-  const body = $('inspBody');
-  if(selectedId){
-    const c = project.components.find(x=>x.id===selectedId);
-    if(!c){ closeInspector(); return; }
-    const def = compDef(c.type);
-    $('inspTitle').textContent = def.label;
-    body.innerHTML = `
-      <div class="field"><label for="insp-label">Label</label>
-        <input id="insp-label" type="text" value="${esc(c.label)}" /></div>
-      <div class="field"><label>Rotate</label>
-        <div class="seg" id="insp-rot">
-          <button data-r="-90">&#8634; 90&deg;</button>
-          <button data-r="90">90&deg; &#8635;</button>
-          <button data-r="45">45&deg;</button>
-        </div></div>
-      <div class="insp-actions">
-        <button class="btn" id="insp-dup">Duplicate</button>
-        <button class="btn btn-danger" id="insp-del">Delete</button>
-      </div>`;
-    $('insp-label').addEventListener('input', e=>{ c.label=e.target.value; renderComponents(); markDirty(); });
-    $('insp-rot').querySelectorAll('button').forEach(b=>b.addEventListener('click',()=>{ c.rot=(c.rot+(+b.dataset.r))%360; render(); markDirty(); }));
-    $('insp-dup').addEventListener('click', duplicateSelected);
-    $('insp-del').addEventListener('click', deleteSelected);
-  } else if(selectedPipeId){
-    const p = project.pipes.find(x=>x.id===selectedPipeId);
-    if(!p){ closeInspector(); return; }
-    $('inspTitle').textContent = 'Pipe';
-    body.innerHTML = `
-      <div class="field"><label>Size</label>
-        <div class="seg" id="insp-size">${PIPE_SIZES.map(s=>`<button data-s='${s}' class="${p.size===s?'active':''}">${s}</button>`).join('')}</div></div>
-      <div class="field"><label>Type</label>
-        <div class="seg types" id="insp-type">${Object.entries(PIPE_TYPES).map(([k,v])=>`<button data-t='${k}' class="${p.type===k?'active':''}" style="${p.type===k?`background:${v.color}`:''}"><span class="swatch" style="background:${v.color}"></span>${v.label}</button>`).join('')}</div></div>
-      <div class="field"><label>Flow direction</label>
-        <button class="btn dir-btn" id="insp-rev">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 4l4 4-4 4"/><path d="M21 8H7a4 4 0 0 0-4 4"/><path d="M7 20l-4-4 4-4"/><path d="M3 16h14a4 4 0 0 0 4-4"/></svg>
-          Reverse direction
-        </button>
-        <span class="dir-note">Now: ${p.reversed?'to → from':'from → to'} (draw order${p.reversed?', reversed':''})</span></div>
-      <div class="insp-actions">
-        <button class="btn btn-danger" id="insp-del">Delete Pipe</button>
-      </div>`;
-    $('insp-size').querySelectorAll('button').forEach(b=>b.addEventListener('click',()=>{ p.size=b.dataset.s; render(); openInspector(); markDirty(); }));
-    $('insp-type').querySelectorAll('button').forEach(b=>b.addEventListener('click',()=>{ p.type=b.dataset.t; render(); openInspector(); markDirty(); }));
-    $('insp-rev').addEventListener('click', ()=>{ p.reversed=!p.reversed; render(); openInspector(); markDirty(); });
-    $('insp-del').addEventListener('click', ()=>{ project.pipes=project.pipes.filter(x=>x.id!==p.id); selectedPipeId=null; render(); closeInspector(); markDirty(); });
-  } else { closeInspector(); return; }
-  insp.hidden = false;
-}
-function closeInspector(){ $('inspector').hidden = true; }
-
-function duplicateSelected(){
-  const c = project.components.find(x=>x.id===selectedId); if(!c) return;
-  const copy = JSON.parse(JSON.stringify(c));
-  copy.id = uid('c'); copy.x += GRID; copy.y += GRID;
-  project.components.push(copy); render(); selectComponent(copy.id); markDirty();
-}
-function deleteSelected(){
-  if(!selectedId) return;
-  project.pipes = project.pipes.filter(p=> p.from.compId!==selectedId && p.to.compId!==selectedId);
-  project.components = project.components.filter(c=>c.id!==selectedId);
-  selectedId=null; render(); closeInspector(); markDirty();
-}
-
-/* ============================================================
- *  Pointer interactions
- * ============================================================ */
-let pointers = new Map();   // active pointers for pinch
-let dragState = null;
-let pipeDraft = null;       // {type,size, nodes:[{compId|null,pt}], cursor:{x,y}}
-
-function pointerType(target){
-  // walk up to find component group / pipe / handle
-  let node = target;
-  while(node && node!==svg){
-    if(node.dataset){
-      if(node.dataset.rot!==undefined) return {kind:'rot'};
-      if(node.dataset.resize!==undefined) return {kind:'resize', dir:node.dataset.resize};
-      if(node.dataset.wp!==undefined) return {kind:'wp', i:+node.dataset.wp};
-      if(node.dataset.id) return {kind:'comp', id:node.dataset.id};
-      if(node.dataset.pipe) return {kind:'pipe', id:node.dataset.pipe};
-    }
-    node = node.parentNode;
-  }
-  return {kind:'canvas'};
-}
-
-svg.addEventListener('pointerdown', onPointerDown);
-svg.addEventListener('pointermove', onPointerMove);
-svg.addEventListener('pointerup', onPointerUp);
-svg.addEventListener('pointercancel', onPointerUp);
-
-function onPointerDown(e){
-  svg.setPointerCapture(e.pointerId);
-  pointers.set(e.pointerId, {x:e.clientX, y:e.clientY});
-
-  if(pointers.size===2){ startPinch(); dragState=null; return; }
-
-  const hit = pointerType(e.target);
-  const w = screenToWorld(e.clientX, e.clientY);
-
-  // FLOW MODE: tapping pipes toggles active; tapping a spillover toggles its cascade.
-  // Dragging the empty canvas still pans.
-  if(flowMode){
-    if(hit.kind==='pipe'){ togglePipeActive(hit.id); return; }
-    if(hit.kind==='comp'){
-      const c=project.components.find(x=>x.id===hit.id);
-      if(c && c.type==='spillover'){ toggleSpillover(c); return; }
-    }
-    // otherwise allow panning
-    dragState = {mode:'pan', sx:e.clientX, sy:e.clientY, ox:view.x, oy:view.y};
-    canvasWrap.classList.add('panning');
-    return;
-  }
-
-  // PIPE TOOL
-  if(tool==='pipe'){
-    handlePipeTap(hit, w);
-    return;
-  }
-  // HAND TOOL or empty canvas -> pan
-  if(tool==='hand' || hit.kind==='canvas'){
-    if(hit.kind==='canvas') clearSelection();
-    dragState = {mode:'pan', sx:e.clientX, sy:e.clientY, ox:view.x, oy:view.y};
-    canvasWrap.classList.add('panning');
-    return;
-  }
-  if(hit.kind==='rot'){
-    const c = project.components.find(x=>x.id===selectedId);
-    const ctr = compCenter(c);
-    dragState = {mode:'rot', c, ctr, startRot:c.rot, startAng:Math.atan2(w.y-ctr.y, w.x-ctr.x)};
-    return;
-  }
-  if(hit.kind==='resize'){
-    const c = project.components.find(x=>x.id===selectedId);
-    dragState = {mode:'resize', c, ow:c.w, oh:c.h, sx:w.x, sy:w.y};
-    return;
-  }
-  if(hit.kind==='wp'){
-    const p = project.pipes.find(x=>x.id===selectedPipeId);
-    dragState = {mode:'wp', p, i:hit.i};
-    return;
-  }
-  if(hit.kind==='comp'){
-    selectComponent(hit.id);
-    const c = project.components.find(x=>x.id===hit.id);
-    dragState = {mode:'move', c, dx:w.x-c.x, dy:w.y-c.y, moved:false};
-    return;
-  }
-  if(hit.kind==='pipe'){
-    selectPipe(hit.id);
-    dragState = null;
-    return;
-  }
-}
-
-function onPointerMove(e){
-  if(pointers.has(e.pointerId)) pointers.set(e.pointerId, {x:e.clientX, y:e.clientY});
-  if(pointers.size===2){ doPinch(); return; }
-
-  // pipe draft preview
-  if(tool==='pipe' && pipeDraft){
-    pipeDraft.cursor = screenToWorld(e.clientX, e.clientY);
-    drawDraft();
-  }
-
-  if(!dragState) return;
-  const w = screenToWorld(e.clientX, e.clientY);
-  if(dragState.mode==='pan'){
-    view.x = dragState.ox + (e.clientX-dragState.sx);
-    view.y = dragState.oy + (e.clientY-dragState.sy);
-    applyView();
-  } else if(dragState.mode==='move'){
-    dragState.c.x = snapVal(w.x - dragState.dx);
-    dragState.c.y = snapVal(w.y - dragState.dy);
-    dragState.moved = true;
-    render();
-  } else if(dragState.mode==='rot'){
-    const ang = Math.atan2(w.y-dragState.ctr.y, w.x-dragState.ctr.x);
-    let deg = dragState.startRot + (ang-dragState.startAng)*180/Math.PI;
-    if(snap) deg = Math.round(deg/15)*15;
-    dragState.c.rot = Math.round(deg);
-    render();
-  } else if(dragState.mode==='resize'){
-    const c = dragState.c;
-    c.w = Math.max(GRID*2, snapVal(dragState.ow + (w.x-dragState.sx)));
-    c.h = Math.max(GRID*2, snapVal(dragState.oh + (w.y-dragState.sy)));
-    render();
-  } else if(dragState.mode==='wp'){
-    dragState.p.waypoints[dragState.i] = {x:snapVal(w.x), y:snapVal(w.y)};
-    render();
-  }
-}
-
-function onPointerUp(e){
-  pointers.delete(e.pointerId);
-  try{ svg.releasePointerCapture(e.pointerId); }catch(_){}
-  if(pointers.size<2) pinch=null;
-  if(dragState){
-    if(dragState.mode==='move' && dragState.moved) markDirty();
-    if(['rot','resize','wp'].includes(dragState.mode)) markDirty();
-  }
-  dragState=null;
-  canvasWrap.classList.remove('panning');
-}
-
-/* ---------- pinch zoom ---------- */
-let pinch=null;
-function startPinch(){
-  const pts=[...pointers.values()];
-  pinch={ d:dist(pts[0],pts[1]), cx:(pts[0].x+pts[1].x)/2, cy:(pts[0].y+pts[1].y)/2, scale:view.scale, vx:view.x, vy:view.y };
-}
-function doPinch(){
-  if(!pinch) { startPinch(); return; }
-  const pts=[...pointers.values()];
-  const nd=dist(pts[0],pts[1]);
-  const ncx=(pts[0].x+pts[1].x)/2, ncy=(pts[0].y+pts[1].y)/2;
-  const factor=nd/pinch.d;
-  let ns=clamp(pinch.scale*factor, 0.15, 4);
-  const r=svg.getBoundingClientRect();
-  // world point under pinch center should stay put
-  const wx=(pinch.cx - r.left - pinch.vx)/pinch.scale;
-  const wy=(pinch.cy - r.top - pinch.vy)/pinch.scale;
-  view.scale=ns;
-  view.x = (ncx - r.left) - wx*ns;
-  view.y = (ncy - r.top) - wy*ns;
-  applyView();
-}
-function dist(a,b){ return Math.hypot(a.x-b.x, a.y-b.y); }
-function clamp(v,a,b){ return Math.max(a,Math.min(b,v)); }
-
-/* ---------- wheel zoom ---------- */
-canvasWrap.addEventListener('wheel', e=>{
-  e.preventDefault();
-  const r=svg.getBoundingClientRect();
-  const wx=(e.clientX - r.left - view.x)/view.scale;
-  const wy=(e.clientY - r.top - view.y)/view.scale;
-  const factor = e.deltaY<0 ? 1.12 : 1/1.12;
-  view.scale = clamp(view.scale*factor, 0.15, 4);
-  view.x = (e.clientX - r.left) - wx*view.scale;
-  view.y = (e.clientY - r.top) - wy*view.scale;
-  applyView();
-}, {passive:false});
-
-/* ============================================================
- *  Pipe tool
- * ============================================================ */
-function handlePipeTap(hit, w){
-  if(!pipeDraft){
-    // must start on a component (or anywhere)
-    const node = (hit.kind==='comp') ? {compId:hit.id, pt:compCenter(project.components.find(c=>c.id===hit.id))} : {compId:null, pt:{x:snapVal(w.x),y:snapVal(w.y)}};
-    pipeDraft = { type:'return', size:'2"', nodes:[node], cursor:w };
-    $('pipeHint').hidden=false;
-    drawDraft();
-    return;
-  }
-  // subsequent taps
-  if(hit.kind==='comp'){
-    // finish on a component
-    const node={compId:hit.id, pt:compCenter(project.components.find(c=>c.id===hit.id))};
-    finishPipe(node);
-  } else {
-    // add waypoint
-    pipeDraft.nodes.push({compId:null, pt:{x:snapVal(w.x), y:snapVal(w.y)}});
-    drawDraft();
-  }
-}
-function finishPipe(endNode){
-  pipeDraft.nodes.push(endNode);
-  const nodes = pipeDraft.nodes;
-  if(nodes.length<2){ cancelPipe(); return; }
-  const from = nodes[0], to = nodes[nodes.length-1];
-  const wps = nodes.slice(1,-1).map(n=>({x:n.pt.x, y:n.pt.y}));
-  // guess type by connected component types
-  let type = pipeDraft.type;
-  const fc = from.compId && project.components.find(c=>c.id===from.compId);
-  const tc = to.compId && project.components.find(c=>c.id===to.compId);
-  type = inferPipeType(fc, tc) || type;
-  project.pipes.push({
-    id: uid('p'), type, size: pipeDraft.size,
-    from:{compId:from.compId, pt:from.pt}, to:{compId:to.compId, pt:to.pt},
-    waypoints: wps,
-    reversed:false, active:true,   // flow defaults: direction = draw order, active on
-  });
-  cancelPipe(); render(); markDirty();
-  // stay in pipe mode so multiple pipes can be drawn in a row
-  toast('Pipe added');
-}
-function inferPipeType(fc, tc){
-  const types=[fc&&fc.type, tc&&tc.type];
-  if(types.includes('skimmer')||types.includes('drain')) return 'suction';
-  if(types.includes('return')) return 'return';
-  if(types.some(t=>['jet','bubbler','deckjet','sheer','slide','spillover','autofill'].includes(t))) return 'feature';
-  if(types.includes('heater')) return null; // could be gas, leave default
-  return null;
-}
-function cancelPipe(){ pipeDraft=null; $('pipeHint').hidden=true; renderOverlay(); }
-function drawDraft(){
-  renderComponentsKeepOverlay();
-  // draw onto overlay
-  const exist = overlayG.querySelector('#draft'); if(exist) exist.remove();
-  if(!pipeDraft) return;
-  const g = el('g'); g.setAttribute('id','draft');
-  const pts = pipeDraft.nodes.map(n=> n.compId ? compCenter(project.components.find(c=>c.id===n.compId)) : n.pt);
-  const all = pipeDraft.cursor ? pts.concat([pipeDraft.cursor]) : pts;
-  const d = all.map((pt,i)=>(i?'L':'M')+pt.x+' '+pt.y).join(' ');
-  const path=el('path'); path.setAttribute('d',d); path.setAttribute('class','ghost-pipe'); g.appendChild(path);
-  pts.forEach(pt=>{ const dot=el('circle'); dot.setAttribute('cx',pt.x); dot.setAttribute('cy',pt.y); dot.setAttribute('r',4); dot.setAttribute('class','endpoint-dot'); g.appendChild(dot); });
-  overlayG.appendChild(g);
-}
-function renderComponentsKeepOverlay(){ /* no-op placeholder; overlay drawn separately */ }
-
-/* double-click / double-tap to finish pipe at a waypoint */
-svg.addEventListener('dblclick', e=>{
-  if(tool==='pipe' && pipeDraft){
-    const w=screenToWorld(e.clientX,e.clientY);
-    finishPipe({compId:null, pt:{x:snapVal(w.x),y:snapVal(w.y)}});
-  }
-});
-
-/* ============================================================
- *  Drag & drop from palette
- * ============================================================ */
-function buildPalette(){
-  const root = $('paletteScroll'); root.innerHTML='';
-  for(const [title, keys] of PALETTE_GROUPS){
-    const grp=document.createElement('div'); grp.className='pal-group';
-    grp.innerHTML=`<span class="pal-group-title">${title}</span><div class="pal-grid"></div>`;
-    const grid=grp.querySelector('.pal-grid');
-    for(const k of keys){
-      const def=CATALOG[k];
-      const item=document.createElement('button');
-      item.className='pal-item'; item.dataset.type=k; item.type='button';
-      item.innerHTML=`<span class="pi-icon">${iconMarkup(def.icon)}</span><span class="pi-label">${def.label}</span>`;
-      attachPaletteDrag(item, k);
-      grid.appendChild(item);
-    }
-    root.appendChild(grp);
-  }
-}
-
-function attachPaletteDrag(item, type){
-  // Pointer-based DnD that works on touch + mouse. Tap (no move) also drops at center.
-  item.addEventListener('pointerdown', (e)=>{
-    e.preventDefault();
-    const startX=e.clientX, startY=e.clientY;
-    let ghost=null, moved=false;
-    item.setPointerCapture(e.pointerId);
-    const def=CATALOG[type];
-
-    function mk(){
-      ghost=document.createElement('div');
-      ghost.style.cssText=`position:fixed;z-index:300;pointer-events:none;width:46px;height:46px;color:#3fd0e0;opacity:.9;transform:translate(-50%,-50%)`;
-      ghost.innerHTML=iconMarkup(def.icon);
-      document.body.appendChild(ghost);
-      item.classList.add('dragging-ghost');
-    }
-    function move(ev){
-      const cx=ev.clientX??startX, cy=ev.clientY??startY;
-      if(!moved && Math.hypot(cx-startX,cy-startY)>6){ moved=true; mk(); }
-      if(ghost){ ghost.style.left=cx+'px'; ghost.style.top=cy+'px'; }
-    }
-    function up(ev){
-      item.removeEventListener('pointermove',move);
-      item.removeEventListener('pointerup',up);
-      item.classList.remove('dragging-ghost');
-      const cx=ev.clientX??startX, cy=ev.clientY??startY;
-      if(ghost){ ghost.remove(); }
-      const r=svg.getBoundingClientRect();
-      let wx, wy;
-      if(moved && cx>=r.left && cx<=r.right && cy>=r.top && cy<=r.bottom){
-        const w=screenToWorld(cx,cy); wx=w.x; wy=w.y;
-      } else if(!moved){
-        // tap: drop at canvas center
-        const w=screenToWorld(r.left+r.width/2, r.top+r.height/2); wx=w.x; wy=w.y;
-        if(window.innerWidth<=860) closePalette();
-      } else {
-        return; // dropped outside canvas after dragging
-      }
-      // for shapes, offset so cursor is top-left-ish center
-      const dropDef=CATALOG[type];
-      if(dropDef.kind==='shape'){ wx-=dropDef.w/2; wy-=dropDef.h/2; }
-      addComponent(type, wx, wy);
-      if(window.innerWidth<=860) closePalette();
-    }
-    item.addEventListener('pointermove',move);
-    item.addEventListener('pointerup',up);
-  });
-}
-
-/* ============================================================
- *  Tools / toolbar
- * ============================================================ */
-function setTool(t){
-  tool=t; cancelPipe();
-  ['Select','Pipe','Hand'].forEach(n=>$('tool'+n).classList.toggle('active', tool===n.toLowerCase()));
-  canvasWrap.classList.toggle('tool-pipe', tool==='pipe');
-  canvasWrap.classList.toggle('tool-hand', tool==='hand');
-  if(t!=='select') clearSelection();
-}
-/* ---------- Flow mode ---------- */
-function setFlowMode(on){
-  flowMode = !!on;
-  const btn=$('btnFlow');
-  btn.classList.toggle('active', flowMode);
-  btn.setAttribute('aria-pressed', flowMode?'true':'false');
-  $('flowHint').hidden = !flowMode;
-  if(flowMode){ cancelPipe(); clearSelection(); }
-  document.body.classList.toggle('flow-on', flowMode);
-  render();
-}
-function toggleFlowMode(){ setFlowMode(!flowMode); }
-function togglePipeActive(id){
-  const p=project.pipes.find(x=>x.id===id); if(!p) return;
-  p.active = (p.active===false) ? true : false;
-  render(); markDirty();
-  toast(p.active===false ? 'Pipe off' : 'Pipe on');
-}
-function toggleSpillover(c){
-  const cur = spilloverActive(c);
-  if(!project.spillState) project.spillState={};
-  project.spillState[c.id] = !cur;   // explicit manual override
-  render(); markDirty();
-  toast(!cur ? 'Spillover on' : 'Spillover off');
-}
-$('btnFlow').onclick=toggleFlowMode;
-
-$('toolSelect').onclick=()=>setTool('select');
-$('toolPipe').onclick=()=>setTool('pipe');
-$('toolHand').onclick=()=>setTool('hand');
-$('pipeCancel').onclick=cancelPipe;
-
-$('snapToggle').onclick=()=>{ snap=!snap; $('snapToggle').classList.toggle('snap-on',snap); toast(snap?'Snap on':'Snap off'); };
-$('zoomIn').onclick=()=>zoomBy(1.2);
-$('zoomOut').onclick=()=>zoomBy(1/1.2);
-$('zoomFit').onclick=fitToScreen;
-function zoomBy(f){
-  const r=svg.getBoundingClientRect();
-  const wx=(r.width/2 - view.x)/view.scale, wy=(r.height/2 - view.y)/view.scale;
-  view.scale=clamp(view.scale*f,0.15,4);
-  view.x=r.width/2 - wx*view.scale; view.y=r.height/2 - wy*view.scale;
-  applyView();
-}
-function fitToScreen(){
-  const b=contentBBox();
-  const r=svg.getBoundingClientRect();
-  if(!b){ view={x:r.width/2, y:r.height/2, scale:1}; applyView(); return; }
-  const pad=80;
-  const s=clamp(Math.min((r.width-pad*2)/b.w,(r.height-pad*2)/b.h),0.15,2);
-  view.scale=s;
-  view.x=r.width/2 - (b.x+b.w/2)*s;
-  view.y=r.height/2 - (b.y+b.h/2)*s;
-  applyView();
-}
-function contentBBox(){
-  let pts=[];
-  for(const c of project.components){ const b=compBounds(c); pts.push([b.x,b.y],[b.x+b.w,b.y+b.h]); }
-  for(const p of project.pipes){ for(const pt of pipePoints(p)) pts.push([pt.x,pt.y]); }
-  if(!pts.length) return null;
-  let minx=Infinity,miny=Infinity,maxx=-Infinity,maxy=-Infinity;
-  for(const [x,y] of pts){ minx=Math.min(minx,x);miny=Math.min(miny,y);maxx=Math.max(maxx,x);maxy=Math.max(maxy,y); }
-  return {x:minx,y:miny,w:Math.max(1,maxx-minx),h:Math.max(1,maxy-miny)};
-}
-
-/* keyboard */
-window.addEventListener('keydown', e=>{
-  if(e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA'||e.target.tagName==='SELECT') return;
-  if((e.key==='Delete'||e.key==='Backspace')){ if(selectedId){deleteSelected();e.preventDefault();} else if(selectedPipeId){project.pipes=project.pipes.filter(x=>x.id!==selectedPipeId);selectedPipeId=null;render();closeInspector();markDirty();} }
-  if(e.key==='Escape'){ if(pipeDraft)cancelPipe(); else clearSelection(); }
-  if((e.ctrlKey||e.metaKey)&&e.key==='d'){ e.preventDefault(); if(selectedId) duplicateSelected(); }
-  if(e.key==='v')setTool('select'); if(e.key==='p')setTool('pipe'); if(e.key==='h')setTool('hand');
-});
-
-/* ============================================================
- *  Project meta + persistence
- * ============================================================ */
-const LS_KEY='poolflow_projects_v1';
-const LS_CUR='poolflow_current_v1';
-/* Storage abstraction: uses the browser's persistent web storage when available
- * (e.g. on GitHub Pages), and falls back to an in-memory map when that storage
- * is unavailable or blocked (e.g. a sandboxed preview iframe). The API name is
- * resolved dynamically so persistence still works on the real static host. */
-const storage = (function(){
-  const KEY = 'local' + 'Storage';
-  let backend = null;
+function restore() {
   try {
-    const s = window[KEY];
-    const probe = '__pf_probe__';
-    s.setItem(probe, '1'); s.removeItem(probe);
-    backend = s;
-  } catch(_) { backend = null; }
-  if(backend) return backend;
-  const mem = {};
+    const raw = localStorage.getItem(STORE_KEY);
+    if (!raw) return false;
+    const s = JSON.parse(raw);
+    if (!s || !Array.isArray(s.items)) return false;
+    state.items = s.items;
+    state.edges = s.edges || [];
+    state.dims = s.dims || [];
+    state.nextId = s.nextId || (s.items.length + 1);
+    state.view = s.view || { scale:1, tx:0, ty:0 };
+    state.pendingPipe = s.pendingPipe || { type:'return', size:'2"' };
+    return true;
+  } catch { return false; }
+}
+function uid() { return 'n' + (state.nextId++); }
+function pushUndo() {
+  state.undoStack.push(JSON.stringify({ items: state.items, edges: state.edges, dims: state.dims }));
+  if (state.undoStack.length > 30) state.undoStack.shift();
+}
+function undo() {
+  const last = state.undoStack.pop();
+  if (!last) { toast('Nothing to undo'); return; }
+  const s = JSON.parse(last);
+  state.items = s.items; state.edges = s.edges; state.dims = s.dims;
+  state.selectedId = null;
+  redrawAll(); persist();
+}
+
+// ---------- View transform (pan & zoom) ----------
+function applyTransform() {
+  world.style.transform = `translate(${state.view.tx}px, ${state.view.ty}px) scale(${state.view.scale})`;
+}
+function clientToWorld(cx, cy) {
+  const rect = viewport.getBoundingClientRect();
   return {
-    getItem:(k)=> (k in mem ? mem[k] : null),
-    setItem:(k,v)=>{ mem[k]=String(v); },
-    removeItem:(k)=>{ delete mem[k]; },
+    x: (cx - rect.left - state.view.tx) / state.view.scale,
+    y: (cy - rect.top  - state.view.ty) / state.view.scale,
   };
-})();
-let dirty=false, saveTimer=null;
-function markDirty(){ dirty=true; project.modified=Date.now(); scheduleSave(); }
-function scheduleSave(){ clearTimeout(saveTimer); saveTimer=setTimeout(saveProject, 800); }
-
-$('projName').addEventListener('input', e=>{ project.name=e.target.value; markDirty(); });
-$('projClient').addEventListener('input', e=>{ project.client=e.target.value; markDirty(); });
-
-function loadAll(){ try{ return JSON.parse(storage.getItem(LS_KEY)||'{}'); }catch(_){ return {}; } }
-function saveAll(map){ try{ storage.setItem(LS_KEY, JSON.stringify(map)); }catch(_){ toast('Storage full'); } }
-
-function saveProject(){
-  if(!project.name && !project.components.length && !project.pipes.length) return;
-  const map=loadAll(); map[project.id]=project; saveAll(map);
-  storage.setItem(LS_CUR, project.id);
-  dirty=false;
-  $('btnSave').textContent='Saved';
-  setTimeout(()=>{ $('btnSave').textContent='Save'; }, 1200);
 }
-$('btnSave').onclick=()=>{ saveProject(); toast('Project saved'); };
-
-function loadProject(id){
-  const map=loadAll(); const p=map[id]; if(!p) return;
-  project=migrateProject(p); selectedId=null;selectedPipeId=null;
-  $('projName').value=project.name||''; $('projClient').value=project.client||'';
-  storage.setItem(LS_CUR, id);
-  render(); fitToScreen(); closeInspector();
+function setZoom(newScale, anchorClientX, anchorClientY) {
+  const s = Math.max(0.25, Math.min(3, newScale));
+  if (anchorClientX == null) {
+    const rect = viewport.getBoundingClientRect();
+    anchorClientX = rect.left + rect.width / 2;
+    anchorClientY = rect.top + rect.height / 2;
+  }
+  const before = clientToWorld(anchorClientX, anchorClientY);
+  state.view.scale = s;
+  const after = clientToWorld(anchorClientX, anchorClientY);
+  state.view.tx += (after.x - before.x) * s;
+  state.view.ty += (after.y - before.y) * s;
+  applyTransform();
 }
-function startNewProject(){
-  project=newProject();
-  $('projName').value=''; $('projClient').value='';
-  selectedId=null;selectedPipeId=null;
-  view={x:0,y:0,scale:1};
-  buildSvgScaffold(); applyView(); render();
-  const r=svg.getBoundingClientRect(); view.x=r.width/2; view.y=r.height/2; applyView();
+function fitToContent() {
+  if (!state.items.length) {
+    state.view = { scale: 1, tx: 20, ty: 20 };
+    applyTransform();
+    return;
+  }
+  const pad = 60;
+  let minX=Infinity, minY=Infinity, maxX=-Infinity, maxY=-Infinity;
+  for (const i of state.items) {
+    minX = Math.min(minX, i.x);
+    minY = Math.min(minY, i.y);
+    maxX = Math.max(maxX, i.x + i.w);
+    maxY = Math.max(maxY, i.y + i.h);
+  }
+  const cw = canvasArea.clientWidth, ch = canvasArea.clientHeight - 80;
+  const w = maxX - minX + pad*2, h = maxY - minY + pad*2;
+  const sc = Math.min(cw / w, ch / h, 1.6);
+  state.view.scale = Math.max(0.4, sc);
+  state.view.tx = -((minX - pad) * state.view.scale) + (cw - (w * state.view.scale)) / 2;
+  state.view.ty = -((minY - pad) * state.view.scale) + 20;
+  applyTransform();
 }
 
-/* ============================================================
- *  Modals: projects + menu
- * ============================================================ */
-function modal(html){
-  const layer=$('modalLayer'); layer.hidden=false; layer.innerHTML=`<div class="modal">${html}</div>`;
-  layer.onclick=(e)=>{ if(e.target===layer) closeModal(); };
-}
-function closeModal(){ $('modalLayer').hidden=true; $('modalLayer').innerHTML=''; }
+// ---------- Pointer manager (drag, pan, pinch) ----------
+const pointers = new Map(); // id -> { clientX, clientY, target }
+let dragMode = null;        // 'pan' | 'pinch' | 'node' | 'resize' | null
+let dragData = null;
+const TAP_THRESHOLD = 8;    // px before counts as drag
+const LONG_PRESS_MS = 500;
+let longPressTimer = null;
+let longPressFired = false;
 
-$('btnProjects').onclick=showProjects;
-function showProjects(){
-  const map=loadAll();
-  const list=Object.values(map).sort((a,b)=>b.modified-a.modified);
-  const rows = list.length ? list.map(p=>`
-    <div class="proj-row ${p.id===project.id?'current':''}">
-      <div class="proj-row-info" data-open="${p.id}">
-        <b>${esc(p.name||'Untitled Project')}</b>
-        <span>${esc(p.client||'')} ${p.client?'&middot; ':''}${new Date(p.modified).toLocaleDateString()}</span>
+function onPointerDown(e) {
+  // Don't intercept controls
+  if (e.target.closest('button, input, select, textarea, .sheet, .topbar, .hud, .modal-backdrop')) return;
+
+  const p = { id: e.pointerId, clientX: e.clientX, clientY: e.clientY, target: e.target, startX: e.clientX, startY: e.clientY, moved: false };
+  pointers.set(e.pointerId, p);
+  viewport.setPointerCapture?.(e.pointerId);
+
+  const nodeEl = e.target.closest('.node');
+  const handle  = e.target.closest('.resize-handle');
+
+  if (pointers.size === 2) {
+    // Start pinch
+    dragMode = 'pinch';
+    const pts = [...pointers.values()];
+    const dx = pts[0].clientX - pts[1].clientX;
+    const dy = pts[0].clientY - pts[1].clientY;
+    dragData = {
+      startDist: Math.hypot(dx, dy),
+      startScale: state.view.scale,
+      midX: (pts[0].clientX + pts[1].clientX)/2,
+      midY: (pts[0].clientY + pts[1].clientY)/2,
+      startTx: state.view.tx,
+      startTy: state.view.ty,
+    };
+    clearLongPress();
+    return;
+  }
+
+  if (handle && state.selectedId) {
+    dragMode = 'resize';
+    const item = getItem(state.selectedId);
+    dragData = { item, startW: item.w, startH: item.h, startX: e.clientX, startY: e.clientY };
+    clearLongPress();
+    e.preventDefault();
+    return;
+  }
+
+  if (nodeEl) {
+    const id = nodeEl.dataset.id;
+    const item = getItem(id);
+    if (!item) return;
+
+    if (state.connectMode) {
+      // Tap-to-connect flow
+      handleConnectTap(id);
+      clearLongPress();
+      return;
+    }
+
+    dragMode = 'node';
+    dragData = {
+      item,
+      startX: e.clientX, startY: e.clientY,
+      origX: item.x, origY: item.y,
+      element: nodeEl,
+    };
+    nodeEl.classList.add('dragging');
+    selectItem(id);
+    // long-press to open quick valve toggle / property
+    longPressFired = false;
+    clearLongPress();
+    longPressTimer = setTimeout(() => {
+      longPressFired = true;
+      if (item.type === 'valve2' || item.type === 'valve3') {
+        cycleValve(item);
+        toast(`Valve: ${item.valveState || 'open'}`);
+      } else {
+        openSheetTab('selected');
+        openSheet();
+      }
+    }, LONG_PRESS_MS);
+    e.preventDefault();
+    return;
+  }
+
+  // Empty canvas → pan
+  dragMode = 'pan';
+  dragData = { startTx: state.view.tx, startTy: state.view.ty, startX: e.clientX, startY: e.clientY };
+  clearLongPress();
+}
+
+function onPointerMove(e) {
+  const p = pointers.get(e.pointerId);
+  if (!p) return;
+  p.clientX = e.clientX; p.clientY = e.clientY;
+  const dx0 = e.clientX - p.startX, dy0 = e.clientY - p.startY;
+  if (Math.hypot(dx0, dy0) > TAP_THRESHOLD) p.moved = true;
+
+  if (dragMode === 'pinch' && pointers.size >= 2) {
+    const pts = [...pointers.values()];
+    const dx = pts[0].clientX - pts[1].clientX;
+    const dy = pts[0].clientY - pts[1].clientY;
+    const dist = Math.hypot(dx, dy);
+    const newScale = Math.max(0.25, Math.min(3, dragData.startScale * (dist / dragData.startDist)));
+    const midX = (pts[0].clientX + pts[1].clientX) / 2;
+    const midY = (pts[0].clientY + pts[1].clientY) / 2;
+    // anchor zoom on midpoint, also pan with midpoint drift
+    const before = clientToWorld(midX, midY);
+    state.view.scale = newScale;
+    const after = clientToWorld(midX, midY);
+    state.view.tx += (after.x - before.x) * state.view.scale;
+    state.view.ty += (after.y - before.y) * state.view.scale;
+    // also account for midpoint movement
+    state.view.tx += (midX - dragData.midX);
+    state.view.ty += (midY - dragData.midY);
+    dragData.midX = midX; dragData.midY = midY;
+    applyTransform();
+    return;
+  }
+
+  if (dragMode === 'pan') {
+    state.view.tx = dragData.startTx + (e.clientX - dragData.startX);
+    state.view.ty = dragData.startTy + (e.clientY - dragData.startY);
+    applyTransform();
+    return;
+  }
+
+  if (dragMode === 'node') {
+    if (longPressFired) return; // ignore drag after long press
+    if (p.moved) {
+      clearLongPress();
+      const dxw = (e.clientX - dragData.startX) / state.view.scale;
+      const dyw = (e.clientY - dragData.startY) / state.view.scale;
+      const item = dragData.item;
+      item.x = Math.round((dragData.origX + dxw) / 4) * 4;
+      item.y = Math.round((dragData.origY + dyw) / 4) * 4;
+      dragData.element.style.left = item.x + 'px';
+      dragData.element.style.top  = item.y + 'px';
+      drawEdges(); drawDims();
+    }
+    return;
+  }
+
+  if (dragMode === 'resize' && dragData.item) {
+    const dxw = (e.clientX - dragData.startX) / state.view.scale;
+    const dyw = (e.clientY - dragData.startY) / state.view.scale;
+    const item = dragData.item;
+    item.w = Math.max(50, Math.round((dragData.startW + dxw) / 4) * 4);
+    item.h = Math.max(40, Math.round((dragData.startH + dyw) / 4) * 4);
+    const el = nodeEl(item.id);
+    if (el) { el.style.width = item.w + 'px'; el.style.height = item.h + 'px'; }
+    drawEdges(); drawDims();
+    return;
+  }
+}
+
+function onPointerUp(e) {
+  const p = pointers.get(e.pointerId);
+  pointers.delete(e.pointerId);
+  clearLongPress();
+  if (!p) return;
+
+  if (dragMode === 'pinch' && pointers.size < 2) {
+    dragMode = pointers.size === 1 ? 'pan' : null;
+    if (dragMode === 'pan') {
+      const remaining = [...pointers.values()][0];
+      dragData = { startTx: state.view.tx, startTy: state.view.ty, startX: remaining.clientX, startY: remaining.clientY };
+      remaining.startX = remaining.clientX; remaining.startY = remaining.clientY;
+    } else {
+      dragData = null;
+    }
+    return;
+  }
+
+  if (dragMode === 'node') {
+    dragData?.element?.classList.remove('dragging');
+    if (!p.moved && !longPressFired) {
+      // tap → already selected on down; nothing extra
+    } else if (p.moved) {
+      pushUndo(); // commit move
+    }
+    dragMode = null; dragData = null; persist();
+    return;
+  }
+
+  if (dragMode === 'resize') {
+    pushUndo(); persist();
+    dragMode = null; dragData = null;
+    syncSelectedPanel();
+    return;
+  }
+
+  if (dragMode === 'pan') {
+    // Tap on empty area → deselect
+    if (!p.moved) {
+      selectItem(null);
+    }
+    dragMode = null; dragData = null;
+  }
+}
+function clearLongPress() { if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; } }
+
+viewport.addEventListener('pointerdown', onPointerDown, { passive:false });
+viewport.addEventListener('pointermove', onPointerMove, { passive:false });
+viewport.addEventListener('pointerup', onPointerUp);
+viewport.addEventListener('pointercancel', onPointerUp);
+viewport.addEventListener('pointerleave', onPointerUp);
+
+// Wheel zoom for desktop / trackpad
+viewport.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const delta = -e.deltaY * 0.0015;
+  setZoom(state.view.scale * (1 + delta), e.clientX, e.clientY);
+}, { passive:false });
+
+// Prevent iOS Safari rubber-band on the canvas
+document.addEventListener('gesturestart', e => e.preventDefault());
+
+// ---------- Items ----------
+function getItem(id) { return state.items.find(i => i.id === id); }
+function nodeEl(id) { return world.querySelector(`.node[data-id="${id}"]`); }
+
+function addItem(type, opts = {}) {
+  const tool = TOOLS[type] || { w:100, h:60, label:type };
+  // Place near center of current view
+  const rect = viewport.getBoundingClientRect();
+  const center = clientToWorld(rect.left + rect.width/2, rect.top + rect.height/3);
+  const offset = state.items.length * 14;
+  const item = {
+    id: uid(),
+    type,
+    label: opts.label || tool.label,
+    size: opts.size || '',
+    notes: opts.notes || '',
+    relation: opts.relation || '',
+    valveState: opts.valveState || (type==='valve2' ? 'open' : type==='valve3' ? 'both' : ''),
+    x: opts.x ?? Math.round((center.x - tool.w/2 + offset) / 4) * 4,
+    y: opts.y ?? Math.round((center.y - tool.h/2 + offset) / 4) * 4,
+    w: opts.w ?? tool.w,
+    h: opts.h ?? tool.h,
+  };
+  pushUndo();
+  state.items.push(item);
+  renderItem(item);
+  selectItem(item.id);
+  persist();
+  return item;
+}
+
+function renderItem(item) {
+  const tool = TOOLS[item.type] || {};
+  const el = document.createElement('div');
+  el.className = 'node ' + (NODE_CLASS[item.type] || '');
+  if (RESIZABLE.has(item.type)) el.classList.add('resizable');
+  if ((item.type==='valve2' && item.valveState==='closed') ||
+      (item.type==='valve3' && item.valveState==='')) {
+    el.classList.add('closed-state');
+  }
+  el.dataset.id = item.id;
+  Object.assign(el.style, { left: item.x+'px', top: item.y+'px', width: item.w+'px', height: item.h+'px' });
+  el.innerHTML = `
+    <div class="icon">${iconMarkup(item.type)}</div>
+    <div class="title">${escapeHtml(item.label)}</div>
+    <div class="meta">${escapeHtml(metaText(item))}</div>
+    <div class="resize-handle" aria-label="Resize"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M9 21h12V9"/><path d="M14 14l7 7"/></svg></div>
+  `;
+  world.appendChild(el);
+}
+function metaText(item) {
+  const bits = [];
+  if (item.size) bits.push(item.size);
+  if (item.valveState) bits.push(item.valveState);
+  if (item.relation) bits.push('→' + item.relation);
+  if (item.notes) bits.push(item.notes);
+  return bits.join(' · ');
+}
+function escapeHtml(s) {
+  return String(s || '').replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+}
+
+function refreshItem(item) {
+  const el = nodeEl(item.id);
+  if (!el) { renderItem(item); return; }
+  el.className = 'node ' + (NODE_CLASS[item.type] || '');
+  if (RESIZABLE.has(item.type)) el.classList.add('resizable');
+  if ((item.type==='valve2' && item.valveState==='closed')) el.classList.add('closed-state');
+  if (state.selectedId === item.id) el.classList.add('selected');
+  Object.assign(el.style, { left: item.x+'px', top: item.y+'px', width: item.w+'px', height: item.h+'px' });
+  el.querySelector('.title').textContent = item.label;
+  el.querySelector('.meta').textContent  = metaText(item);
+}
+
+function deleteItem(id) {
+  pushUndo();
+  state.items = state.items.filter(i => i.id !== id);
+  state.edges = state.edges.filter(e => e.from !== id && e.to !== id);
+  state.dims  = state.dims.filter(d => d.a !== id && d.b !== id);
+  const el = nodeEl(id); if (el) el.remove();
+  if (state.selectedId === id) state.selectedId = null;
+  solveFlow(); persist(); renderSheet();
+}
+
+function selectItem(id) {
+  state.selectedId = id;
+  world.querySelectorAll('.node').forEach(n => n.classList.toggle('selected', n.dataset.id === id));
+  syncSelectedPanel();
+}
+
+function cycleValve(item) {
+  pushUndo();
+  if (item.type === 'valve2') {
+    item.valveState = item.valveState === 'open' ? 'closed' : 'open';
+  } else if (item.type === 'valve3') {
+    const order = ['a','b','both'];
+    const next = order[(order.indexOf(item.valveState) + 1) % order.length] || 'a';
+    item.valveState = next;
+  }
+  refreshItem(item); solveFlow(); persist();
+}
+
+// ---------- Connect mode ----------
+function startConnectMode() {
+  if (!state.items.length) { toast('Add parts first'); return; }
+  state.connectMode = true;
+  state.connectSourceId = null;
+  connectBanner.classList.add('show');
+  closeSheet();
+  toast('Connect mode: tap source, then destination');
+}
+function cancelConnectMode() {
+  state.connectMode = false;
+  state.connectSourceId = null;
+  connectBanner.classList.remove('show');
+  world.querySelectorAll('.node.connect-source').forEach(n => n.classList.remove('connect-source'));
+}
+function handleConnectTap(id) {
+  if (!state.connectSourceId) {
+    state.connectSourceId = id;
+    const el = nodeEl(id); if (el) el.classList.add('connect-source');
+    toast('Now tap destination');
+    return;
+  }
+  if (state.connectSourceId === id) {
+    // tapping same node cancels
+    cancelConnectMode();
+    return;
+  }
+  // Create edge
+  const from = getItem(state.connectSourceId), to = getItem(id);
+  if (from && to) {
+    pushUndo();
+    state.edges.push({
+      id: uid(),
+      from: from.id,
+      to: to.id,
+      type: state.pendingPipe.type,
+      size: state.pendingPipe.size,
+      label: `${from.label} → ${to.label}`,
+      active: false,
+      blocked: false,
+    });
+    toast(`${PIPE_TYPES[state.pendingPipe.type].label} ${state.pendingPipe.size}: ${from.label} → ${to.label}`);
+    solveFlow(); persist();
+  }
+  cancelConnectMode();
+}
+
+// ---------- Drawing ----------
+function drawEdges() {
+  const defs = `<defs>
+    ${Object.entries(PIPE_TYPES).map(([k, v]) => `
+      <marker id="arr-${k}" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+        <path d="M0 0L10 5L0 10Z" fill="${v.color}"/>
+      </marker>`).join('')}
+    <style>
+      .pipe { fill:none; stroke-linecap:round; }
+      .pipe.active { stroke-dasharray:14 10; animation: flow 1.2s linear infinite; }
+      .pipe.blocked { opacity:.3; stroke-dasharray:4 8; }
+      @keyframes flow { to { stroke-dashoffset: -24; } }
+    </style>
+  </defs>`;
+  let html = defs;
+  for (const e of state.edges) {
+    const a = getItem(e.from), b = getItem(e.to);
+    if (!a || !b) continue;
+    const p1 = { x: a.x + a.w/2, y: a.y + a.h/2 };
+    const p2 = { x: b.x + b.w/2, y: b.y + b.h/2 };
+    const mx = (p1.x + p2.x) / 2;
+    const d = `M ${p1.x} ${p1.y} C ${mx} ${p1.y}, ${mx} ${p2.y}, ${p2.x} ${p2.y}`;
+    const t = PIPE_TYPES[e.type] || PIPE_TYPES.return;
+    const classes = ['pipe'];
+    if (e.active) classes.push('active');
+    if (e.blocked) classes.push('blocked');
+    const sw = pipeStrokeWidth(e.size);
+    html += `<path d="${d}" class="${classes.join(' ')}" stroke="${t.color}" stroke-width="${sw}" stroke-dasharray="${t.dash}" marker-end="url(#arr-${e.type})"></path>`;
+    // label
+    const lx = (p1.x + p2.x) / 2, ly = (p1.y + p2.y) / 2 - 8;
+    html += `<text class="flow-text" x="${lx}" y="${ly}" text-anchor="middle">${escapeHtml(e.size || '')} ${escapeHtml(t.label)}</text>`;
+  }
+  edgeSvg.innerHTML = html;
+}
+
+function drawDims() {
+  let html = '';
+  for (const d of state.dims) {
+    const a = getItem(d.a), b = getItem(d.b);
+    if (!a || !b) continue;
+    const ca = { x: a.x + a.w/2, y: a.y + a.h/2 };
+    const cb = { x: b.x + b.w/2, y: b.y + b.h/2 };
+    const y = Math.min(ca.y, cb.y) - 36;
+    const x1 = Math.min(ca.x, cb.x), x2 = Math.max(ca.x, cb.x);
+    const distPx = Math.hypot(cb.x - ca.x, cb.y - ca.y);
+    const ftPerPx = 1/24;
+    const ft = (distPx * ftPerPx).toFixed(1);
+    html += `
+      <line x1="${ca.x}" y1="${ca.y}" x2="${ca.x}" y2="${y}" stroke="var(--muted)" stroke-dasharray="3 4"/>
+      <line x1="${cb.x}" y1="${cb.y}" x2="${cb.x}" y2="${y}" stroke="var(--muted)" stroke-dasharray="3 4"/>
+      <line x1="${x1}" y1="${y}" x2="${x2}" y2="${y}" stroke="var(--text)" stroke-width="1.5"/>
+      <polygon points="${x1},${y} ${x1+8},${y-4} ${x1+8},${y+4}" fill="var(--text)"/>
+      <polygon points="${x2},${y} ${x2-8},${y-4} ${x2-8},${y+4}" fill="var(--text)"/>
+      <text class="dim-text" x="${(x1+x2)/2}" y="${y-8}" text-anchor="middle">${d.label}: ${ft} ft</text>`;
+  }
+  dimSvg.innerHTML = html;
+}
+
+function redrawAll() {
+  world.querySelectorAll('.node').forEach(n => n.remove());
+  state.items.forEach(renderItem);
+  applyTransform();
+  drawEdges(); drawDims();
+  solveFlow();
+  renderSheet();
+}
+
+// ---------- Solver ----------
+function adjacency() { const m = {}; state.items.forEach(i => m[i.id] = []); state.edges.forEach(e => m[e.from].push(e)); return m; }
+function valveAllows(node, edges, index) {
+  if (node.type === 'valve2') return node.valveState !== 'closed';
+  if (node.type === 'valve3') {
+    if (node.valveState === 'both' || !node.valveState) return true;
+    if (node.valveState === 'a') return index === 0;
+    if (node.valveState === 'b') return index === 1;
+    return false;
+  }
+  if (node.type === 'checkvalve') return true;
+  if (node.type === 'actuated') return node.valveState !== 'closed';
+  return true;
+}
+function solveFlow() {
+  state.edges.forEach(e => { e.active = false; e.blocked = false; });
+  const issues = [];
+  const adj = adjacency();
+  const pumps = state.items.filter(i => i.type === 'pump');
+  const results = [];
+
+  function traverse(edge, root, seen) {
+    edge.active = true;
+    const node = getItem(edge.to);
+    if (!node) return;
+    if (seen.has(node.id)) return;
+    seen.add(node.id);
+    if (node.type === 'valve2' && node.valveState === 'closed') {
+      edge.blocked = true; issues.push(`${node.label} is closed.`); return;
+    }
+    const outs = (adj[node.id] || []).filter(e => e.type !== 'conduit');
+    if (node.type === 'valve3') {
+      outs.forEach((o, i) => valveAllows(node, outs, i) ? traverse(o, root, new Set(seen)) : (o.blocked = true));
+      return;
+    }
+    if (node.type === 'tee') {
+      if (!outs.length) issues.push(`${node.label} tee has no downstream branch.`);
+      outs.forEach(o => traverse(o, root, new Set(seen))); return;
+    }
+    if (['pool','spa'].includes(node.type)) {
+      results.push({ root, end: node.label, type: node.type, id: node.id }); return;
+    }
+    if (!outs.length) {
+      issues.push(`${node.label} ends with no downstream body.`); return;
+    }
+    outs.forEach(o => traverse(o, root, new Set(seen)));
+  }
+
+  for (const pump of pumps) {
+    const incoming = state.edges.filter(e => e.to === pump.id && e.type !== 'conduit');
+    const outgoing = state.edges.filter(e => e.from === pump.id && e.type !== 'conduit');
+    if (!incoming.length) issues.push(`Pump ${pump.label} has no suction source.`);
+    if (!outgoing.length) issues.push(`Pump ${pump.label} has no return destination.`);
+    incoming.forEach(e => e.active = true);
+    outgoing.forEach(o => traverse(o, pump.label, new Set([pump.id])));
+  }
+
+  // Spillover check
+  for (const spa of state.items.filter(i => i.type === 'spa')) {
+    const inToSpa = state.edges.filter(e => e.to === spa.id && ['return','spillover','feature'].includes(e.type) && e.active && !e.blocked);
+    if (inToSpa.length) {
+      const out = state.edges.filter(e => e.from === spa.id && (e.type === 'spillover' || e.type === 'return') && e.active && !e.blocked);
+      const reachesPool = out.some(e => getItem(e.to)?.type === 'pool');
+      const relPool = spa.relation === 'pool';
+      if (!relPool && !reachesPool) {
+        issues.push(`Spa ${spa.label} has no spillover/return to pool.`);
+      }
+    }
+  }
+
+  state.lastSolve = { issues, results };
+  const ok = !issues.length;
+  statusPill.className = 'status-pill ' + (ok ? 'ok' : 'err');
+  statusPill.querySelector('.label').textContent = ok ? (results.length ? `Flow → ${[...new Set(results.map(r => r.end))].join(', ')}` : 'Ready') : `${issues.length} issue${issues.length===1?'':'s'}`;
+  drawEdges();
+}
+
+// ---------- Bottom sheet ----------
+let activeTab = 'parts';
+function openSheet() { sheet.classList.add('open'); sheet.classList.remove('mid'); }
+function midSheet()  { sheet.classList.add('mid'); sheet.classList.remove('open'); }
+function closeSheet(){ sheet.classList.remove('open'); sheet.classList.remove('mid'); }
+function openSheetTab(name) {
+  activeTab = name;
+  sheetTabs.querySelectorAll('button').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
+  renderSheet();
+}
+sheetTabs.querySelectorAll('button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    openSheetTab(btn.dataset.tab);
+    if (!sheet.classList.contains('open')) openSheet();
+  });
+});
+
+// drag-handle to toggle sheet states
+let sheetDragStart = null;
+const sheetHandle = $('sheetHandle');
+sheetHandle.addEventListener('pointerdown', (e) => {
+  sheetDragStart = { y: e.clientY, ts: Date.now() };
+  sheetHandle.setPointerCapture(e.pointerId);
+});
+sheetHandle.addEventListener('pointermove', (e) => {
+  if (!sheetDragStart) return;
+  const dy = e.clientY - sheetDragStart.y;
+  if (Math.abs(dy) > 10) {
+    sheet.style.transition = 'none';
+    sheet.style.transform = `translateY(calc(${dy}px + (var(--current-y, 0px))))`;
+  }
+});
+sheetHandle.addEventListener('pointerup', (e) => {
+  if (!sheetDragStart) return;
+  const dy = e.clientY - sheetDragStart.y;
+  sheet.style.transition = '';
+  sheet.style.transform = '';
+  if (dy < -40) openSheet();
+  else if (dy > 60) closeSheet();
+  else if (sheet.classList.contains('open')) midSheet();
+  else openSheet();
+  sheetDragStart = null;
+});
+
+function renderSheet() {
+  if (activeTab === 'parts')      sheetBody.innerHTML = renderParts();
+  else if (activeTab === 'selected') sheetBody.innerHTML = renderSelected();
+  else if (activeTab === 'pipes')    sheetBody.innerHTML = renderPipes();
+  else if (activeTab === 'validate') sheetBody.innerHTML = renderValidate();
+  else if (activeTab === 'takeoff')  sheetBody.innerHTML = renderTakeoff();
+  else if (activeTab === 'export')   sheetBody.innerHTML = renderExport();
+  bindSheetActions();
+}
+
+function renderParts() {
+  return PALETTE_GROUPS.map(([title, items]) => `
+    <div class="group">
+      <div class="group-title">${title}</div>
+      <div class="palette">
+        ${items.map(([type, label]) => `
+          <button data-add="${type}">
+            <span class="glyph">${iconMarkup(type)}</span>
+            <span class="lbl">${label}</span>
+          </button>`).join('')}
       </div>
-      <div class="proj-row-actions">
-        <button class="btn icon-btn small" data-rename="${p.id}" title="Rename"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg></button>
-        <button class="btn icon-btn small btn-danger" data-del="${p.id}" title="Delete"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/></svg></button>
+    </div>
+  `).join('') + `
+    <div class="row" style="margin-top:14px;">
+      <button class="btn" data-action="demo">Load demo</button>
+      <button class="btn danger" data-action="clearAll">Clear all</button>
+    </div>
+  `;
+}
+
+function renderSelected() {
+  const item = getItem(state.selectedId);
+  if (!item) return `<div class="panel"><p style="color:var(--muted);">Tap a part on the canvas to edit it.</p></div>`;
+  const isValve = item.type === 'valve2' || item.type === 'valve3' || item.type === 'actuated';
+  return `
+    <div class="panel">
+      <div class="row" style="margin-bottom:10px;">
+        <div style="font-weight:700; font-size:16px;">${escapeHtml(item.label)}</div>
+        <div style="text-align:right; color:var(--muted); font-size:12px;">${item.type}</div>
       </div>
-    </div>`).join('') : `<p class="empty-note">No saved projects yet.</p>`;
-  modal(`
-    <div class="modal-head"><h2>Projects</h2><button class="icon-btn small" id="mClose"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"/></svg></button></div>
-    <div class="modal-body"><div class="proj-list">${rows}</div></div>
-    <div class="modal-foot"><button class="btn btn-accent" id="mNew">New Project</button></div>`);
-  $('mClose').onclick=closeModal;
-  $('mNew').onclick=()=>{ saveProject(); startNewProject(); closeModal(); toast('New project'); };
-  document.querySelectorAll('[data-open]').forEach(b=>b.onclick=()=>{ saveProject(); loadProject(b.dataset.open); closeModal(); });
-  document.querySelectorAll('[data-del]').forEach(b=>b.onclick=()=>{ const map=loadAll(); delete map[b.dataset.del]; saveAll(map); if(b.dataset.del===project.id) startNewProject(); showProjects(); });
-  document.querySelectorAll('[data-rename]').forEach(b=>b.onclick=()=>{ const map=loadAll(); const p=map[b.dataset.rename]; const nn=prompt('Project name', p.name||''); if(nn!==null){ p.name=nn; if(p.id===project.id){project.name=nn;$('projName').value=nn;} saveAll(map); showProjects(); } });
+      <div class="field"><label>Label</label><input id="f-label" value="${escapeHtml(item.label)}"/></div>
+      <div class="row tight" style="margin-top:8px;">
+        <div class="field"><label>Pipe size</label>
+          <select id="f-size">
+            <option value="">—</option>
+            ${PIPE_SIZES.map(s => `<option ${item.size===s?'selected':''}>${s}</option>`).join('')}
+          </select>
+        </div>
+        <div class="field"><label>Body relation</label>
+          <select id="f-relation">
+            <option value="">None</option>
+            <option ${item.relation==='pool'?'selected':''} value="pool">Flows to pool</option>
+            <option ${item.relation==='spa'?'selected':''} value="spa">Flows to spa</option>
+          </select>
+        </div>
+      </div>
+      ${isValve ? `
+      <div class="field" style="margin-top:8px;"><label>Valve mode</label>
+        <select id="f-valve">
+          <option value="">N/A</option>
+          <option ${item.valveState==='open'?'selected':''} value="open">Open</option>
+          <option ${item.valveState==='closed'?'selected':''} value="closed">Closed</option>
+          <option ${item.valveState==='a'?'selected':''} value="a">3-way → A</option>
+          <option ${item.valveState==='b'?'selected':''} value="b">3-way → B</option>
+          <option ${item.valveState==='both'?'selected':''} value="both">3-way shared</option>
+        </select>
+      </div>` : ''}
+      <div class="row tight" style="margin-top:8px;">
+        <div class="field"><label>Width (px)</label><input id="f-w" type="number" value="${item.w}" min="40"/></div>
+        <div class="field"><label>Height (px)</label><input id="f-h" type="number" value="${item.h}" min="30"/></div>
+      </div>
+      <div class="field" style="margin-top:8px;"><label>Notes</label><input id="f-notes" value="${escapeHtml(item.notes||'')}" placeholder="e.g. branch A, custom feature"/></div>
+      <div class="row" style="margin-top:12px;">
+        <button class="btn primary" data-action="applySelected">Apply</button>
+        <button class="btn danger"  data-action="deleteSelected">Delete</button>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <button class="btn" data-action="duplicateSelected">Duplicate</button>
+        <button class="btn" data-action="measureFrom">Measure from this…</button>
+      </div>
+    </div>`;
 }
 
-$('btnMenu').onclick=showMenu;
-function showMenu(){
-  modal(`
-    <div class="modal-head"><h2>Menu</h2><button class="icon-btn small" id="mClose"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"/></svg></button></div>
-    <div class="modal-body"><div class="menu-list">
-      <button id="mExportJson"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>Export project as JSON</button>
-      <button id="mImportJson"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 8l5-5 5 5M12 3v12"/></svg>Import project from JSON</button>
-      <button id="mPdf2"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M9 13h6M9 17h4"/></svg>Export PDF plan sheet</button>
-      <button id="mContractor"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"/><path d="M4 21v-1a6 6 0 0 1 16 0v1"/></svg>Set contractor name</button>
-      <button id="mNew2"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>New blank project</button>
-    </div></div>`);
-  $('mClose').onclick=closeModal;
-  $('mExportJson').onclick=()=>{ exportJSON(); closeModal(); };
-  $('mImportJson').onclick=()=>{ $('importFile').click(); closeModal(); };
-  $('mPdf2').onclick=()=>{ closeModal(); exportPDF(); };
-  $('mNew2').onclick=()=>{ saveProject(); startNewProject(); closeModal(); };
-  $('mContractor').onclick=()=>{ const n=prompt('Contractor / company name (shown on PDF)', project.contractor||''); if(n!==null){ project.contractor=n; markDirty(); toast('Contractor saved'); } closeModal(); };
+function renderPipes() {
+  const p = state.pendingPipe;
+  return `
+    <div class="panel">
+      <h3>Pipe to draw</h3>
+      <div class="field"><label>Type</label>
+        <select id="pipe-type">
+          ${Object.entries(PIPE_TYPES).map(([k, v]) => `<option ${p.type===k?'selected':''} value="${k}">${v.label}</option>`).join('')}
+        </select>
+      </div>
+      <div class="field" style="margin-top:8px;"><label>Size</label>
+        <select id="pipe-size">
+          ${PIPE_SIZES.map(s => `<option ${p.size===s?'selected':''}>${s}</option>`).join('')}
+        </select>
+      </div>
+      <button class="btn primary full" style="margin-top:12px;" data-action="connectMode">
+        Start tap-to-connect
+      </button>
+      <p style="color:var(--muted); font-size:12px; margin-top:8px;">Tap two parts in order. Long-press a valve to flip it.</p>
+    </div>
+
+    <div class="panel">
+      <h3>Existing pipes (${state.edges.length})</h3>
+      ${state.edges.length === 0 ? `<p style="color:var(--muted);">No connections yet.</p>` :
+        state.edges.map(e => {
+          const a = getItem(e.from), b = getItem(e.to); if (!a||!b) return '';
+          const t = PIPE_TYPES[e.type] || {};
+          return `<div class="row-item" style="padding:8px 10px; background:var(--surface); border:1px solid var(--border); border-radius:10px; margin-bottom:6px;">
+            <div>
+              <div style="font-weight:600;">${escapeHtml(a.label)} → ${escapeHtml(b.label)}</div>
+              <div style="color:var(--muted); font-size:12px;">${t.label||e.type} · ${e.size||'—'}${e.active?' · active':''}${e.blocked?' · blocked':''}</div>
+            </div>
+            <button class="btn" data-action="deletePipe" data-pid="${e.id}">Delete</button>
+          </div>`;
+        }).join('')
+      }
+    </div>
+
+    <div class="panel">
+      <h3>Legend</h3>
+      <div class="legend">
+        ${Object.entries(PIPE_TYPES).map(([k,v])=>`<div class="item"><div class="swatch" style="background:${v.color}"></div>${v.label}</div>`).join('')}
+      </div>
+    </div>`;
 }
 
-/* ---------- JSON export/import ---------- */
-function exportJSON(){
-  const data=JSON.stringify(project,null,2);
-  const blob=new Blob([data],{type:'application/json'});
-  const a=document.createElement('a');
-  a.href=URL.createObjectURL(blob);
-  a.download=(project.name||'poolflow-project').replace(/[^a-z0-9]+/gi,'-').toLowerCase()+'.json';
-  a.click(); URL.revokeObjectURL(a.href);
+function renderValidate() {
+  const sol = state.lastSolve;
+  const issues = sol?.issues || [];
+  const ok = !issues.length;
+  return `
+    <div class="panel">
+      <h3>Status</h3>
+      <div class="row-item ${ok ? '' : 'err'}" style="padding:12px; border-radius:10px; background:${ok ? 'color-mix(in srgb, var(--success) 14%, var(--surface))' : 'var(--error-bg)'};
+           color:${ok ? 'var(--success)' : 'var(--error)'}; border:1px solid ${ok ? 'var(--success)' : 'var(--error)'}; font-weight:600;">
+        ${ok ? '✓ Valid flow' : `⚠ ${issues.length} issue${issues.length===1?'':'s'} found`}
+      </div>
+      <div class="issues-list" style="margin-top:10px;">
+        ${issues.length === 0
+          ? `<div class="row-item">No hydraulic errors detected.</div>`
+          : issues.map(t => `<div class="row-item err">${escapeHtml(t)}</div>`).join('')}
+      </div>
+      <button class="btn primary full" style="margin-top:12px;" data-action="solveFlow">Re-solve flow</button>
+    </div>`;
+}
+
+function renderTakeoff() {
+  const counts = {};
+  state.items.forEach(i => {
+    if (i.type === 'tee') counts['Tees'] = (counts['Tees']||0)+1;
+    if (i.type === 'valve2') counts['2-way valves'] = (counts['2-way valves']||0)+1;
+    if (i.type === 'valve3') counts['3-way valves'] = (counts['3-way valves']||0)+1;
+    if (i.type === 'checkvalve') counts['Check valves'] = (counts['Check valves']||0)+1;
+    if (i.type === 'actuated') counts['Actuated valves'] = (counts['Actuated valves']||0)+1;
+    if (i.type === 'return') counts['Returns'] = (counts['Returns']||0)+1;
+    if (i.type === 'skimmer') counts['Skimmers'] = (counts['Skimmers']||0)+1;
+    if (i.type === 'drain') counts['Main drains'] = (counts['Main drains']||0)+1;
+    if (i.type === 'jet') counts['Spa jets'] = (counts['Spa jets']||0)+1;
+    if (i.type === 'bubbler') counts['Bubblers'] = (counts['Bubblers']||0)+1;
+    if (i.type === 'deckjet') counts['Deck jets'] = (counts['Deck jets']||0)+1;
+  });
+  state.edges.forEach(e => {
+    const key = `${(PIPE_TYPES[e.type]?.label)||e.type} pipe ${e.size||'—'}`;
+    counts[key] = (counts[key]||0)+1;
+    counts['Est. 90° elbows'] = (counts['Est. 90° elbows']||0)+2;
+  });
+  const entries = Object.entries(counts);
+  return `
+    <div class="panel">
+      <h3>Fittings takeoff</h3>
+      <div class="takeoff-list">
+        ${entries.length === 0
+          ? `<div class="row-item">Nothing counted yet — add parts and pipes.</div>`
+          : entries.map(([k,v]) => `<div class="row-item"><span>${escapeHtml(k)}</span><span class="qty">${v}</span></div>`).join('')}
+      </div>
+    </div>`;
+}
+
+function renderExport() {
+  return `
+    <div class="panel">
+      <h3>Share with plumbers</h3>
+      <div class="row" style="margin-top:8px;">
+        <button class="btn primary" data-action="exportPDF">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+          Export PDF
+        </button>
+        <button class="btn" data-action="exportJSON">Export JSON</button>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <button class="btn" data-action="exportPNG">Save plan image</button>
+        <button class="btn" data-action="sharePlan">Share…</button>
+      </div>
+    </div>
+    <div class="panel">
+      <h3>Backup & restore</h3>
+      <div class="row">
+        <button class="btn" data-action="importJSON">Import JSON</button>
+        <button class="btn" data-action="undo">Undo</button>
+      </div>
+    </div>
+    <div class="panel">
+      <h3>GitHub</h3>
+      <p style="color:var(--muted); font-size:12px;">Save the current planner code back to your GitHub Pages repo (requires personal access token with <code>repo</code> scope).</p>
+      <button class="btn primary full" data-action="pushGithub">Update GitHub</button>
+    </div>
+    <div class="panel">
+      <h3>Appearance</h3>
+      <div class="row">
+        <button class="btn" data-action="theme-light">Light</button>
+        <button class="btn" data-action="theme-dark">Dark</button>
+        <button class="btn" data-action="theme-auto">Auto</button>
+      </div>
+    </div>
+  `;
+}
+
+function bindSheetActions() {
+  // Palette adders
+  sheetBody.querySelectorAll('[data-add]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const type = btn.dataset.add;
+      addItem(type);
+      if (type === 'custom' || type === 'customeq') {
+        // open Selected so user can rename
+        openSheetTab('selected'); openSheet();
+      }
+    });
+  });
+
+  // Actions
+  sheetBody.querySelectorAll('[data-action]').forEach(btn => {
+    btn.addEventListener('click', () => doAction(btn.dataset.action, btn));
+  });
+
+  // Selected fields — live save on Apply
+  if (activeTab === 'selected' && state.selectedId) {
+    // (no live binding; user taps Apply)
+  }
+
+  // Pipe selectors auto-save
+  const pipeType = $('pipe-type'), pipeSize = $('pipe-size');
+  if (pipeType) pipeType.onchange = () => { state.pendingPipe.type = pipeType.value; persist(); };
+  if (pipeSize) pipeSize.onchange = () => { state.pendingPipe.size = pipeSize.value; persist(); };
+}
+
+function doAction(name, btn) {
+  switch(name) {
+    case 'applySelected': {
+      const item = getItem(state.selectedId); if (!item) return;
+      pushUndo();
+      item.label = $('f-label')?.value || item.label;
+      item.size  = $('f-size')?.value || '';
+      item.relation = $('f-relation')?.value || '';
+      if ($('f-valve')) item.valveState = $('f-valve').value || '';
+      item.w = parseInt($('f-w')?.value || item.w, 10);
+      item.h = parseInt($('f-h')?.value || item.h, 10);
+      item.notes = $('f-notes')?.value || '';
+      refreshItem(item); solveFlow(); persist();
+      toast('Saved'); break;
+    }
+    case 'deleteSelected': if (state.selectedId) deleteItem(state.selectedId); renderSheet(); break;
+    case 'duplicateSelected': {
+      const i = getItem(state.selectedId); if (!i) return;
+      addItem(i.type, { ...i, x: i.x + 24, y: i.y + 24, id: undefined });
+      break;
+    }
+    case 'measureFrom': {
+      if (!state.selectedId) return;
+      const a = state.selectedId;
+      toast('Tap another part to measure to');
+      const handler = (e) => {
+        const n = e.target.closest('.node');
+        if (!n) return;
+        const b = n.dataset.id;
+        if (b === a) return;
+        state.dims.push({ a, b, label: 'Spacing' });
+        viewport.removeEventListener('pointerdown', handler, true);
+        drawDims(); persist();
+      };
+      viewport.addEventListener('pointerdown', handler, true);
+      break;
+    }
+    case 'deletePipe': {
+      pushUndo();
+      const pid = btn.dataset.pid;
+      state.edges = state.edges.filter(e => e.id !== pid);
+      solveFlow(); persist(); renderSheet(); break;
+    }
+    case 'connectMode': startConnectMode(); break;
+    case 'solveFlow': solveFlow(); renderSheet(); break;
+    case 'exportPDF': exportPDF(); break;
+    case 'exportJSON': exportJSON(); break;
+    case 'exportPNG': exportPNG(); break;
+    case 'sharePlan': sharePlan(); break;
+    case 'importJSON': importJSON(); break;
+    case 'undo': undo(); break;
+    case 'pushGithub': openGithubModal(); break;
+    case 'clearAll': if (confirm('Clear everything?')) { pushUndo(); state.items=[]; state.edges=[]; state.dims=[]; state.selectedId=null; redrawAll(); persist(); } break;
+    case 'demo': loadDemo(); break;
+    case 'theme-light': document.documentElement.setAttribute('data-theme','light'); break;
+    case 'theme-dark':  document.documentElement.setAttribute('data-theme','dark');  break;
+    case 'theme-auto':  document.documentElement.setAttribute('data-theme', matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'); break;
+  }
+}
+
+function syncSelectedPanel() {
+  if (activeTab === 'selected') renderSheet();
+}
+
+// ---------- Toast ----------
+let toastTimer = null;
+function toast(msg) {
+  toastEl.textContent = msg;
+  toastEl.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toastEl.classList.remove('show'), 1800);
+}
+
+// ---------- Export ----------
+function exportJSON() {
+  const data = { version: 2, items: state.items, edges: state.edges, dims: state.dims };
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type:'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `poolflow-plan-${Date.now()}.json`;
+  a.click();
   toast('JSON exported');
 }
-$('importFile').addEventListener('change', e=>{
-  const f=e.target.files[0]; if(!f) return;
-  const rd=new FileReader();
-  rd.onload=()=>{ try{
-    const p=JSON.parse(rd.result);
-    if(!p.components) throw 0;
-    p.id=p.id||('proj_'+Date.now().toString(36));
-    project=migrateProject(p);
-    $('projName').value=project.name||''; $('projClient').value=project.client||'';
-    render(); fitToScreen(); saveProject(); toast('Project imported');
-  }catch(_){ toast('Invalid JSON file'); } };
-  rd.readAsText(f); e.target.value='';
+function importJSON() {
+  const input = document.createElement('input');
+  input.type = 'file'; input.accept = 'application/json';
+  input.onchange = () => {
+    const file = input.files?.[0]; if (!file) return;
+    const r = new FileReader();
+    r.onload = () => {
+      try {
+        const s = JSON.parse(r.result);
+        pushUndo();
+        state.items = s.items || []; state.edges = s.edges || []; state.dims = s.dims || [];
+        state.nextId = state.items.length + 100;
+        state.selectedId = null;
+        redrawAll(); fitToContent(); persist();
+        toast('Plan loaded');
+      } catch { toast('Invalid file'); }
+    };
+    r.readAsText(file);
+  };
+  input.click();
+}
+
+function exportPDF() {
+  if (!window.jspdf) { toast('PDF library still loading…'); return; }
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ orientation:'landscape', unit:'pt', format:'a4' });
+  doc.setFont('helvetica','bold'); doc.setFontSize(18);
+  doc.text('PoolFlow Planner — Equipment & Plumbing Plan', 32, 36);
+  doc.setFont('helvetica','normal'); doc.setFontSize(10);
+  doc.text(new Date().toLocaleString(), 32, 52);
+
+  // Render plan diagram as a vector-ish bitmap by rasterizing SVG/world into a temp canvas
+  const png = renderWorldToImage();
+  if (png) {
+    const pageW = doc.internal.pageSize.getWidth();
+    const pageH = doc.internal.pageSize.getHeight();
+    const maxW = pageW - 64, maxH = pageH - 130;
+    const ratio = Math.min(maxW / png.w, maxH / png.h);
+    doc.addImage(png.url, 'PNG', 32, 68, png.w * ratio, png.h * ratio);
+  }
+
+  // Parts list
+  doc.addPage();
+  doc.setFontSize(16); doc.text('Parts', 32, 36);
+  doc.setFontSize(10);
+  let y = 60;
+  state.items.forEach(i => {
+    const line = `• ${i.label} (${i.type})  size:${i.size||'-'}  valve:${i.valveState||'-'}  rel:${i.relation||'-'}  notes:${i.notes||'-'}`;
+    doc.text(line, 32, y); y += 14;
+    if (y > 540) { doc.addPage(); y = 36; }
+  });
+
+  // Connections
+  doc.addPage(); doc.setFontSize(16); doc.text('Connections', 32, 36);
+  doc.setFontSize(10); y = 60;
+  state.edges.forEach(e => {
+    const a = getItem(e.from), b = getItem(e.to);
+    const line = `• ${a?.label} → ${b?.label}   ${PIPE_TYPES[e.type]?.label||e.type}  ${e.size||'-'}  ${e.active?'active':'inactive'}${e.blocked?' BLOCKED':''}`;
+    doc.text(line, 32, y); y += 14;
+    if (y > 540) { doc.addPage(); y = 36; }
+  });
+
+  // Validation
+  doc.addPage(); doc.setFontSize(16); doc.text('Validation', 32, 36);
+  doc.setFontSize(10); y = 60;
+  const issues = state.lastSolve?.issues?.length ? state.lastSolve.issues : ['No hydraulic errors detected.'];
+  issues.forEach(t => { doc.text('• ' + t, 32, y); y += 14; if (y>540){doc.addPage();y=36;} });
+
+  // Takeoff
+  doc.addPage(); doc.setFontSize(16); doc.text('Fittings takeoff', 32, 36);
+  doc.setFontSize(10); y = 60;
+  // recompute counts
+  const counts = {};
+  state.items.forEach(i => { counts[i.type] = (counts[i.type]||0)+1; });
+  state.edges.forEach(e => {
+    const k = `${PIPE_TYPES[e.type]?.label||e.type} pipe ${e.size||'—'}`;
+    counts[k] = (counts[k]||0)+1;
+    counts['Est. 90° elbows'] = (counts['Est. 90° elbows']||0)+2;
+  });
+  Object.entries(counts).forEach(([k,v]) => { doc.text(`• ${v} × ${k}`, 32, y); y += 14; if (y>540){doc.addPage();y=36;} });
+
+  doc.save(`poolflow-plan-${Date.now()}.pdf`);
+  toast('PDF exported');
+}
+
+// Rasterize the world (positions of nodes + edges) to a PNG-ish data URL via canvas
+function renderWorldToImage() {
+  if (!state.items.length) return null;
+  let minX=Infinity, minY=Infinity, maxX=-Infinity, maxY=-Infinity;
+  for (const i of state.items) { minX=Math.min(minX,i.x); minY=Math.min(minY,i.y); maxX=Math.max(maxX,i.x+i.w); maxY=Math.max(maxY,i.y+i.h); }
+  const pad = 40;
+  const w = (maxX - minX) + pad*2, h = (maxY - minY) + pad*2;
+  const c = document.createElement('canvas');
+  const scale = 2;
+  c.width = w * scale; c.height = h * scale;
+  const ctx = c.getContext('2d');
+  ctx.scale(scale, scale);
+  ctx.fillStyle = '#ffffff'; ctx.fillRect(0,0,w,h);
+  const ox = -minX + pad, oy = -minY + pad;
+
+  // grid
+  ctx.strokeStyle = '#eef0f3'; ctx.lineWidth = 1;
+  for (let x = 0; x < w; x += 24) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,h); ctx.stroke(); }
+  for (let y = 0; y < h; y += 24) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(w,y); ctx.stroke(); }
+
+  // edges
+  for (const e of state.edges) {
+    const a = getItem(e.from), b = getItem(e.to); if (!a||!b) continue;
+    const p1 = { x: a.x + a.w/2 + ox, y: a.y + a.h/2 + oy };
+    const p2 = { x: b.x + b.w/2 + ox, y: b.y + b.h/2 + oy };
+    const t = PIPE_TYPES[e.type] || PIPE_TYPES.return;
+    ctx.strokeStyle = t.color.startsWith('var') ? cssVarColor(t.color) : t.color;
+    ctx.lineWidth = pipeStrokeWidth(e.size);
+    ctx.setLineDash(t.dash ? t.dash.split(' ').map(Number) : []);
+    ctx.beginPath();
+    const mx = (p1.x + p2.x) / 2;
+    ctx.moveTo(p1.x, p1.y);
+    ctx.bezierCurveTo(mx, p1.y, mx, p2.y, p2.x, p2.y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    // arrowhead
+    const ang = Math.atan2(p2.y - p1.y, p2.x - p1.x);
+    ctx.fillStyle = ctx.strokeStyle;
+    ctx.beginPath();
+    ctx.moveTo(p2.x, p2.y);
+    ctx.lineTo(p2.x - 10*Math.cos(ang-0.4), p2.y - 10*Math.sin(ang-0.4));
+    ctx.lineTo(p2.x - 10*Math.cos(ang+0.4), p2.y - 10*Math.sin(ang+0.4));
+    ctx.closePath(); ctx.fill();
+    // label
+    ctx.fillStyle = '#111'; ctx.font = 'bold 11px -apple-system, system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(`${e.size||''} ${t.label}`, (p1.x+p2.x)/2, (p1.y+p2.y)/2 - 8);
+  }
+
+  // dims
+  ctx.strokeStyle = '#444'; ctx.fillStyle = '#111';
+  for (const d of state.dims) {
+    const a = getItem(d.a), b = getItem(d.b); if (!a||!b) continue;
+    const ca = { x: a.x + a.w/2 + ox, y: a.y + a.h/2 + oy };
+    const cb = { x: b.x + b.w/2 + ox, y: b.y + b.h/2 + oy };
+    const y = Math.min(ca.y, cb.y) - 30;
+    ctx.beginPath(); ctx.moveTo(ca.x, y); ctx.lineTo(cb.x, y); ctx.stroke();
+    const ft = (Math.hypot(cb.x-ca.x, cb.y-ca.y)/24).toFixed(1);
+    ctx.font = 'bold 11px -apple-system, system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(`${d.label}: ${ft} ft`, (ca.x+cb.x)/2, y - 6);
+  }
+
+  // nodes
+  for (const i of state.items) {
+    const x = i.x + ox, y = i.y + oy;
+    ctx.fillStyle = '#ffffff';
+    ctx.strokeStyle = i.type === 'pool' ? '#1f6feb' : i.type === 'spa' ? '#7c4dff' : i.type === 'pad' ? '#999' : '#333';
+    ctx.lineWidth = 2;
+    if (i.type === 'pad') ctx.setLineDash([6,4]);
+    roundRect(ctx, x, y, i.w, i.h, 8); ctx.fill(); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#111';
+    ctx.font = 'bold 12px -apple-system, system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(i.label, x + i.w/2, y + i.h/2 - 4);
+    ctx.font = '10px -apple-system, system-ui, sans-serif';
+    ctx.fillStyle = '#555';
+    const m = metaText(i);
+    if (m) ctx.fillText(m, x + i.w/2, y + i.h/2 + 12);
+  }
+
+  return { url: c.toDataURL('image/png'), w, h };
+}
+function roundRect(ctx,x,y,w,h,r){r=Math.min(r,w/2,h/2);ctx.beginPath();ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath();}
+function cssVarColor(v) {
+  // map our CSS variable names to concrete colors for canvas export
+  const map = {
+    'var(--pipe-suction)':'#1f6feb',
+    'var(--pipe-return)':'#e23b56',
+    'var(--pipe-spillover)':'#7c4dff',
+    'var(--pipe-feature)':'#e07b00',
+    'var(--pipe-conduit)':'#9aa0a6',
+    'var(--pipe-gas)':'#d19900',
+    'var(--pipe-drain)':'#3a4a5c',
+  };
+  return map[v] || '#333';
+}
+
+function exportPNG() {
+  const img = renderWorldToImage();
+  if (!img) { toast('Add parts first'); return; }
+  const a = document.createElement('a');
+  a.href = img.url; a.download = `poolflow-plan-${Date.now()}.png`;
+  a.click();
+  toast('Image saved');
+}
+async function sharePlan() {
+  const img = renderWorldToImage();
+  if (!img) { toast('Add parts first'); return; }
+  try {
+    const blob = await (await fetch(img.url)).blob();
+    const file = new File([blob], `poolflow-plan.png`, { type:'image/png' });
+    if (navigator.canShare && navigator.canShare({ files:[file] })) {
+      await navigator.share({ files:[file], title:'PoolFlow plan' });
+    } else {
+      exportPNG();
+    }
+  } catch { exportPNG(); }
+}
+
+// ---------- GitHub push ----------
+function openGithubModal() {
+  modalContent.innerHTML = `
+    <h3>Update GitHub</h3>
+    <p style="color:var(--muted); font-size:13px;">This will overwrite <code>index.html</code> in <code>reifere-stack/poolflow-planner</code> with the current page source. Bring your own Personal Access Token (classic) with <code>repo</code> scope.</p>
+    <div class="field"><label>GitHub Token</label><input type="password" id="gh-token" placeholder="ghp_..."/></div>
+    <div class="field" style="margin-top:8px;"><label>Commit message</label><input id="gh-msg" value="Update planner from device"/></div>
+    <div class="row" style="margin-top:14px;">
+      <button class="btn" id="gh-cancel">Cancel</button>
+      <button class="btn primary" id="gh-go">Push</button>
+    </div>
+  `;
+  modalBackdrop.classList.add('show');
+  $('gh-cancel').onclick = closeModal;
+  $('gh-go').onclick = async () => {
+    const token = $('gh-token').value.trim();
+    const msg = $('gh-msg').value.trim() || 'Update planner';
+    if (!token) { toast('Need a token'); return; }
+    try {
+      const html = document.documentElement.outerHTML;
+      const content = btoa(unescape(encodeURIComponent(html)));
+      const url = 'https://api.github.com/repos/reifere-stack/poolflow-planner/contents/index.html';
+      const get = await fetch(url, { headers:{ Authorization:`Bearer ${token}`, Accept:'application/vnd.github+json' } });
+      const existing = await get.json();
+      const put = await fetch(url, {
+        method:'PUT',
+        headers:{ Authorization:`Bearer ${token}`, Accept:'application/vnd.github+json','Content-Type':'application/json' },
+        body: JSON.stringify({ message: msg, content, sha: existing.sha })
+      });
+      if (!put.ok) throw new Error(await put.text());
+      toast('Pushed to GitHub');
+      closeModal();
+    } catch (err) {
+      toast('Push failed');
+      console.error(err);
+    }
+  };
+}
+function closeModal() { modalBackdrop.classList.remove('show'); modalContent.innerHTML=''; }
+modalBackdrop.addEventListener('click', (e) => { if (e.target === modalBackdrop) closeModal(); });
+
+// ---------- Demo ----------
+function loadDemo() {
+  pushUndo();
+  state.items = []; state.edges = []; state.dims = []; state.selectedId = null;
+  world.querySelectorAll('.node').forEach(n => n.remove());
+  state.nextId = 1;
+
+  const add = (type, opts) => addItem(type, opts);
+  const pool = add('pool',    { x: 80,  y: 380, label:'Pool' });
+  const spa  = add('spa',     { x: 380, y: 220, label:'Spa', relation:'pool' });
+  const pad  = add('pad',     { x: 1100, y: 280, label:'Equipment Pad' });
+  const sk   = add('skimmer', { x: 110, y: 340, label:'Skimmer', size:'2.5"' });
+  const md   = add('drain',   { x: 200, y: 540, label:'Main Drain', size:'2"' });
+  const ret1 = add('return',  { x: 110, y: 600, label:'Return 1', size:'2"' });
+  const ret2 = add('return',  { x: 240, y: 600, label:'Return 2', size:'2"' });
+  const jet  = add('jet',     { x: 410, y: 260, label:'Spa Jet 1', size:'2"' });
+  const feat = add('feature', { x: 700, y: 200, label:'Water Feature', size:'2"', relation:'spa' });
+  const vSuc = add('valve3',  { x: 920, y: 320, label:'Suction Valve', valveState:'a' });
+  const pump = add('pump',    { x: 1110, y: 300, label:'Pump', size:'2.5"' });
+  const flt  = add('filter',  { x: 1240, y: 300, label:'Filter', size:'2.5"' });
+  const htr  = add('heater',  { x: 1370, y: 300, label:'Heater', size:'2.5"' });
+  const vRet = add('valve3',  { x: 1510, y: 300, label:'Return Valve', valveState:'both' });
+  const tee  = add('tee',     { x: 1620, y: 380, label:'Tee' });
+  const fvlv = add('valve2',  { x: 800, y: 300, label:'Feature Valve', valveState:'open' });
+
+  const addE = (from, to, type, size) => state.edges.push({ id:uid(), from:from.id, to:to.id, type, size, label:`${from.label} → ${to.label}`, active:false, blocked:false });
+  addE(sk,   vSuc, 'suction', '2.5"');
+  addE(md,   vSuc, 'suction', '2"');
+  addE(vSuc, pump, 'suction', '2.5"');
+  addE(pump, flt,  'return',  '2.5"');
+  addE(flt,  htr,  'return',  '2.5"');
+  addE(htr,  vRet, 'return',  '2.5"');
+  addE(htr,  fvlv, 'feature', '2"');
+  addE(fvlv, feat, 'feature', '2"');
+  addE(feat, spa,  'feature', '2"');
+  addE(vRet, tee,  'return',  '2.5"');
+  addE(tee,  ret1, 'return',  '2"');
+  addE(tee,  ret2, 'return',  '2"');
+  addE(vRet, jet,  'return',  '2"');
+  addE(spa,  pool, 'spillover','2.5"');
+
+  state.dims.push({ a: ret1.id, b: ret2.id, label:'Return spacing' });
+
+  solveFlow(); persist(); redrawAll(); fitToContent();
+}
+
+// ---------- Top-bar buttons ----------
+$('menuBtn').addEventListener('click', () => {
+  if (sheet.classList.contains('open')) midSheet();
+  else openSheet();
+});
+$('connectBtn').addEventListener('click', () => {
+  if (state.connectMode) cancelConnectMode();
+  else startConnectMode();
+});
+$('connectCancel').addEventListener('click', cancelConnectMode);
+$('undoBtn').addEventListener('click', undo);
+
+$('zoomIn').addEventListener('click', () => setZoom(state.view.scale * 1.25));
+$('zoomOut').addEventListener('click', () => setZoom(state.view.scale / 1.25));
+$('zoomFit').addEventListener('click', fitToContent);
+
+// Theme auto
+document.documentElement.setAttribute('data-theme', matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+
+// ---------- Init ----------
+if (!restore()) {
+  loadDemo();
+} else {
+  redrawAll();
+  applyTransform();
+  setTimeout(fitToContent, 50);
+}
+renderSheet();
+solveFlow();
+
+// Keyboard
+document.addEventListener('keydown', (e) => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+  if (e.key === 'Delete' || e.key === 'Backspace') {
+    if (state.selectedId) { deleteItem(state.selectedId); e.preventDefault(); }
+  }
+  if ((e.ctrlKey || e.metaKey) && e.key === 'z') { undo(); e.preventDefault(); }
 });
 
-/* ============================================================
- *  PDF export
- * ============================================================ */
-$('btnExportPdf').onclick=exportPDF;
-function exportPDF(){
-  if(!project.components.length && !project.pipes.length){ toast('Add components first'); return; }
-  toast('Building PDF…');
-  setTimeout(()=>{ try{ buildPDF(); }catch(err){ console.error(err); toast('PDF error'); } }, 30);
-}
+// Resize
+window.addEventListener('resize', () => { applyTransform(); });
 
-function buildPDF(){
-  const { jsPDF } = window.jspdf;
-  const doc = new jsPDF({ orientation:'landscape', unit:'pt', format:'letter' }); // 792 x 612
-  const PW=792, PH=612, M=24;
-  const INK='#0f1b2d', LINE='#94a9c4', SUB='#5a6e88';
-
-  // ---- Outer border ----
-  doc.setDrawColor(15,27,45); doc.setLineWidth(1.4);
-  doc.rect(M, M, PW-M*2, PH-M*2);
-
-  // ---- Title block (bottom strip) ----
-  const tbH=70, tbY=PH-M-tbH;
-  doc.setLineWidth(1); doc.line(M, tbY, PW-M, tbY);
-  // dividers
-  const cols=[M, M+300, M+470, M+620, PW-M];
-  for(let i=1;i<cols.length-1;i++) doc.line(cols[i], tbY, cols[i], PH-M);
-  function tbCell(x, label, value, big){
-    doc.setFontSize(6.5); doc.setTextColor(90,110,136); doc.setFont('helvetica','normal');
-    doc.text(label.toUpperCase(), x+8, tbY+15);
-    doc.setTextColor(15,27,45); doc.setFont('helvetica', big?'bold':'normal'); doc.setFontSize(big?14:10);
-    doc.text(value||'—', x+8, tbY+ (big?40:33), {maxWidth: 280});
-  }
-  tbCell(cols[0], 'Project', project.name||'Untitled Project', true);
-  // client/address spans into project cell second line
-  doc.setFontSize(8); doc.setTextColor(90,110,136); doc.setFont('helvetica','normal');
-  doc.text((project.client||'').slice(0,70), cols[0]+8, tbY+56, {maxWidth:284});
-  tbCell(cols[1], 'Sheet', 'Plumbing Plan');
-  doc.setFontSize(8); doc.setTextColor(90,110,136);
-  doc.text('Top-down schematic', cols[1]+8, tbY+50);
-  tbCell(cols[2], 'Contractor', project.contractor||'');
-  tbCell(cols[3], 'Date', new Date().toLocaleDateString());
-  doc.setFontSize(7); doc.setTextColor(90,110,136);
-  doc.text('PoolFlow Planner', cols[3]+8, tbY+50);
-
-  // ---- Header strip ----
-  doc.setFont('helvetica','bold'); doc.setFontSize(13); doc.setTextColor(15,27,45);
-  doc.text('POOL & SPA PLUMBING PLAN', M+10, M+22);
-  doc.setFont('helvetica','normal'); doc.setFontSize(8); doc.setTextColor(90,110,136);
-  doc.text('Scale: 1 grid = 1  ft (approx.) · Not for construction without site verification', M+10, M+35);
-
-  // ---- Diagram area ----
-  const legendW=150;
-  const dx=M+8, dyTop=M+46, dw=PW-M*2-legendW-24, dh=tbY-dyTop-10;
-  // light frame for plan
-  doc.setDrawColor(200,210,225); doc.setLineWidth(0.5); doc.rect(dx, dyTop, dw, dh);
-
-  const bb=contentBBox()||{x:0,y:0,w:100,h:100};
-  const pad=20;
-  const s=Math.min((dw-pad*2)/bb.w, (dh-pad*2)/bb.h);
-  const ox=dx + (dw - bb.w*s)/2 - bb.x*s;
-  const oy=dyTop + (dh - bb.h*s)/2 - bb.y*s;
-  const TX=(x)=>ox+x*s, TY=(y)=>oy+y*s;
-
-  // grid inside diagram (subtle)
-  doc.setDrawColor(228,234,242); doc.setLineWidth(0.3);
-  // draw pipes
-  for(const p of project.pipes){
-    const pts=pipePoints(p); const t=PIPE_TYPES[p.type];
-    const rgb=hex2rgb(t.color);
-    doc.setDrawColor(rgb[0],rgb[1],rgb[2]);
-    doc.setLineWidth(Math.max(0.8, pipeStrokeWidth(p.size)*s*0.5));
-    if(t.dash){ const dd=t.dash.split(' ').map(n=>+n*s*0.5); doc.setLineDashPattern(dd,0);} else doc.setLineDashPattern([],0);
-    for(let i=0;i<pts.length-1;i++) doc.line(TX(pts[i].x),TY(pts[i].y),TX(pts[i+1].x),TY(pts[i+1].y));
-    doc.setLineDashPattern([],0);
-    // direction arrowhead at midpoint (flow direction = draw order, or reversed)
-    {
-      const dPts = p.reversed ? pts.slice().reverse() : pts;
-      const a = pointAt(dPts, 0.5);
-      const asz = Math.max(4, 5 + pipeStrokeWidth(p.size)*0.6) * s;
-      const ax=TX(a.x), ay=TY(a.y);
-      const bx=ax-a.ux*asz, by=ay-a.uy*asz;
-      const w=asz*0.6, pxv=-a.uy, pyv=a.ux;
-      doc.setFillColor(rgb[0],rgb[1],rgb[2]);
-      doc.triangle(ax,ay, bx+pxv*w,by+pyv*w, bx-pxv*w,by-pyv*w, 'F');
-    }
-    // size label
-    const mid=midLabelPoint(pts);
-    doc.setFillColor(255,255,255); doc.setDrawColor(rgb[0],rgb[1],rgb[2]); doc.setLineWidth(0.4);
-    const lw=p.size.length*4+6;
-    doc.rect(TX(mid.x)-lw/2, TY(mid.y)-6, lw, 11, 'FD');
-    doc.setFontSize(6.5); doc.setTextColor(rgb[0],rgb[1],rgb[2]); doc.setFont('helvetica','bold');
-    doc.text(p.size, TX(mid.x), TY(mid.y)+2.5, {align:'center'});
-  }
-  // draw components
-  doc.setFont('helvetica','bold');
-  for(const c of project.components){
-    const def=compDef(c.type);
-    if(def.kind==='shape'){
-      doc.setDrawColor(43,91,134); doc.setFillColor(238,243,250); doc.setLineWidth(1);
-      if(def.dashed) doc.setLineDashPattern([3,2],0); else doc.setLineDashPattern([],0);
-      if(def.shape==='ellipse'){
-        doc.ellipse(TX(c.x+c.w/2),TY(c.y+c.h/2), c.w/2*s, c.h/2*s, 'FD');
-      } else {
-        doc.roundedRect(TX(c.x),TY(c.y), c.w*s, c.h*s, 4,4,'FD');
-      }
-      doc.setLineDashPattern([],0);
-      doc.setFontSize(Math.max(7,Math.min(11, c.h*s*0.18)));
-      doc.setTextColor(15,27,45);
-      doc.text(c.label, TX(c.x+c.w/2), TY(c.y+c.h/2)+3, {align:'center'});
-    } else {
-      const box=(def.kind==='equip'?EQUIP_BOX:FITTING_BOX)*s;
-      doc.setDrawColor(43,91,134); doc.setFillColor(255,255,255); doc.setLineWidth(0.8);
-      const cx=TX(c.x), cy=TY(c.y);
-      if(def.kind==='equip') doc.roundedRect(cx-box/2,cy-box/2,box,box,3,3,'FD');
-      else doc.circle(cx,cy,box/2,'FD');
-      // initials glyph
-      doc.setFontSize(Math.max(5,box*0.34)); doc.setTextColor(15,27,45); doc.setFont('helvetica','bold');
-      doc.text(glyphFor(c.type), cx, cy+box*0.13, {align:'center'});
-      doc.setFontSize(6.2); doc.setFont('helvetica','normal'); doc.setTextColor(60,80,105);
-      doc.text(c.label, cx, cy+box/2+8, {align:'center', maxWidth:80});
-    }
-  }
-
-  // ---- Legend ----
-  const lx=PW-M-legendW-8, ly=dyTop;
-  doc.setDrawColor(200,210,225); doc.setLineWidth(0.6); doc.setFillColor(248,250,252);
-  doc.rect(lx, ly, legendW, dh, 'FD');
-  let yy=ly+18;
-  doc.setFont('helvetica','bold'); doc.setFontSize(9); doc.setTextColor(15,27,45);
-  doc.text('LEGEND', lx+10, yy); yy+=16;
-  doc.setFontSize(7); doc.setFont('helvetica','bold'); doc.setTextColor(90,110,136);
-  doc.text('PIPE TYPES', lx+10, yy); yy+=4;
-  doc.setFont('helvetica','normal'); doc.setTextColor(15,27,45);
-  const usedTypes=new Set(project.pipes.map(p=>p.type));
-  for(const [k,v] of Object.entries(PIPE_TYPES)){
-    yy+=13;
-    const rgb=hex2rgb(v.color); doc.setDrawColor(rgb[0],rgb[1],rgb[2]); doc.setLineWidth(2);
-    if(v.dash) doc.setLineDashPattern([4,2],0); else doc.setLineDashPattern([],0);
-    doc.line(lx+10, yy-2, lx+34, yy-2); doc.setLineDashPattern([],0);
-    doc.setFontSize(7); doc.setTextColor(usedTypes.has(k)?15:160, usedTypes.has(k)?27:170, usedTypes.has(k)?45:185);
-    doc.text(v.label, lx+40, yy);
-  }
-  yy+=20;
-  doc.setFont('helvetica','bold'); doc.setFontSize(7); doc.setTextColor(90,110,136);
-  doc.text('PIPE SIZES USED', lx+10, yy);
-  doc.setFont('helvetica','normal'); doc.setTextColor(15,27,45); doc.setFontSize(7);
-  const usedSizes=[...new Set(project.pipes.map(p=>p.size))].sort((a,b)=>parseFloat(a)-parseFloat(b));
-  yy+=12; doc.text(usedSizes.length?usedSizes.join('  ·  '):'—', lx+10, yy);
-
-  yy+=20;
-  doc.setFont('helvetica','bold'); doc.setFontSize(7); doc.setTextColor(90,110,136);
-  doc.text('COMPONENT KEY', lx+10, yy);
-  doc.setFont('helvetica','normal'); doc.setFontSize(6.5); doc.setTextColor(15,27,45);
-  const usedComp=[...new Set(project.components.map(c=>c.type))];
-  for(const t of usedComp){
-    if(yy> ly+dh-16) break;
-    yy+=11;
-    doc.setFont('helvetica','bold'); doc.setTextColor(15,27,45); doc.setFontSize(6.5);
-    doc.text(glyphFor(t), lx+12, yy, {align:'center'});
-    doc.setFont('helvetica','normal'); doc.setTextColor(60,80,105);
-    doc.text(CATALOG[t].label, lx+24, yy, {maxWidth:legendW-30});
-  }
-
-  const fname=(project.name||'poolflow-plan').replace(/[^a-z0-9]+/gi,'-').toLowerCase();
-  doc.save(fname+'.pdf');
-  toast('PDF downloaded');
-}
-function glyphFor(type){
-  const map={pool:'PL',spa:'SPA',padzone:'PAD',spillover:'SO',skimmer:'SK',return:'R',drain:'MD',jet:'JET',bubbler:'BUB',deckjet:'DJ',sheer:'SD',slide:'SL',autofill:'AF',custom:'?',pump:'P',filter:'F',heater:'H',saltcell:'SC',booster:'BP',valve2:'2W',valve3:'3W',checkvalve:'CV',actuated:'AV',manifold:'MF',customeq:'EQ'};
-  return map[type]||'?';
-}
-function hex2rgb(h){ h=h.replace('#',''); return [parseInt(h.slice(0,2),16),parseInt(h.slice(2,4),16),parseInt(h.slice(4,6),16)]; }
-
-/* ============================================================
- *  Misc UI
- * ============================================================ */
-let toastTimer=null;
-function toast(msg){ const t=$('toast'); t.textContent=msg; t.hidden=false; clearTimeout(toastTimer); toastTimer=setTimeout(()=>t.hidden=true,1800); }
-function esc(s){ return String(s||'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
-
-$('inspClose').onclick=clearSelection;
-
-// palette toggle (mobile)
-$('paletteToggle').onclick=()=>$('palette').classList.toggle('open');
-function closePalette(){ $('palette').classList.remove('open'); }
-
-// inject logo
-$('palette') && document.querySelectorAll('.logo, .empty-logo').forEach(e=>e.innerHTML=LOGO_SVG);
-
-/* ============================================================
- *  Init
- * ============================================================ */
-function init(){
-  buildSvgScaffold();
-  buildPalette();
-  document.querySelectorAll('.logo, .empty-logo').forEach(e=>e.innerHTML=LOGO_SVG);
-  const curId=storage.getItem(LS_CUR);
-  const map=loadAll();
-  if(curId && map[curId]){ loadProject(curId); }
-  else { startNewProject(); }
-  setTool('select');
-  applyView();
-  window.addEventListener('resize', ()=>{});
-  // expose for QA
-  window.__poolflow={ get project(){return project;}, get flowMode(){return flowMode;}, addComponent, setTool, setFlowMode, toggleFlowMode, togglePipeActive, toggleSpillover, fitToScreen, exportPDF, screenToWorld, render };
-}
-document.addEventListener('DOMContentLoaded', init);
 })();
