@@ -74,6 +74,17 @@ function restore() {
     if (!s || !Array.isArray(s.items)) return false;
     state.items = s.items;
     state.edges = s.edges || [];
+    // Migration: old 3-way valve states 'a'/'b'/'both' -> 'pos1'/'pos2'/'shared'.
+    // Also strip the long-dead edge.valvePort field.
+    const VS_MAP = { a: 'pos1', b: 'pos2', both: 'shared', '': 'shared' };
+    for (const it of state.items) {
+      if (it.type === 'valve3' && it.valveState in VS_MAP) {
+        it.valveState = VS_MAP[it.valveState];
+      }
+    }
+    for (const e of state.edges) {
+      if ('valvePort' in e) delete e.valvePort;
+    }
     state.dims = s.dims || [];
     state.nextId = s.nextId || (s.items.length + 1);
     state.view = s.view || { scale:1, tx:0, ty:0 };
@@ -563,7 +574,7 @@ function addItem(type, opts = {}) {
     size: opts.size || '',
     notes: opts.notes || '',
     relation: opts.relation || '',
-    valveState: opts.valveState || (type==='valve2' ? 'open' : type==='valve3' ? 'both' : ''),
+    valveState: opts.valveState || (type==='valve2' ? 'open' : type==='valve3' ? 'shared' : ''),
     x: opts.x ?? Math.round((center.x - tool.w/2 + offset) / 4) * 4,
     y: opts.y ?? Math.round((center.y - tool.h/2 + offset) / 4) * 4,
     w: opts.w ?? tool.w,
@@ -607,7 +618,16 @@ function metaText(item) {
     bits.push(`${fmtFIShort(item.w)} × ${fmtFIShort(item.h)}`);
   }
   if (item.size) bits.push(item.size);
-  if (item.valveState) bits.push(item.valveState);
+  if (item.valveState) {
+    if (item.type === 'valve3') {
+      const info = valveBranchInfo(item);
+      if (item.valveState === 'pos1') bits.push('→ ' + info.pos1);
+      else if (item.valveState === 'pos2') bits.push('→ ' + info.pos2);
+      else bits.push('shared');
+    } else {
+      bits.push(item.valveState);
+    }
+  }
   if (item.relation) bits.push('→' + item.relation);
   if (item.notes) bits.push(item.notes);
   return bits.join(' · ');
@@ -649,9 +669,9 @@ function cycleValve(item) {
   if (item.type === 'valve2') {
     item.valveState = item.valveState === 'open' ? 'closed' : 'open';
   } else if (item.type === 'valve3') {
-    const order = ['a','b','both'];
-    const next = order[(order.indexOf(item.valveState) + 1) % order.length] || 'a';
-    item.valveState = next;
+    const order = ['pos1','pos2','shared'];
+    const cur = order.indexOf(item.valveState);
+    item.valveState = order[(cur + 1) % order.length] || 'shared';
   }
   refreshItem(item); solveFlow(); persist();
 }
@@ -930,14 +950,6 @@ function drawEdges() {
   let html = defs;
   // Spillover arrows are drawn first so pipes render above them
   html += renderSpillovers();
-  // Precompute per-3-way-valve output order so we can label A/B badges.
-  // Mirrors the solver: explicit edge.valvePort wins, then insertion order fills.
-  const valve3Outs = {};
-  for (const e of state.edges) {
-    if (e.type === 'conduit') continue;
-    const src = getItem(e.from);
-    if (src && src.type === 'valve3') (valve3Outs[src.id] ||= []).push(e);
-  }
   for (const e of state.edges) {
     const pts = edgeRoutePoints(e);
     if (pts.length < 2) continue;
@@ -981,28 +993,36 @@ function drawEdges() {
       });
     }
   }
-  // A/B port badges on 3-way valve output edges (drawn after pipes so they sit on top).
-  // Only show badges when the valve actually has multiple outputs to disambiguate.
-  for (const [vid, outs] of Object.entries(valve3Outs)) {
-    if (outs.length < 2) continue;
-    const valve = getItem(vid);
-    for (let i = 0; i < outs.length; i++) {
-      const edge = outs[i];
-      const port = valvePortFor(outs, i);
-      if (!port) continue; // only first two outs get a label
+  // Branch-name chips on 3-way valve branch pipes (Poolside-style).
+  // For every valve3, draw a small chip near the valve end of each branch pipe showing
+  // the destination name (e.g. "Pool", "Spa", or "Branch 1" fallback).
+  for (const valve of state.items) {
+    if (valve.type !== 'valve3') continue;
+    const info = valveBranchInfo(valve);
+    if (info.branches.length < 2) continue;
+    const labels = [info.pos1, info.pos2];
+    for (let i = 0; i < info.branches.length; i++) {
+      const edge = info.branches[i];
+      const label = labels[i] || ('Branch ' + (i + 1));
       const pts = edgeRoutePoints(edge);
       if (pts.length < 2) continue;
-      // Place the badge ~22px along the pipe from the valve so it doesn't sit on the valve body.
-      const dx = pts[1].x - pts[0].x, dy = pts[1].y - pts[0].y;
+      // For suction-side branches, the valve sits at the .to end; for return-side, at .from.
+      const valveAtStart = edge.from === valve.id;
+      const p0 = valveAtStart ? pts[0] : pts[pts.length - 1];
+      const p1 = valveAtStart ? pts[1] : pts[pts.length - 2];
+      const dx = p1.x - p0.x, dy = p1.y - p0.y;
       const len = Math.hypot(dx, dy) || 1;
-      const off = Math.min(22, len * 0.4);
-      const bx = pts[0].x + (dx / len) * off;
-      const by = pts[0].y + (dy / len) * off;
-      const active = (valve?.valveState === 'both' || !valve?.valveState || valve?.valveState === port) && edge.active && !edge.blocked;
+      const off = Math.min(28, len * 0.4);
+      const bx = p0.x + (dx / len) * off;
+      const by = p0.y + (dy / len) * off;
+      const vs = valve.valveState || 'shared';
+      const posIsOpen = vs === 'shared' || (vs === 'pos1' && i === 0) || (vs === 'pos2' && i === 1);
+      const active = posIsOpen && edge.active && !edge.blocked;
       const cls = active ? 'port-badge active' : 'port-badge';
       const tcls = active ? 'port-text active' : 'port-text';
-      html += `<circle class="${cls}" cx="${bx}" cy="${by}" r="10" pointer-events="none"></circle>`;
-      html += `<text class="${tcls}" x="${bx}" y="${by}" pointer-events="none">${port.toUpperCase()}</text>`;
+      const w = Math.max(44, label.length * 7.2 + 14);
+      html += `<rect class="${cls}" x="${bx - w/2}" y="${by - 10}" width="${w}" height="20" rx="10" pointer-events="none"></rect>`;
+      html += `<text class="${tcls}" x="${bx}" y="${by}" pointer-events="none">${escapeHtml(label)}</text>`;
     }
   }
   edgeSvg.innerHTML = html;
@@ -1118,39 +1138,111 @@ function redrawAll() {
 
 // ---------- Solver ----------
 function adjacency() { const m = {}; state.items.forEach(i => m[i.id] = []); state.edges.forEach(e => m[e.from].push(e)); return m; }
-// Resolve the port label for a given output edge of a 3-way valve.
-// Honors explicit edge.valvePort = 'a' | 'b'. Otherwise, the first unassigned
-// edge becomes 'a' and the second becomes 'b' (insertion-order fallback so
-// existing plans without explicit assignments keep working).
-function valvePortFor(edges, index) {
-  const explicit = edges[index]?.valvePort;
-  if (explicit === 'a' || explicit === 'b') return explicit;
-  // Insertion-order fallback: walk through edges; skip those with explicit ports;
-  // first unassigned -> 'a', second -> 'b'.
-  let assignedA = null, assignedB = null;
-  for (let i = 0; i < edges.length; i++) {
-    const p = edges[i].valvePort;
-    if (p === 'a') assignedA = i;
-    if (p === 'b') assignedB = i;
+
+// ---------- 3-way valve: Poolside-style named-branch model ----------
+// A 3-way valve has 3 physical ports: 1 trunk (common) + 2 branches.
+// Return-side valves: trunk = inlet, branches = outputs (e.g. Pool / Spa).
+// Suction-side valves: trunk = outlet, branches = inputs (e.g. Skimmer / Main Drain).
+//
+// valveState: 'pos1' | 'pos2' | 'shared'. Position names come from auto-naming
+// the downstream graph (Poolside-style: branch ending at the spa becomes 'Spa').
+
+const BRANCH_NAMED_TYPES = new Set([
+  'pool','spa',
+  'jet','bubbler','return','skimmer','drain','deckjet',
+  'sheer','slide','autofill','feature','waterfall','laminar',
+]);
+
+// Returns { trunk, branches, side } for a valve3 based on graph topology.
+function valveBranches(valve) {
+  const ins  = state.edges.filter(e => e.to   === valve.id && e.type !== 'conduit' && e.type !== 'spillover');
+  const outs = state.edges.filter(e => e.from === valve.id && e.type !== 'conduit' && e.type !== 'spillover');
+  let trunk = null, branches = [], side = 'unknown';
+  if (outs.length >= 2 && ins.length <= 1) {
+    trunk = ins[0] || null; branches = outs.slice(0, 2); side = 'return';
+  } else if (ins.length >= 2 && outs.length <= 1) {
+    trunk = outs[0] || null; branches = ins.slice(0, 2); side = 'suction';
+  } else if (outs.length >= 2) {
+    trunk = ins[0] || null; branches = outs.slice(0, 2); side = 'return';
+  } else if (ins.length >= 2) {
+    trunk = outs[0] || null; branches = ins.slice(0, 2); side = 'suction';
   }
-  let nextA = assignedA === null;
-  let nextB = assignedB === null;
-  for (let i = 0; i < edges.length; i++) {
-    if (edges[i].valvePort === 'a' || edges[i].valvePort === 'b') continue;
-    if (nextA) { if (i === index) return 'a'; nextA = false; continue; }
-    if (nextB) { if (i === index) return 'b'; nextB = false; continue; }
+  // Stable order: top-left destination becomes branch 1.
+  if (branches.length === 2) {
+    const otherEnd = (e) => side === 'suction' ? getItem(e.from) : getItem(e.to);
+    const a = otherEnd(branches[0]), b = otherEnd(branches[1]);
+    if (a && b) {
+      const ka = (a.y || 0) * 10000 + (a.x || 0);
+      const kb = (b.y || 0) * 10000 + (b.x || 0);
+      if (ka > kb) branches = [branches[1], branches[0]];
+    }
+  }
+  return { trunk, branches, side };
+}
+
+// Walk along non-conduit edges from one end of an edge and return the first
+// "named" node (pool/spa/named fixture). Stops on cycles and other valves.
+function findNamedDownstream(startEdge, direction) {
+  const seen = new Set();
+  const startNode = direction === 'forward' ? getItem(startEdge.to) : getItem(startEdge.from);
+  if (!startNode) return null;
+  const stack = [startNode];
+  while (stack.length) {
+    const node = stack.pop();
+    if (!node || seen.has(node.id)) continue;
+    seen.add(node.id);
+    if (BRANCH_NAMED_TYPES.has(node.type)) return node;
+    if (node.type === 'valve3' || node.type === 'valve2' || node.type === 'actuated') continue;
+    const next = direction === 'forward'
+      ? state.edges.filter(e => e.from === node.id && e.type !== 'conduit' && e.type !== 'spillover')
+      : state.edges.filter(e => e.to   === node.id && e.type !== 'conduit' && e.type !== 'spillover');
+    for (const e of next) {
+      const n = direction === 'forward' ? getItem(e.to) : getItem(e.from);
+      if (n && !seen.has(n.id)) stack.push(n);
+    }
   }
   return null;
+}
+
+// Display label for one branch. Priority: explicit override > auto-named > "Branch N".
+function branchLabelFor(valve, branchEdge, branchIndex, side) {
+  const override = valve.branchLabels && valve.branchLabels[branchEdge.id];
+  if (override) return override;
+  const direction = side === 'suction' ? 'backward' : 'forward';
+  const named = findNamedDownstream(branchEdge, direction);
+  if (named) return named.label || ('Branch ' + (branchIndex + 1));
+  return 'Branch ' + (branchIndex + 1);
+}
+
+// Returns { trunk, branches, side, pos1, pos2 } for a valve3.
+function valveBranchInfo(valve) {
+  const { trunk, branches, side } = valveBranches(valve);
+  if (branches.length < 2) {
+    return { trunk, branches, side, pos1: 'Branch 1', pos2: 'Branch 2' };
+  }
+  return {
+    trunk, branches, side,
+    pos1: branchLabelFor(valve, branches[0], 0, side),
+    pos2: branchLabelFor(valve, branches[1], 1, side),
+  };
+}
+
+// Decide if flow may pass through a given edge of a valve3 under its current position.
+function valve3EdgeOpen(valve, edge) {
+  const { branches } = valveBranches(valve);
+  const vs = valve.valveState || 'shared';
+  if (vs === 'shared') return true;
+  const isBranch = branches.some(b => b.id === edge.id);
+  if (!isBranch) return true; // trunk always open
+  if (vs === 'pos1') return branches[0]?.id === edge.id;
+  if (vs === 'pos2') return branches[1]?.id === edge.id;
+  return true;
 }
 
 function valveAllows(node, edges, index) {
   if (node.type === 'valve2') return node.valveState !== 'closed';
   if (node.type === 'valve3') {
-    if (node.valveState === 'both' || !node.valveState) return true;
-    const port = valvePortFor(edges, index);
-    if (node.valveState === 'a') return port === 'a';
-    if (node.valveState === 'b') return port === 'b';
-    return false;
+    return valve3EdgeOpen(node, edges[index]);
   }
   if (node.type === 'checkvalve') return true;
   if (node.type === 'actuated') return node.valveState !== 'closed';
@@ -1206,12 +1298,42 @@ function solveFlow() {
     outs.forEach(o => traverse(o, root, new Set(seen)));
   }
 
+  // Backward traversal for suction-side: walk against arrows from the pump,
+  // marking inputs active. When a 3-way valve appears suction-side, only the
+  // branch open under its current position passes; the other is blocked.
+  function traverseBack(edge, seen) {
+    edge.active = true;
+    const node = getItem(edge.from);
+    if (!node) return;
+    if (seen.has(node.id)) return;
+    seen.add(node.id);
+    if (node.type === 'valve2' && node.valveState === 'closed') {
+      edge.blocked = true; issues.push(`${node.label} is closed.`); return;
+    }
+    const ins = state.edges.filter(e => e.to === node.id && e.type !== 'conduit');
+    if (node.type === 'valve3') {
+      ins.forEach((inE) => {
+        if (valve3EdgeOpen(node, inE)) traverseBack(inE, new Set(seen));
+        else inE.blocked = true;
+      });
+      return;
+    }
+    if (node.type === 'tee') {
+      ins.forEach(inE => traverseBack(inE, new Set(seen)));
+      return;
+    }
+    if (['pool','spa'].includes(node.type)) return;
+    // Otherwise (skimmer/drain/etc.), the suction chain ends here.
+    if (!ins.length) return;
+    ins.forEach(inE => traverseBack(inE, new Set(seen)));
+  }
+
   for (const pump of pumps) {
     const incoming = state.edges.filter(e => e.to === pump.id && e.type !== 'conduit');
     const outgoing = state.edges.filter(e => e.from === pump.id && e.type !== 'conduit');
     if (!incoming.length) issues.push(`Pump ${pump.label} has no suction source.`);
     if (!outgoing.length) issues.push(`Pump ${pump.label} has no return destination.`);
-    incoming.forEach(e => e.active = true);
+    incoming.forEach(e => traverseBack(e, new Set([pump.id])));
     outgoing.forEach(o => traverse(o, pump.label, new Set([pump.id])));
   }
 
@@ -1406,17 +1528,25 @@ function renderSelected() {
           </select>
         </div>
       </div>
-      ${isValve ? `
+      ${isValve ? (item.type === 'valve3' ? (() => {
+        const info = valveBranchInfo(item);
+        return `
+      <div class="field" style="margin-top:8px;"><label>Valve position</label>
+        <select id="f-valve">
+          <option ${item.valveState==='pos1'?'selected':''} value="pos1">Open to ${escapeHtml(info.pos1)}</option>
+          <option ${item.valveState==='pos2'?'selected':''} value="pos2">Open to ${escapeHtml(info.pos2)}</option>
+          <option ${(item.valveState==='shared'||!item.valveState)?'selected':''} value="shared">Shared (both branches open)</option>
+        </select>
+      </div>
+      <p style="color:var(--muted); font-size:12px; margin-top:6px;">Branches are auto-named from the plumbing downstream. Rename a branch by tapping its pipe in the Pipes tab.</p>`;
+      })() : `
       <div class="field" style="margin-top:8px;"><label>Valve mode</label>
         <select id="f-valve">
           <option value="">N/A</option>
           <option ${item.valveState==='open'?'selected':''} value="open">Open</option>
           <option ${item.valveState==='closed'?'selected':''} value="closed">Closed</option>
-          <option ${item.valveState==='a'?'selected':''} value="a">3-way → A</option>
-          <option ${item.valveState==='b'?'selected':''} value="b">3-way → B</option>
-          <option ${item.valveState==='both'?'selected':''} value="both">3-way shared</option>
         </select>
-      </div>` : ''}
+      </div>`) : ''}
       ${renderEquipmentModelPicker(item)}
       ${renderSizeFields(item)}
       ${isBody ? `
@@ -1466,38 +1596,40 @@ function renderPipes() {
   const routeStyle = p.routeStyle || 'auto';
   const editing = state.editingEdgeId ? state.edges.find(e => e.id === state.editingEdgeId) : null;
 
-  // If this pipe leaves a 3-way valve, show port-assignment controls.
+  // If this pipe is a branch of a 3-way valve, show what it leads to and let the
+  // user rename the branch if the auto-name isn't right.
   let portPanel = '';
   if (editing) {
-    const src = getItem(editing.from);
-    if (src && src.type === 'valve3') {
-      const sibs = state.edges.filter(e => e.from === src.id && e.type !== 'conduit');
-      const idx = sibs.indexOf(editing);
-      const inferredPort = idx >= 0 ? valvePortFor(sibs, idx) : null;
-      const explicit = editing.valvePort === 'a' || editing.valvePort === 'b';
-      const labelFor = (p) => p === 'a' ? 'Port A' : p === 'b' ? 'Port B' : '—';
-      const otherEdge = sibs.find((e, i) => i !== idx && valvePortFor(sibs, i) && valvePortFor(sibs, i) !== inferredPort);
-      const otherSummary = otherEdge
-        ? `Port ${(valvePortFor(sibs, sibs.indexOf(otherEdge)) || '?').toUpperCase()}: ${escapeHtml(getItem(otherEdge.to)?.label || '?')}`
-        : 'No second output yet';
-      portPanel = `
+    // The valve might be on either end of the edge (return-side: valve=from; suction-side: valve=to).
+    const candidates = [getItem(editing.from), getItem(editing.to)].filter(v => v && v.type === 'valve3');
+    for (const valve of candidates) {
+      const info = valveBranchInfo(valve);
+      const branchIdx = info.branches.findIndex(b => b.id === editing.id);
+      if (branchIdx < 0) continue; // this edge is the trunk, not a branch
+      const otherIdx = branchIdx === 0 ? 1 : 0;
+      const myLabel = branchIdx === 0 ? info.pos1 : info.pos2;
+      const otherLabel = branchIdx === 0 ? info.pos2 : info.pos1;
+      const override = (valve.branchLabels && valve.branchLabels[editing.id]) || '';
+      portPanel += `
         <div class="panel" style="border:2px solid var(--accent); margin-top:8px;">
-          <h3>3-way valve port</h3>
+          <h3>3-way valve branch</h3>
           <div style="font-size:13px; color:var(--muted); margin-bottom:6px;">
-            Source: <strong>${escapeHtml(src.label)}</strong> · current valve mode:
-            <strong>${escapeHtml(src.valveState || 'both')}</strong>
+            Valve: <strong>${escapeHtml(valve.label)}</strong> · side: <strong>${info.side}</strong>
           </div>
           <div style="font-size:13px; margin-bottom:6px;">
-            This pipe is <strong>${labelFor(inferredPort)}</strong>${explicit ? '' : ' (auto)'}.
-            <br><span style="color:var(--muted); font-size:12px;">${escapeHtml(otherSummary)}</span>
+            This pipe is the <strong>${escapeHtml(myLabel)}</strong> branch.
+            <br><span style="color:var(--muted); font-size:12px;">Other branch: ${escapeHtml(otherLabel)}</span>
+          </div>
+          <div class="field" style="margin-top:6px;"><label>Rename this branch (optional)</label>
+            <input id="f-branch-label" placeholder="Auto: ${escapeHtml(myLabel)}" value="${escapeHtml(override)}"/>
           </div>
           <div class="row" style="gap:6px; margin-top:6px;">
-            <button class="btn ${inferredPort==='a' && explicit ? 'primary' : ''}" data-action="setEdgePort" data-port="a">Set as Port A</button>
-            <button class="btn ${inferredPort==='b' && explicit ? 'primary' : ''}" data-action="setEdgePort" data-port="b">Set as Port B</button>
-            <button class="btn" data-action="setEdgePort" data-port="">Auto</button>
+            <button class="btn primary" data-action="setBranchLabel" data-valve-id="${valve.id}">Save name</button>
+            <button class="btn" data-action="setBranchLabel" data-valve-id="${valve.id}" data-clear="1">Use auto name</button>
           </div>
-          <p style="color:var(--muted); font-size:12px; margin-top:8px;">Tip: set the valve mode (Open A / Open B / Shared) in the valve’s Selected panel to route flow.</p>
+          <p style="color:var(--muted); font-size:12px; margin-top:8px;">Tip: open the valve in the Selected tab and pick “Open to ${escapeHtml(myLabel)}” to route flow this way.</p>
         </div>`;
+      break;
     }
   }
 
@@ -2072,24 +2204,23 @@ function doAction(name, btn) {
       toast('Bends cleared');
       break;
     }
-    case 'setEdgePort': {
+    case 'setBranchLabel': {
       const e = state.edges.find(x => x.id === state.editingEdgeId);
       if (!e) break;
-      const newPort = btn.dataset.port; // 'a' | 'b' | ''
+      const valveId = btn.dataset.valveId;
+      const valve = getItem(valveId);
+      if (!valve) break;
       pushUndo();
-      if (newPort === 'a' || newPort === 'b') {
-        // Clear any sibling that currently holds the same port so it's unique.
-        for (const sib of state.edges) {
-          if (sib.id !== e.id && sib.from === e.from && sib.valvePort === newPort) {
-            sib.valvePort = '';
-          }
-        }
-        e.valvePort = newPort;
+      valve.branchLabels = valve.branchLabels || {};
+      if (btn.dataset.clear === '1') {
+        delete valve.branchLabels[e.id];
+        toast('Using auto name');
       } else {
-        e.valvePort = '';
+        const name = ($('f-branch-label')?.value || '').trim();
+        if (name) { valve.branchLabels[e.id] = name; toast('Branch renamed'); }
+        else { delete valve.branchLabels[e.id]; toast('Using auto name'); }
       }
       drawEdges(); solveFlow(); persist(); renderSheet();
-      toast(newPort ? `Pipe set as Port ${newPort.toUpperCase()}` : 'Port set to auto');
       break;
     }
     case 'applyEdge': {
@@ -2533,11 +2664,11 @@ function loadDemo() {
   const ret2 = add('return',  { x: 240, y: 600, label:'Return 2', size:'2"' });
   const jet  = add('jet',     { x: 410, y: 260, label:'Spa Jet 1', size:'2"' });
   const feat = add('feature', { x: 700, y: 200, label:'Water Feature', size:'2"', relation:'spa' });
-  const vSuc = add('valve3',  { x: 920, y: 320, label:'Suction Valve', valveState:'a' });
+  const vSuc = add('valve3',  { x: 920, y: 320, label:'Suction Valve', valveState:'shared' });
   const pump = add('pump',    { x: 1110, y: 300, label:'Pump', size:'2.5"' });
   const flt  = add('filter',  { x: 1240, y: 300, label:'Filter', size:'2.5"' });
   const htr  = add('heater',  { x: 1370, y: 300, label:'Heater', size:'2.5"' });
-  const vRet = add('valve3',  { x: 1510, y: 300, label:'Return Valve', valveState:'both' });
+  const vRet = add('valve3',  { x: 1510, y: 300, label:'Return Valve', valveState:'shared' });
   const tee  = add('tee',     { x: 1620, y: 380, label:'Tee' });
   const fvlv = add('valve2',  { x: 800, y: 300, label:'Feature Valve', valveState:'open' });
 
