@@ -19,22 +19,50 @@ const connectBanner = $('connectBanner');
 const STORE_KEY = 'poolflow-planner-v2';
 
 const state = {
-  items: [],       // { id, type, label, size, notes, relation, valveState, x, y, w, h }
-  edges: [],       // { id, from, to, type, size, label, active, blocked }
-  dims: [],        // { a, b, label }
+  items: [],
+  edges: [],
+  dims: [],
   selectedId: null,
   connectMode: false,
   connectSourceId: null,
   pendingPipe: { type:'return', size:'2"' },
   view: { scale: 1, tx: 0, ty: 0 },
+  scale: { pxPerFoot: 24 },
   nextId: 1,
   lastSolve: null,
   undoStack: [],
 };
 
+// ---------- Real-world conversion ----------
+function pxPerFoot() { return state.scale?.pxPerFoot || 24; }
+function pxToFeet(px) { return px / pxPerFoot(); }
+function feetToPx(ft) { return ft * pxPerFoot(); }
+function pxToFI(px) {
+  const totalIn = Math.round(pxToFeet(px) * 12);
+  return { ft: Math.floor(totalIn / 12), in: totalIn % 12 };
+}
+function fiToPx(ft, inches) {
+  const f = Math.max(0, Number(ft) || 0);
+  const i = Math.max(0, Number(inches) || 0);
+  return Math.round(feetToPx(f + i / 12));
+}
+function fmtFI(px) {
+  const { ft, in: i } = pxToFI(px);
+  return i ? `${ft}′ ${i}″` : `${ft}′`;
+}
+function fmtFIShort(px) {
+  const totalFt = pxToFeet(px);
+  if (totalFt < 1) {
+    const inches = Math.round(totalFt * 12);
+    return `${inches}″`;
+  }
+  const { ft, in: i } = pxToFI(px);
+  return i ? `${ft}′${i}″` : `${ft}′`;
+}
+
 // ---------- Persistence ----------
 function persist() {
-  const snap = { items: state.items, edges: state.edges, dims: state.dims, nextId: state.nextId, view: state.view, pendingPipe: state.pendingPipe };
+  const snap = { items: state.items, edges: state.edges, dims: state.dims, nextId: state.nextId, view: state.view, pendingPipe: state.pendingPipe, scale: state.scale };
   try { localStorage.setItem(STORE_KEY, JSON.stringify(snap)); } catch {}
 }
 function restore() {
@@ -49,6 +77,7 @@ function restore() {
     state.nextId = s.nextId || (s.items.length + 1);
     state.view = s.view || { scale:1, tx:0, ty:0 };
     state.pendingPipe = s.pendingPipe || { type:'return', size:'2"' };
+    state.scale = s.scale && s.scale.pxPerFoot ? s.scale : { pxPerFoot: 24 };
     return true;
   } catch { return false; }
 }
@@ -97,7 +126,7 @@ function fitToContent() {
     applyTransform();
     return;
   }
-  const pad = 60;
+  const pad = 40;
   let minX=Infinity, minY=Infinity, maxX=-Infinity, maxY=-Infinity;
   for (const i of state.items) {
     minX = Math.min(minX, i.x);
@@ -105,12 +134,18 @@ function fitToContent() {
     maxX = Math.max(maxX, i.x + i.w);
     maxY = Math.max(maxY, i.y + i.h);
   }
-  const cw = canvasArea.clientWidth, ch = canvasArea.clientHeight - 80;
+  // Account for the bottom sheet eating ~80px (mid) or more (open)
+  const sheetEl = document.getElementById('sheet');
+  const sheetH = sheetEl?.getBoundingClientRect ? Math.max(80, window.innerHeight - sheetEl.getBoundingClientRect().top) : 80;
+  const isMobile = window.innerWidth < 900;
+  const reserved = isMobile ? (sheetEl?.classList.contains('open') ? sheetH : 90) : 0;
+  const cw = canvasArea.clientWidth - (isMobile ? 0 : 0);
+  const ch = Math.max(120, canvasArea.clientHeight - reserved);
   const w = maxX - minX + pad*2, h = maxY - minY + pad*2;
   const sc = Math.min(cw / w, ch / h, 1.6);
-  state.view.scale = Math.max(0.4, sc);
+  state.view.scale = Math.max(0.3, sc);
   state.view.tx = -((minX - pad) * state.view.scale) + (cw - (w * state.view.scale)) / 2;
-  state.view.ty = -((minY - pad) * state.view.scale) + 20;
+  state.view.ty = -((minY - pad) * state.view.scale) + 16;
   applyTransform();
 }
 
@@ -261,10 +296,17 @@ function onPointerMove(e) {
     const dxw = (e.clientX - dragData.startX) / state.view.scale;
     const dyw = (e.clientY - dragData.startY) / state.view.scale;
     const item = dragData.item;
-    item.w = Math.max(50, Math.round((dragData.startW + dxw) / 4) * 4);
-    item.h = Math.max(40, Math.round((dragData.startH + dyw) / 4) * 4);
+    const inchPx = pxPerFoot() / 12;
+    const snap = RESIZABLE.has(item.type) ? inchPx : 4;
+    item.w = Math.max(50, Math.round((dragData.startW + dxw) / snap) * snap);
+    item.h = Math.max(40, Math.round((dragData.startH + dyw) / snap) * snap);
     const el = nodeEl(item.id);
-    if (el) { el.style.width = item.w + 'px'; el.style.height = item.h + 'px'; }
+    if (el) {
+      el.style.width = item.w + 'px';
+      el.style.height = item.h + 'px';
+      const meta = el.querySelector('.meta');
+      if (meta) meta.textContent = metaText(item);
+    }
     drawEdges(); drawDims();
     return;
   }
@@ -384,6 +426,9 @@ function renderItem(item) {
 }
 function metaText(item) {
   const bits = [];
+  if (RESIZABLE.has(item.type)) {
+    bits.push(`${fmtFIShort(item.w)} × ${fmtFIShort(item.h)}`);
+  }
   if (item.size) bits.push(item.size);
   if (item.valveState) bits.push(item.valveState);
   if (item.relation) bits.push('→' + item.relation);
@@ -526,15 +571,14 @@ function drawDims() {
     const y = Math.min(ca.y, cb.y) - 36;
     const x1 = Math.min(ca.x, cb.x), x2 = Math.max(ca.x, cb.x);
     const distPx = Math.hypot(cb.x - ca.x, cb.y - ca.y);
-    const ftPerPx = 1/24;
-    const ft = (distPx * ftPerPx).toFixed(1);
+    const ftDisp = fmtFI(distPx);
     html += `
       <line x1="${ca.x}" y1="${ca.y}" x2="${ca.x}" y2="${y}" stroke="var(--muted)" stroke-dasharray="3 4"/>
       <line x1="${cb.x}" y1="${cb.y}" x2="${cb.x}" y2="${y}" stroke="var(--muted)" stroke-dasharray="3 4"/>
       <line x1="${x1}" y1="${y}" x2="${x2}" y2="${y}" stroke="var(--text)" stroke-width="1.5"/>
       <polygon points="${x1},${y} ${x1+8},${y-4} ${x1+8},${y+4}" fill="var(--text)"/>
       <polygon points="${x2},${y} ${x2-8},${y-4} ${x2-8},${y+4}" fill="var(--text)"/>
-      <text class="dim-text" x="${(x1+x2)/2}" y="${y-8}" text-anchor="middle">${d.label}: ${ft} ft</text>`;
+      <text class="dim-text" x="${(x1+x2)/2}" y="${y-8}" text-anchor="middle">${d.label}: ${ftDisp}</text>`;
   }
   dimSvg.innerHTML = html;
 }
@@ -699,6 +743,37 @@ function renderParts() {
   `;
 }
 
+function renderSizeFields(item) {
+  if (RESIZABLE.has(item.type)) {
+    const w = pxToFI(item.w), h = pxToFI(item.h);
+    const presets = item.type === 'pool'
+      ? [['16′×32′',16,32], ['18′×36′',18,36], ['20′×40′',20,40], ['16′ round',16,16]]
+      : item.type === 'spa'
+        ? [['7′×7′',7,7], ['8′×8′',8,8], ['6′×6′',6,6], ['9′×7′',9,7]]
+        : [['10′×6′',10,6], ['12′×8′',12,8], ['14′×6′',14,6]];
+    return `
+      <div class="group" style="margin-top:10px;">
+        <div class="group-title">Size (feet · inches)</div>
+        <div class="row tight">
+          <div class="field"><label>Width</label>
+            <div class="fi-input"><input id="f-w-ft" type="number" min="0" max="999" value="${w.ft}"/><span>′</span><input id="f-w-in" type="number" min="0" max="11" value="${w.in}"/><span>″</span></div>
+          </div>
+          <div class="field"><label>Height</label>
+            <div class="fi-input"><input id="f-h-ft" type="number" min="0" max="999" value="${h.ft}"/><span>′</span><input id="f-h-in" type="number" min="0" max="11" value="${h.in}"/><span>″</span></div>
+          </div>
+        </div>
+        <div class="chip-row" style="margin-top:8px;">
+          ${presets.map(([lbl, fw, fh]) => `<button class="chip" data-action="preset-size" data-fw="${fw}" data-fh="${fh}">${lbl}</button>`).join('')}
+        </div>
+      </div>`;
+  }
+  return `
+    <div class="row tight" style="margin-top:8px;">
+      <div class="field"><label>Width (px)</label><input id="f-w-px" type="number" value="${item.w}" min="40"/></div>
+      <div class="field"><label>Height (px)</label><input id="f-h-px" type="number" value="${item.h}" min="30"/></div>
+    </div>`;
+}
+
 function renderSelected() {
   const item = getItem(state.selectedId);
   if (!item) return `<div class="panel"><p style="color:var(--muted);">Tap a part on the canvas to edit it.</p></div>`;
@@ -736,10 +811,7 @@ function renderSelected() {
           <option ${item.valveState==='both'?'selected':''} value="both">3-way shared</option>
         </select>
       </div>` : ''}
-      <div class="row tight" style="margin-top:8px;">
-        <div class="field"><label>Width (px)</label><input id="f-w" type="number" value="${item.w}" min="40"/></div>
-        <div class="field"><label>Height (px)</label><input id="f-h" type="number" value="${item.h}" min="30"/></div>
-      </div>
+      ${renderSizeFields(item)}
       <div class="field" style="margin-top:8px;"><label>Notes</label><input id="f-notes" value="${escapeHtml(item.notes||'')}" placeholder="e.g. branch A, custom feature"/></div>
       <div class="row" style="margin-top:12px;">
         <button class="btn primary" data-action="applySelected">Apply</button>
@@ -879,6 +951,22 @@ function renderExport() {
       <button class="btn primary full" data-action="pushGithub">Update GitHub</button>
     </div>
     <div class="panel">
+      <h3>Drawing scale</h3>
+      <p style="color:var(--muted); font-size:12px; margin-top:0;">How many canvas pixels equal 1 foot. Higher = bigger drawings.</p>
+      <div class="row tight">
+        <div class="field"><label>Pixels per foot</label>
+          <input id="scale-px" type="number" min="4" max="200" step="1" value="${pxPerFoot()}"/>
+        </div>
+        <button class="btn primary" data-action="applyScale" style="max-width:120px;">Apply</button>
+      </div>
+      <div class="chip-row" style="margin-top:8px;">
+        <button class="chip" data-action="applyScale" data-scale="12">12 px/ft</button>
+        <button class="chip" data-action="applyScale" data-scale="24">24 px/ft</button>
+        <button class="chip" data-action="applyScale" data-scale="36">36 px/ft</button>
+        <button class="chip" data-action="applyScale" data-scale="48">48 px/ft</button>
+      </div>
+    </div>
+    <div class="panel">
       <h3>Appearance</h3>
       <div class="row">
         <button class="btn" data-action="theme-light">Light</button>
@@ -927,13 +1015,44 @@ function doAction(name, btn) {
       item.size  = $('f-size')?.value || '';
       item.relation = $('f-relation')?.value || '';
       if ($('f-valve')) item.valveState = $('f-valve').value || '';
-      item.w = parseInt($('f-w')?.value || item.w, 10);
-      item.h = parseInt($('f-h')?.value || item.h, 10);
+      if ($('f-w-ft')) {
+        const wPx = fiToPx($('f-w-ft').value, $('f-w-in').value);
+        const hPx = fiToPx($('f-h-ft').value, $('f-h-in').value);
+        if (wPx >= 20) item.w = wPx;
+        if (hPx >= 16) item.h = hPx;
+      } else if ($('f-w-px')) {
+        item.w = parseInt($('f-w-px').value || item.w, 10);
+        item.h = parseInt($('f-h-px').value || item.h, 10);
+      }
       item.notes = $('f-notes')?.value || '';
       refreshItem(item); solveFlow(); persist();
       toast('Saved'); break;
     }
     case 'deleteSelected': if (state.selectedId) deleteItem(state.selectedId); renderSheet(); break;
+    case 'preset-size': {
+      const item = getItem(state.selectedId); if (!item) return;
+      const fw = parseFloat(btn.dataset.fw), fh = parseFloat(btn.dataset.fh);
+      pushUndo();
+      item.w = Math.round(feetToPx(fw));
+      item.h = Math.round(feetToPx(fh));
+      refreshItem(item); persist();
+      renderSheet();
+      toast(`${fw}′ × ${fh}′`); break;
+    }
+    case 'applyScale': {
+      let v;
+      if (btn?.dataset?.scale) v = parseFloat(btn.dataset.scale);
+      else v = parseFloat($('scale-px')?.value);
+      if (v > 0 && v <= 200) {
+        pushUndo();
+        state.scale.pxPerFoot = v;
+        persist();
+        drawEdges(); drawDims();
+        state.items.forEach(refreshItem);
+        renderSheet();
+        toast(`Scale: ${v} px / ft`);
+      } else { toast('Pick 1–200 px/ft'); } break;
+    }
     case 'duplicateSelected': {
       const i = getItem(state.selectedId); if (!i) return;
       addItem(i.type, { ...i, x: i.x + 24, y: i.y + 24, id: undefined });

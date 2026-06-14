@@ -262,10 +262,34 @@
     .field input, .field select, .field textarea {
       width:100%; padding:10px 12px;
       background:var(--surface); border:1px solid var(--border); border-radius:10px;
-      color:var(--text); font-size:15px;  /* >=16px would prevent iOS zoom; 15 is small enough but we use viewport meta to disable */
+      color:var(--text); font-size:15px;
       min-height:44px;
     }
     .field textarea { min-height:60px; resize:vertical; }
+
+    /* Feet/inches combined input */
+    .fi-input {
+      display:flex; align-items:stretch;
+      background:var(--surface); border:1px solid var(--border); border-radius:10px;
+      overflow:hidden; min-height:44px;
+    }
+    .fi-input input {
+      flex:1; min-width:0; width:100%;
+      border:none; background:transparent;
+      padding:10px 4px 10px 10px;
+      font-size:16px; font-weight:600;
+      text-align:right;
+      -moz-appearance: textfield;
+    }
+    .fi-input input::-webkit-outer-spin-button,
+    .fi-input input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+    .fi-input input:first-child { border-right:1px solid var(--border); }
+    .fi-input span {
+      display:flex; align-items:center; justify-content:center;
+      padding:0 6px 0 2px;
+      font-size:16px; color:var(--muted); font-weight:700;
+      min-width:16px;
+    }
 
     .btn {
       display:inline-flex; align-items:center; justify-content:center; gap:6px;
