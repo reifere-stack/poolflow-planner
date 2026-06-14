@@ -35,7 +35,7 @@ const PALETTE_GROUPS = [
   ]],
   ['Valves & Tees', [
     ['valve2',     '2-Way Valve',    {w:100, h:70}],
-    ['valve3',     '3-Way Valve',    {w:110, h:70}],
+    ['valve3',     '3-Way Valve',    {w:130, h:100}],
     ['checkvalve', 'Check Valve',    {w:110, h:70}],
     ['actuated',   'Actuated Valve', {w:120, h:70}],
     ['tee',        'Tee',            {w:80, h:60}],

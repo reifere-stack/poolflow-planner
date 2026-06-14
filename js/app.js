@@ -25,6 +25,7 @@ const state = {
   selectedId: null,
   connectMode: false,
   connectSourceId: null,
+  connectSourceTap: null,
   pendingPipe: { type:'return', size:'2"' },
   view: { scale: 1, tx: 0, ty: 0 },
   scale: { pxPerFoot: 24 },
@@ -85,6 +86,10 @@ function restore() {
     for (const e of state.edges) {
       if ('valvePort' in e) delete e.valvePort;
     }
+    // Migration: assign explicit ports for legacy edges touching valve3 / pump.
+    // Valves: use direction-based heuristic + geometry (left = A, right = B).
+    // Pumps:  incoming = intake (suction), outgoing = discharge (return).
+    migratePortsOnLoad(state);
     state.dims = s.dims || [];
     state.nextId = s.nextId || (s.items.length + 1);
     state.view = s.view || { scale:1, tx:0, ty:0 };
@@ -93,6 +98,81 @@ function restore() {
     return true;
   } catch { return false; }
 }
+
+// One-time-per-load migration: write fromPort/toPort onto edges touching
+// 3-way valves and pumps so the new port-aware code paths work for legacy plans.
+function migratePortsOnLoad(s) {
+  if (!s || !Array.isArray(s.items) || !Array.isArray(s.edges)) return;
+  const itemById = {};
+  s.items.forEach(it => itemById[it.id] = it);
+
+  // --- 3-way valves ---
+  for (const valve of s.items) {
+    if (valve.type !== 'valve3') continue;
+    const touching = s.edges.filter(e =>
+      (e.from === valve.id || e.to === valve.id) &&
+      e.type !== 'conduit' && e.type !== 'spillover'
+    );
+    // Skip if any edge already has a valid port set.
+    const alreadyPorted = touching.some(e =>
+      (e.from === valve.id && (e.fromPort === 'trunk' || e.fromPort === 'a' || e.fromPort === 'b')) ||
+      (e.to   === valve.id && (e.toPort   === 'trunk' || e.toPort   === 'a' || e.toPort   === 'b'))
+    );
+    if (alreadyPorted) continue;
+    const ins  = touching.filter(e => e.to   === valve.id);
+    const outs = touching.filter(e => e.from === valve.id);
+    // Identify trunk edge + branch edges using the old direction heuristic.
+    let trunkEdge = null, branchEdges = [];
+    if (outs.length >= 2 && ins.length <= 1) { trunkEdge = ins[0]  || null; branchEdges = outs.slice(0, 2); }
+    else if (ins.length >= 2 && outs.length <= 1) { trunkEdge = outs[0] || null; branchEdges = ins.slice(0, 2); }
+    else if (outs.length >= 2) { trunkEdge = ins[0]  || null; branchEdges = outs.slice(0, 2); }
+    else if (ins.length >= 2)  { trunkEdge = outs[0] || null; branchEdges = ins.slice(0, 2);  }
+    else {
+      // 0-1 edges total: assign trunk to whatever single edge is there.
+      if (touching.length === 1) trunkEdge = touching[0];
+    }
+    // Sort branches: left-most (smaller x) becomes A, other becomes B.
+    const otherEnd = (e) => e.from === valve.id ? itemById[e.to] : itemById[e.from];
+    if (branchEdges.length === 2) {
+      const a = otherEnd(branchEdges[0]);
+      const b = otherEnd(branchEdges[1]);
+      if (a && b) {
+        const ka = (a.y || 0) * 10000 + (a.x || 0);
+        const kb = (b.y || 0) * 10000 + (b.x || 0);
+        if (ka > kb) branchEdges = [branchEdges[1], branchEdges[0]];
+      }
+    }
+    const writePort = (e, port) => {
+      if (!e) return;
+      if (e.from === valve.id) e.fromPort = port;
+      else if (e.to === valve.id) e.toPort = port;
+    };
+    writePort(trunkEdge, 'trunk');
+    if (branchEdges[0]) writePort(branchEdges[0], 'a');
+    if (branchEdges[1]) writePort(branchEdges[1], 'b');
+  }
+
+  // --- Pumps ---
+  for (const pump of s.items) {
+    if (pump.type !== 'pump') continue;
+    const touching = s.edges.filter(e =>
+      (e.from === pump.id || e.to === pump.id) &&
+      e.type !== 'conduit' && e.type !== 'spillover'
+    );
+    for (const e of touching) {
+      // Incoming -> intake (suction). Outgoing -> discharge (return).
+      if (e.to === pump.id) {
+        if (e.toPort !== 'intake' && e.toPort !== 'discharge') e.toPort = 'intake';
+        if (e.toPort === 'intake'    && e.type !== 'feature' && e.type !== 'gas' && e.type !== 'conduit') e.type = 'suction';
+      }
+      if (e.from === pump.id) {
+        if (e.fromPort !== 'intake' && e.fromPort !== 'discharge') e.fromPort = 'discharge';
+        if (e.fromPort === 'discharge' && e.type !== 'feature' && e.type !== 'gas' && e.type !== 'conduit') e.type = 'return';
+      }
+    }
+  }
+}
+
 function uid() { return 'n' + (state.nextId++); }
 function pushUndo() {
   state.undoStack.push(JSON.stringify({ items: state.items, edges: state.edges, dims: state.dims }));
@@ -277,8 +357,10 @@ function onPointerDown(e) {
     if (!item) return;
 
     if (state.connectMode) {
-      // Tap-to-connect flow
-      handleConnectTap(id);
+      // Tap-to-connect flow. Pass the world-space tap point so port-aware
+      // endpoints (valve3, pump) can pick the closest port to the tap.
+      const tapPt = clientToWorld(e.clientX, e.clientY);
+      handleConnectTap(id, tapPt);
       clearLongPress();
       return;
     }
@@ -593,10 +675,82 @@ function addItem(type, opts = {}) {
   return item;
 }
 
+// Build the inner HTML for a 3-way valve node: a visible T-shape body with three
+// labelled ports (Trunk on bottom, A on left, B on right). The port markers are
+// absolute-positioned dots; the open-position chip shows current flow.
+function valve3InnerMarkup(item) {
+  const info = (typeof valveBranchInfo === 'function') ? valveBranchInfo(item) : null;
+  const labelA = info ? info.pos1 : 'A';
+  const labelB = info ? info.pos2 : 'B';
+  const side   = info ? info.side : 'unknown';
+  const vs = item.valveState || 'shared';
+  let trunkRole = 'Trunk';
+  if (side === 'return')  trunkRole = 'In';
+  if (side === 'suction') trunkRole = 'Out';
+  const openClass = (port) => {
+    if (vs === 'shared') return port === 'a' || port === 'b' ? 'open' : '';
+    if (vs === 'pos1' && port === 'a') return 'open';
+    if (vs === 'pos2' && port === 'b') return 'open';
+    return '';
+  };
+  const legClass = (port) => openClass(port) ? 'leg-open' : 'leg-closed';
+  const stateText = vs === 'shared' ? 'Shared'
+                  : vs === 'pos1'   ? '→ ' + escapeHtml(labelA)
+                  : vs === 'pos2'   ? '→ ' + escapeHtml(labelB)
+                  : 'Off';
+  return `
+    <svg class="valve3-body" viewBox="0 0 100 100" preserveAspectRatio="none">
+      <line class="leg leg-trunk" x1="50" y1="50" x2="50" y2="100"/>
+      <line class="leg ${legClass('a')}" x1="50" y1="50" x2="0"  y2="50"/>
+      <line class="leg ${legClass('b')}" x1="50" y1="50" x2="100" y2="50"/>
+      <circle class="valve3-hub" cx="50" cy="50" r="10"/>
+    </svg>
+    <div class="valve3-title">${escapeHtml(item.label)}</div>
+    <div class="valve3-port port-trunk" data-port="trunk" title="${escapeHtml(trunkRole)}">
+      <span class="port-dot">T</span><span class="port-label">${escapeHtml(trunkRole)}</span>
+    </div>
+    <div class="valve3-port port-a ${openClass('a')}" data-port="a" title="Port A: ${escapeHtml(labelA)}">
+      <span class="port-dot">A</span><span class="port-label">${escapeHtml(labelA)}</span>
+    </div>
+    <div class="valve3-port port-b ${openClass('b')}" data-port="b" title="Port B: ${escapeHtml(labelB)}">
+      <span class="port-dot">B</span><span class="port-label">${escapeHtml(labelB)}</span>
+    </div>
+  `;
+}
+
+// Inner HTML for a pump: standard icon/title + two side ports labelled
+// "Suction" (left, intake) and "Return" (right, discharge), Poolside-style.
+function pumpInnerMarkup(item) {
+  return `
+    <div class="icon">${iconMarkup(item.type)}</div>
+    <div class="title">${escapeHtml(item.label)}</div>
+    <div class="meta">${escapeHtml(metaText(item))}</div>
+    <div class="pump-port port-intake" data-port="intake" title="Intake → Suction">
+      <span class="port-dot">S</span><span class="port-label">Suction</span>
+    </div>
+    <div class="pump-port port-discharge" data-port="discharge" title="Discharge → Return">
+      <span class="port-dot">R</span><span class="port-label">Return</span>
+    </div>
+  `;
+}
+
+function nodeInnerMarkup(item) {
+  if (item.type === 'valve3') return valve3InnerMarkup(item);
+  if (item.type === 'pump')   return pumpInnerMarkup(item);
+  return `
+    <div class="icon">${iconMarkup(item.type)}</div>
+    <div class="title">${escapeHtml(item.label)}</div>
+    <div class="meta">${escapeHtml(metaText(item))}</div>
+    <div class="resize-handle" aria-label="Resize"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M9 21h12V9"/><path d="M14 14l7 7"/></svg></div>
+  `;
+}
+
 function renderItem(item) {
   const tool = TOOLS[item.type] || {};
   const el = document.createElement('div');
   el.className = 'node ' + (NODE_CLASS[item.type] || '');
+  if (item.type === 'valve3') el.classList.add('valve3-node');
+  if (item.type === 'pump')   el.classList.add('pump-node');
   if (RESIZABLE.has(item.type)) el.classList.add('resizable');
   if ((item.type==='valve2' && item.valveState==='closed') ||
       (item.type==='valve3' && item.valveState==='')) {
@@ -604,12 +758,7 @@ function renderItem(item) {
   }
   el.dataset.id = item.id;
   Object.assign(el.style, { left: item.x+'px', top: item.y+'px', width: item.w+'px', height: item.h+'px' });
-  el.innerHTML = `
-    <div class="icon">${iconMarkup(item.type)}</div>
-    <div class="title">${escapeHtml(item.label)}</div>
-    <div class="meta">${escapeHtml(metaText(item))}</div>
-    <div class="resize-handle" aria-label="Resize"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M9 21h12V9"/><path d="M14 14l7 7"/></svg></div>
-  `;
+  el.innerHTML = nodeInnerMarkup(item);
   world.appendChild(el);
 }
 function metaText(item) {
@@ -640,12 +789,21 @@ function refreshItem(item) {
   const el = nodeEl(item.id);
   if (!el) { renderItem(item); return; }
   el.className = 'node ' + (NODE_CLASS[item.type] || '');
+  if (item.type === 'valve3') el.classList.add('valve3-node');
+  if (item.type === 'pump')   el.classList.add('pump-node');
   if (RESIZABLE.has(item.type)) el.classList.add('resizable');
   if ((item.type==='valve2' && item.valveState==='closed')) el.classList.add('closed-state');
   if (state.selectedId === item.id) el.classList.add('selected');
   Object.assign(el.style, { left: item.x+'px', top: item.y+'px', width: item.w+'px', height: item.h+'px' });
-  el.querySelector('.title').textContent = item.label;
-  el.querySelector('.meta').textContent  = metaText(item);
+  if (item.type === 'valve3' || item.type === 'pump') {
+    // Rebuild fully so port labels & sub-elements stay in sync.
+    el.innerHTML = nodeInnerMarkup(item);
+  } else {
+    const titleEl = el.querySelector('.title');
+    const metaEl  = el.querySelector('.meta');
+    if (titleEl) titleEl.textContent = item.label;
+    if (metaEl)  metaEl.textContent  = metaText(item);
+  }
 }
 
 function deleteItem(id) {
@@ -681,6 +839,7 @@ function startConnectMode() {
   if (!state.items.length) { toast('Add parts first'); return; }
   state.connectMode = true;
   state.connectSourceId = null;
+  state.connectSourceTap = null;
   connectBanner.classList.add('show');
   closeSheet();
   toast('Connect mode: tap source, then destination');
@@ -688,6 +847,7 @@ function startConnectMode() {
 function cancelConnectMode() {
   state.connectMode = false;
   state.connectSourceId = null;
+  state.connectSourceTap = null;
   connectBanner.classList.remove('show');
   world.querySelectorAll('.node.connect-source').forEach(n => n.classList.remove('connect-source'));
 }
@@ -699,8 +859,8 @@ function insertWaypointInOrder(edge, pt) {
   // Build the live anchor sequence (start + waypoints + end) to determine the best insert position
   const a = getItem(edge.from), b = getItem(edge.to);
   if (!a || !b) { existing.push({ x: Math.round(pt.x), y: Math.round(pt.y) }); return; }
-  const start = { x: a.x + a.w/2, y: a.y + a.h/2 };
-  const end   = { x: b.x + b.w/2, y: b.y + b.h/2 };
+  const start = edgeAnchorPoint(a, edge.fromPort);
+  const end   = edgeAnchorPoint(b, edge.toPort);
   const seq = [start, ...existing, end];
   let bestI = 0, bestD = Infinity;
   for (let i = 0; i < seq.length - 1; i++) {
@@ -762,28 +922,35 @@ function handleConnectTapOnPipe(edgeId, wp) {
     waypoints: [],
     fromSize: '', toSize: '',
   });
-  // Add the new branch from source -> tee using the pending pipe spec
+  // Add the new branch from source -> tee using the pending pipe spec.
+  // Honor the source-side port (valve3 / pump) recorded at source-tap time.
   const pp = state.pendingPipe;
+  const srcItem = getItem(sourceId);
+  const srcAssign = assignPortForTap(srcItem, state.connectSourceTap, 'from');
+  const pipeType = srcAssign.pipeType || pp.type;
   state.edges.push({
     id: uid(),
     from: sourceId,
     to: teeId,
-    type: pp.type,
+    type: pipeType,
     size: pp.size,
-    label: `${getItem(sourceId)?.label || '?'} → ${tee.label}`,
+    label: `${srcItem?.label || '?'} → ${tee.label}`,
     active: false, blocked: false,
     routeStyle: pp.routeStyle || 'auto',
     waypoints: [],
     fromSize: '', toSize: '',
+    fromPort: srcAssign.port || '',
+    toPort: '',
   });
   toast('Tee inserted into pipe');
   cancelConnectMode();
   solveFlow(); persist(); drawEdges(); renderSheet();
 }
 
-function handleConnectTap(id) {
+function handleConnectTap(id, tapPt) {
   if (!state.connectSourceId) {
     state.connectSourceId = id;
+    state.connectSourceTap = tapPt || null;
     const el = nodeEl(id); if (el) el.classList.add('connect-source');
     toast('Now tap destination');
     return;
@@ -797,11 +964,19 @@ function handleConnectTap(id) {
   const from = getItem(state.connectSourceId), to = getItem(id);
   if (from && to) {
     pushUndo();
+    const srcTap = state.connectSourceTap;
+    const fromAssign = assignPortForTap(from, srcTap, 'from');
+    const toAssign   = assignPortForTap(to,   tapPt, 'to');
+    // Pump-implied pipe type wins over the pending pipe type (intake → suction,
+    // discharge → return). The destination side wins over the source side if
+    // both end up at a pump (rare).
+    const impliedType = toAssign.pipeType || fromAssign.pipeType || null;
+    const pipeType = impliedType || state.pendingPipe.type;
     state.edges.push({
       id: uid(),
       from: from.id,
       to: to.id,
-      type: state.pendingPipe.type,
+      type: pipeType,
       size: state.pendingPipe.size,
       label: `${from.label} → ${to.label}`,
       active: false,
@@ -810,8 +985,10 @@ function handleConnectTap(id) {
       waypoints: [],
       fromSize: '',
       toSize: '',
+      fromPort: fromAssign.port || '',
+      toPort:   toAssign.port   || '',
     });
-    toast(`${PIPE_TYPES[state.pendingPipe.type].label} ${state.pendingPipe.size}: ${from.label} → ${to.label}`);
+    toast(`${PIPE_TYPES[pipeType].label} ${state.pendingPipe.size}: ${from.label} → ${to.label}`);
     solveFlow(); persist();
   }
   cancelConnectMode();
@@ -843,12 +1020,24 @@ function autoRoute(p1, p2, style) {
   return [p1, corner, p2];
 }
 
+// Anchor point for one end of an edge. Port-aware items (valve3, pump) anchor
+// at the exact port world-position when their edge has a port assignment.
+function edgeAnchorPoint(item, port) {
+  if (item.type === 'valve3' && (port === 'trunk' || port === 'a' || port === 'b')) {
+    return valvePortPos(item, port);
+  }
+  if (item.type === 'pump' && (port === 'intake' || port === 'discharge')) {
+    return pumpPortPos(item, port);
+  }
+  return { x: item.x + item.w / 2, y: item.y + item.h / 2 };
+}
+
 // Full route for an edge: anchor points + user waypoints, applying routing style
 function edgeRoutePoints(e) {
   const a = getItem(e.from), b = getItem(e.to);
   if (!a || !b) return [];
-  const start = { x: a.x + a.w/2, y: a.y + a.h/2 };
-  const end   = { x: b.x + b.w/2, y: b.y + b.h/2 };
+  const start = edgeAnchorPoint(a, e.fromPort);
+  const end   = edgeAnchorPoint(b, e.toPort);
   const style = e.routeStyle || 'auto';
   const wps = Array.isArray(e.waypoints) ? e.waypoints : [];
   if (style === 'manual' || wps.length) {
@@ -1153,8 +1342,133 @@ const BRANCH_NAMED_TYPES = new Set([
   'sheer','slide','autofill','feature','waterfall','laminar',
 ]);
 
-// Returns { trunk, branches, side } for a valve3 based on graph topology.
+// ---------- 3-way valve geometry & port helpers ----------
+// A 3-way valve has 3 named ports laid out as a T:
+//   trunk = bottom-center, a = left-middle, b = right-middle
+// Ports are stored on the edge as edge.fromPort / edge.toPort = 'trunk'|'a'|'b'|''.
+const V3_PORTS = ['trunk', 'a', 'b'];
+
+function valvePortPos(valve, port) {
+  if (!valve || valve.type !== 'valve3') return null;
+  const cx = valve.x + valve.w / 2;
+  const cy = valve.y + valve.h / 2;
+  if (port === 'trunk') return { x: cx, y: valve.y + valve.h };
+  if (port === 'a')     return { x: valve.x,            y: cy };
+  if (port === 'b')     return { x: valve.x + valve.w,  y: cy };
+  return { x: cx, y: cy };
+}
+
+// Returns 'trunk'|'a'|'b' closest to a world-space point.
+function nearestValvePort(valve, pt) {
+  let best = 'trunk', bestD = Infinity;
+  for (const p of V3_PORTS) {
+    const pos = valvePortPos(valve, p);
+    const d = Math.hypot(pos.x - pt.x, pos.y - pt.y);
+    if (d < bestD) { bestD = d; best = p; }
+  }
+  return best;
+}
+
+// All non-conduit edges touching this valve, grouped by port.
+function valvePortMap(valve) {
+  const out = { trunk: [], a: [], b: [], unassigned: [] };
+  for (const e of state.edges) {
+    if (e.type === 'conduit' || e.type === 'spillover') continue;
+    if (e.from === valve.id) {
+      const p = e.fromPort;
+      if (p === 'trunk' || p === 'a' || p === 'b') out[p].push(e);
+      else out.unassigned.push(e);
+    } else if (e.to === valve.id) {
+      const p = e.toPort;
+      if (p === 'trunk' || p === 'a' || p === 'b') out[p].push(e);
+      else out.unassigned.push(e);
+    }
+  }
+  return out;
+}
+
+// Pick the first available port. Honors `preferred` if it's free.
+function nextFreeValvePort(valve, preferred) {
+  const pm = valvePortMap(valve);
+  if (preferred && pm[preferred] && pm[preferred].length === 0) return preferred;
+  for (const p of V3_PORTS) {
+    if (pm[p].length === 0) return p;
+  }
+  return null;
+}
+
+// ---------- Pump ports (intake / discharge) ----------
+// Pumps have 2 fixed ports: intake on the left (water in, suction side) and
+// discharge on the right (water out, return side). Just like Poolside, anything
+// connected to the intake side is automatically suction; anything connected to
+// the discharge side is automatically return.
+const PUMP_PORTS = ['intake', 'discharge'];
+
+function pumpPortPos(pump, port) {
+  if (!pump || pump.type !== 'pump') return null;
+  const cy = pump.y + pump.h / 2;
+  if (port === 'intake')    return { x: pump.x,             y: cy };
+  if (port === 'discharge') return { x: pump.x + pump.w,    y: cy };
+  return { x: pump.x + pump.w / 2, y: cy };
+}
+
+// Returns 'intake' or 'discharge' depending on which side of the pump pt is on.
+function nearestPumpPort(pump, pt) {
+  const cx = pump.x + pump.w / 2;
+  return pt.x < cx ? 'intake' : 'discharge';
+}
+
+// Pipe type implied by a pump port: intake is suction, discharge is return.
+function pumpPortPipeType(port) {
+  if (port === 'intake')    return 'suction';
+  if (port === 'discharge') return 'return';
+  return null;
+}
+
+// ---------- Unified port assignment for connect-mode ----------
+// Given an item and a tap point, return { port, pipeType } where pipeType is the
+// implied pipe type (or null if the item doesn't dictate one).
+// `role` is 'from' (this item is the source side of a new edge) or 'to' (destination).
+function assignPortForTap(item, tapPt, role) {
+  if (!item) return { port: '', pipeType: null };
+  if (item.type === 'valve3') {
+    if (!tapPt) return { port: nextFreeValvePort(item, null) || 'trunk', pipeType: null };
+    return { port: nearestValvePort(item, tapPt), pipeType: null };
+  }
+  if (item.type === 'pump') {
+    // If a tap point exists, honor it; otherwise default by role.
+    let port;
+    if (tapPt) port = nearestPumpPort(item, tapPt);
+    else       port = role === 'from' ? 'discharge' : 'intake';
+    return { port, pipeType: pumpPortPipeType(port) };
+  }
+  return { port: '', pipeType: null };
+}
+
+// Returns { trunk, branches, side } for a valve3.
+// New (preferred): use explicit per-edge port assignments (fromPort/toPort).
+// Legacy fallback: infer from in/out direction.
 function valveBranches(valve) {
+  const pm = valvePortMap(valve);
+  const hasExplicit = pm.trunk.length + pm.a.length + pm.b.length > 0;
+  if (hasExplicit) {
+    const trunk    = pm.trunk[0] || null;
+    const branchA  = pm.a[0]     || null;
+    const branchB  = pm.b[0]     || null;
+    const branches = [branchA, branchB].filter(Boolean);
+    // Side from arrow direction of the trunk edge.
+    let side = 'unknown';
+    if (trunk) {
+      if (trunk.to   === valve.id) side = 'return';   // trunk is incoming -> branches outflow
+      else if (trunk.from === valve.id) side = 'suction'; // trunk is outgoing -> branches inflow
+    } else if (branchA || branchB) {
+      // No trunk edge yet; guess from branches.
+      const refEdge = branchA || branchB;
+      side = refEdge.from === valve.id ? 'return' : 'suction';
+    }
+    return { trunk, branches, side };
+  }
+  // Legacy path: no port assignments yet, use the old in/out heuristic.
   const ins  = state.edges.filter(e => e.to   === valve.id && e.type !== 'conduit' && e.type !== 'spillover');
   const outs = state.edges.filter(e => e.from === valve.id && e.type !== 'conduit' && e.type !== 'spillover');
   let trunk = null, branches = [], side = 'unknown';
@@ -2707,6 +3021,9 @@ function loadDemo() {
   addE(spa,  pool, 'spillover','2.5"');
 
   state.dims.push({ a: ret1.id, b: ret2.id, label:'Return spacing' });
+
+  // Run the port migration over the freshly-built demo so valves & pumps get ports.
+  migratePortsOnLoad(state);
 
   solveFlow(); persist(); redrawAll(); fitToContent();
 }

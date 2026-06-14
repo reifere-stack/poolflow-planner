@@ -171,6 +171,123 @@
     .node.valve.closed-state { background: color-mix(in srgb, var(--error) 14%, var(--surface)); border-color: var(--error); }
     .node.tee       { background: var(--surface2); }
 
+    /* 3-way valve: visible T-body with 3 labelled ports */
+    .node.valve3-node {
+      padding: 0;
+      overflow: visible;
+    }
+    .node.valve3-node .valve3-body {
+      position: absolute; inset: 8px;
+      width: calc(100% - 16px); height: calc(100% - 16px);
+      pointer-events: none;
+    }
+    .node.valve3-node .valve3-body .leg {
+      stroke: color-mix(in srgb, var(--gold) 55%, transparent);
+      stroke-width: 6;
+      stroke-linecap: round;
+      vector-effect: non-scaling-stroke;
+    }
+    .node.valve3-node .valve3-body .leg-open  { stroke: var(--gold); }
+    .node.valve3-node .valve3-body .leg-closed { stroke: color-mix(in srgb, var(--gold) 30%, transparent); }
+    .node.valve3-node .valve3-body .leg-trunk { stroke: var(--gold); }
+    .node.valve3-node .valve3-body .valve3-hub {
+      fill: var(--surface);
+      stroke: var(--gold);
+      stroke-width: 2.4;
+      vector-effect: non-scaling-stroke;
+    }
+    .node.valve3-node .valve3-title {
+      position: absolute; left: 0; right: 0; top: 4px;
+      text-align: center; font-weight: 700; font-size: 11px;
+      pointer-events: none;
+      color: var(--text);
+      text-shadow: 0 0 4px var(--surface), 0 0 4px var(--surface);
+    }
+    .node.valve3-node .valve3-state {
+      position: absolute; left: 0; right: 0; bottom: -16px;
+      text-align: center; font-size: 10px; color: var(--muted);
+      pointer-events: none;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .node.valve3-node .valve3-port {
+      position: absolute;
+      display: flex; align-items: center; gap: 3px;
+      pointer-events: none;
+      font-size: 10px; color: var(--text);
+    }
+    .node.valve3-node .valve3-port .port-dot {
+      width: 18px; height: 18px;
+      border-radius: 50%;
+      background: var(--surface);
+      border: 2px solid color-mix(in srgb, var(--gold) 55%, transparent);
+      color: var(--gold);
+      font-weight: 800; font-size: 10px;
+      display: inline-flex; align-items: center; justify-content: center;
+      box-shadow: 0 1px 2px rgba(0,0,0,.15);
+    }
+    .node.valve3-node .valve3-port.open .port-dot {
+      background: var(--gold); color: #fff; border-color: var(--gold);
+    }
+    .node.valve3-node .valve3-port .port-label {
+      max-width: 50px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      text-shadow: 0 0 4px var(--surface), 0 0 4px var(--surface);
+    }
+    /* Port positions: trunk bottom-center, A left-middle, B right-middle */
+    .node.valve3-node .port-trunk {
+      left: 50%; bottom: -4px;
+      transform: translate(-50%, 50%);
+      flex-direction: column; gap: 1px;
+    }
+    .node.valve3-node .port-a {
+      left: -4px; top: 50%;
+      transform: translate(-50%, -50%);
+      flex-direction: row-reverse;
+    }
+    .node.valve3-node .port-a .port-label { text-align: right; }
+    .node.valve3-node .port-b {
+      right: -4px; top: 50%;
+      transform: translate(50%, -50%);
+    }
+
+    /* Pump: intake (left) + discharge (right) port chips */
+    .node.pump-node { overflow: visible; }
+    .node.pump-node .pump-port {
+      position: absolute;
+      display: flex; align-items: center; gap: 3px;
+      pointer-events: none;
+      font-size: 9px; font-weight: 700;
+      color: var(--text);
+    }
+    .node.pump-node .pump-port .port-dot {
+      width: 16px; height: 16px;
+      border-radius: 50%;
+      background: var(--surface);
+      border: 2px solid;
+      font-weight: 800; font-size: 9px;
+      display: inline-flex; align-items: center; justify-content: center;
+      box-shadow: 0 1px 2px rgba(0,0,0,.15);
+    }
+    .node.pump-node .pump-port .port-label {
+      text-shadow: 0 0 4px var(--surface), 0 0 4px var(--surface);
+    }
+    .node.pump-node .port-intake {
+      left: -4px; top: 50%;
+      transform: translate(-50%, -50%);
+      flex-direction: row-reverse;
+    }
+    .node.pump-node .port-intake .port-dot {
+      border-color: var(--pipe-suction, #f59e0b);
+      color: var(--pipe-suction, #f59e0b);
+    }
+    .node.pump-node .port-discharge {
+      right: -4px; top: 50%;
+      transform: translate(50%, -50%);
+    }
+    .node.pump-node .port-discharge .port-dot {
+      border-color: var(--pipe-return, #2563eb);
+      color: var(--pipe-return, #2563eb);
+    }
+
     /* resize handle */
     .node .resize-handle {
       position:absolute; right:-2px; bottom:-2px;
