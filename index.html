@@ -1,129 +1,177 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="dark">
+<html lang="en" data-theme="light">
 <head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-<meta name="theme-color" content="#0f1b2d" />
-<title>PoolFlow Planner</title>
-<link rel="icon" href="./favicon.svg" type="image/svg+xml" />
-<link rel="preconnect" href="https://fonts.googleapis.com" />
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
-<link rel="stylesheet" href="./css/style.css" />
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PoolFlow Planner</title>
+  <meta name="description" content="Interactive pool and spa hydraulic planner with valves, tees, spillover validation, fittings takeoff, dimensions, flow animation, and export." />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/interactjs/dist/interact.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
+  <style>
+    :root,[data-theme="light"]{--bg:#f7f6f2;--surface:#f9f8f5;--surface2:#fbfbf9;--offset:#f3f0ec;--border:#d4d1ca;--text:#28251d;--muted:#6f6d67;--primary:#01696f;--primary2:#0c4e54;--blue:#006494;--purple:#7a39bb;--orange:#da7101;--warning:#964219;--gold:#d19900;--success:#437a22;--error:#a12c7b;--shadow:0 10px 30px rgba(20,20,20,.08);--r:14px}
+    [data-theme="dark"]{--bg:#171614;--surface:#1c1b19;--surface2:#201f1d;--offset:#252320;--border:#393836;--text:#e3e0d8;--muted:#9e9c96;--primary:#4f98a3;--primary2:#227f8b;--blue:#6ca9de;--purple:#a86fdf;--orange:#fdab43;--warning:#cf8d65;--gold:#efc65d;--success:#79b95b;--error:#db7cb7;--shadow:0 14px 34px rgba(0,0,0,.35)}
+    *{box-sizing:border-box}html,body{margin:0}body{font-family:'Instrument Sans',system-ui,sans-serif;background:var(--bg);color:var(--text)}button,input,select{font:inherit}button{cursor:pointer}.app{display:grid;grid-template-columns:380px 1fr;min-height:100vh}.side{background:var(--surface);border-right:1px solid var(--border);padding:16px;overflow:auto;display:flex;flex-direction:column;gap:14px}.main{display:grid;grid-template-rows:auto 1fr}.top{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;padding:16px;border-bottom:1px solid var(--border);background:var(--surface)}.logo{display:flex;gap:12px;align-items:center}.logo svg{width:36px;height:36px;color:var(--primary)}h1{font-family:'Instrument Serif',serif;margin:0;font-size:32px}h2{font-size:18px;margin:0 0 10px}.muted{color:var(--muted);font-size:14px}.panel{background:var(--surface2);border:1px solid color-mix(in srgb,var(--text) 10%, transparent);border-radius:var(--r);padding:14px;box-shadow:0 1px 2px rgba(0,0,0,.04)}.grid2,.tools{display:grid;grid-template-columns:1fr 1fr;gap:8px}.tools button,.btn{min-height:44px;border-radius:12px;border:1px solid var(--border);background:var(--bg);color:var(--text);padding:10px 12px;font-weight:600}.btn.primary{background:var(--primary);border-color:var(--primary);color:white}.btn.primary:hover{background:var(--primary2)}label{display:block;font-size:13px;font-weight:700;margin-bottom:4px}.stack{display:flex;flex-direction:column;gap:8px}.row{display:flex;gap:8px;align-items:center}.row>*{flex:1}input,select{width:100%;padding:10px 12px;border-radius:10px;border:1px solid var(--border);background:var(--bg);color:var(--text)}.canvasWrap{padding:16px;overflow:auto;background:linear-gradient(180deg,var(--offset),var(--bg))}.canvasShell{position:relative;min-width:1180px;min-height:900px}.rulerX,.rulerY{position:absolute;background:var(--surface);z-index:2}.rulerX{left:42px;right:0;top:0;height:42px;border-bottom:1px solid var(--border)}.rulerY{left:0;top:42px;bottom:0;width:42px;border-right:1px solid var(--border)}.stage{position:absolute;left:42px;top:42px;width:1900px;height:1200px;border:1px solid var(--border);border-radius:16px;overflow:hidden;background-image:linear-gradient(to right,color-mix(in srgb,var(--border) 50%, transparent) 1px,transparent 1px),linear-gradient(to bottom,color-mix(in srgb,var(--border) 50%, transparent) 1px,transparent 1px);background-size:40px 40px}.stage:before{content:'';position:absolute;inset:0;background-image:linear-gradient(to right,color-mix(in srgb,var(--primary) 7%, transparent) 1px,transparent 1px),linear-gradient(to bottom,color-mix(in srgb,var(--primary) 7%, transparent) 1px,transparent 1px);background-size:200px 200px;pointer-events:none}.svg{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}.node{position:absolute;min-width:84px;min-height:46px;border-radius:12px;border:2px solid var(--border);background:var(--surface);box-shadow:var(--shadow);padding:8px 10px;display:flex;flex-direction:column;justify-content:center;gap:2px;user-select:none;touch-action:none}.node .title{font-size:14px;font-weight:700}.node .meta{font-size:11px;color:var(--muted)}.node.selected{outline:3px solid color-mix(in srgb,var(--primary) 22%, transparent);border-color:var(--primary)}.body-pool,.body-spa{border-radius:999px;text-align:center;align-items:center;background:color-mix(in srgb,var(--blue) 15%, var(--surface));border-color:color-mix(in srgb,var(--blue) 50%, var(--border))}.body-pad{background:color-mix(in srgb,var(--warning) 10%, var(--surface));border-style:dashed}.fixture-light{background:color-mix(in srgb,var(--gold) 18%, var(--surface));border-color:var(--gold)}.fixture-conduit{background:color-mix(in srgb,var(--orange) 18%, var(--surface));border-color:var(--orange)}.valve{background:color-mix(in srgb,var(--primary) 12%, var(--surface));border-color:var(--primary)}.tee{background:color-mix(in srgb,var(--warning) 12%, var(--surface));border-color:var(--warning)}.status{padding:10px 12px;border-radius:12px;font-size:13px;font-weight:700}.ok{background:color-mix(in srgb,var(--success) 16%, transparent);color:var(--success)}.err{background:color-mix(in srgb,var(--error) 16%, transparent);color:var(--error)}.chip{display:inline-flex;align-items:center;padding:3px 8px;border-radius:999px;background:color-mix(in srgb,var(--primary) 12%, transparent);font-size:12px;font-weight:700}.legend{display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:13px}.legend span{display:flex;align-items:center;gap:6px}.dot{width:12px;height:12px;border-radius:999px;display:inline-block}.flowText,.measureText{font-size:12px;fill:var(--text);paint-order:stroke;stroke:var(--bg);stroke-width:3px;stroke-linejoin:round}.rightCol{display:grid;grid-template-columns:1.2fr .8fr;gap:12px}.list{display:flex;flex-direction:column;gap:8px;max-height:210px;overflow:auto}.card{padding:10px;border-radius:12px;background:var(--bg);border:1px solid var(--border);font-size:13px}.sm{font-size:12px;color:var(--muted)}@media (max-width:980px){.app{grid-template-columns:1fr}.side{border-right:none;border-bottom:1px solid var(--border)}.canvasShell{min-width:1100px}}
+  </style>
 </head>
 <body>
-<div id="app">
-  <!-- ===== Top bar ===== -->
-  <header class="topbar">
-    <div class="brand">
-      <span class="logo" aria-label="PoolFlow Planner logo"></span>
-      <div class="brand-text">
-        <span class="brand-name">PoolFlow</span>
-        <span class="brand-sub">Planner</span>
+<div class="app">
+  <aside class="side">
+    <div class="logo">
+      <svg viewBox="0 0 48 48" fill="none" aria-label="PoolFlow Planner logo"><path d="M8 14c6-6 26-6 32 0-6 6-26 6-32 0Z" stroke="currentColor" stroke-width="2.6"/><path d="M8 24c6-6 26-6 32 0-6 6-26 6-32 0Z" stroke="currentColor" stroke-width="2.6" opacity=".72"/><circle cx="36" cy="12" r="4" fill="currentColor"/></svg>
+      <div><h1>PoolFlow Planner</h1><div class="muted">Hydraulic flows, spillover logic, fittings, export</div></div>
+    </div>
+
+    <section class="panel">
+      <h2>Parts</h2>
+      <div class="tools" id="toolbox"></div>
+    </section>
+
+    <section class="panel stack">
+      <h2>Scale</h2>
+      <div class="row"><div><label>Units</label><select id="unit"><option value="ft">Feet</option><option value="in">Inches</option></select></div><div><label>Pixels per unit</label><input id="ppu" type="number" value="20" min="5"></div></div>
+      <div class="row"><div><label>Grid step</label><input id="grid" type="number" value="2" min="1"></div><div><label>Dimension style</label><select id="dimMode"><option value="center">Center to center</option><option value="edge">Edge to edge</option></select></div></div>
+      <button class="btn" id="measureBtn">Measure selected spacing</button>
+    </section>
+
+    <section class="panel stack">
+      <h2>Connect and flow</h2>
+      <div class="row"><div><label>Line type</label><select id="edgeType"><option value="suction">Suction</option><option value="return" selected>Return</option><option value="spillover">Spillover</option><option value="feature">Water feature</option><option value="conduit">Conduit</option></select></div><div><label>Size</label><select id="edgeSize"><option>1.5"</option><option selected>2"</option><option>2.5"</option><option>3"</option><option>4"</option><option>3/4" conduit</option><option>1" conduit</option></select></div></div>
+      <div class="row"><div><label>From label</label><input id="edgeFromText" placeholder="Pool suction"></div><div><label>To label</label><input id="edgeToText" placeholder="Spa return"></div></div>
+      <button class="btn primary" id="connectBtn">Connect selected in order</button>
+      <button class="btn" id="solveBtn">Solve flow</button>
+      <button class="btn" id="animBtn">Toggle animation</button>
+    </section>
+
+    <section class="panel stack">
+      <h2>Selected part</h2>
+      <div class="grid2">
+        <div><label>Label</label><input id="pLabel"></div>
+        <div><label>Size</label><input id="pSize"></div>
+        <div><label>Width</label><input id="pW" type="number"></div>
+        <div><label>Height</label><input id="pH" type="number"></div>
+      </div>
+      <div><label>Notes</label><input id="pNotes" placeholder="Custom feature / nicheless / branch A"></div>
+      <div><label>Body relation</label><select id="bodyRelation"><option value="">None</option><option value="pool">Flows to pool</option><option value="spa">Flows to spa</option></select></div>
+      <div><label>Valve mode</label><select id="valveState"><option value="">N/A</option><option value="open">2-way open</option><option value="closed">2-way closed</option><option value="a">3-way to port A</option><option value="b">3-way to port B</option><option value="both">3-way shared</option></select></div>
+      <div class="row"><button class="btn" id="applyBtn">Apply</button><button class="btn" id="deleteBtn">Delete</button></div>
+    </section>
+
+    <section class="panel stack">
+      <h2>Visibility and export</h2>
+      <div class="row"><label><input type="checkbox" id="showDims" checked> Dimensions</label><label><input type="checkbox" id="showLabels" checked> Labels</label></div>
+      <div class="row"><label><input type="checkbox" id="showLights" checked> Lights</label><label><input type="checkbox" id="showConduit" checked> Conduit</label></div>
+      <div class="row"><button class="btn primary" id="jsonBtn">Export JSON</button><button class="btn primary" id="pdfBtn">Export PDF</button></div>
+      <div class="row"><button class="btn primary" id="ghBtn">Update GitHub</button><button class="btn" id="demoBtn">Load advanced demo</button></div>
+    </section>
+
+    <section class="panel stack">
+      <h2>Validation</h2>
+      <div id="statusBox" class="status ok">Ready.</div>
+      <div id="issues" class="list"></div>
+    </section>
+
+    <section class="panel stack">
+      <h2>Fittings takeoff</h2>
+      <div id="takeoff" class="list"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Legend</h2>
+      <div class="legend">
+        <span><i class="dot" style="background:var(--primary)"></i>Suction</span>
+        <span><i class="dot" style="background:var(--blue)"></i>Return</span>
+        <span><i class="dot" style="background:var(--purple)"></i>Spillover</span>
+        <span><i class="dot" style="background:var(--warning)"></i>Feature</span>
+        <span><i class="dot" style="background:var(--orange)"></i>Conduit</span>
+        <span><i class="dot" style="background:var(--gold)"></i>Light</span>
+      </div>
+    </section>
+  </aside>
+
+  <main class="main">
+    <div class="top">
+      <div>
+        <div class="chip">Interactive valves + tees + spillover validation</div>
+        <div class="muted">Set suction and return routes, flip valves, and validate whether the whole hydraulic loop completes.</div>
+      </div>
+      <div class="rightCol">
+        <div class="panel"><strong>How it works</strong><div class="sm">Select two or more parts and connect them in order. Add 2-way or 3-way valves, tees, lights, conduit, water features, and spillover. Use Solve flow after any valve change.</div></div>
+        <div class="panel"><strong>Spillover rule</strong><div class="sm">If water returns to spa or a feature spills into spa, the app expects a valid downstream path from spa to pool unless isolated spa mode is intentional.</div></div>
       </div>
     </div>
 
-    <div class="project-meta">
-      <input id="projName" class="proj-name" type="text" placeholder="Untitled Project" aria-label="Project name" />
-      <input id="projClient" class="proj-client" type="text" placeholder="Client / Address" aria-label="Client and address" />
-    </div>
-
-    <div class="topbar-actions">
-      <button id="btnFlow" class="btn btn-flow" title="Toggle flow animation view" aria-pressed="false">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8c2.5 0 2.5 2 5 2s2.5-2 5-2 2.5 2 5 2"/><path d="M3 14c2.5 0 2.5 2 5 2s2.5-2 5-2 2.5 2 5 2"/></svg>
-        <span>Flow</span>
-      </button>
-      <button id="btnProjects" class="btn" title="Projects">Projects</button>
-      <button id="btnSave" class="btn" title="Save now">Save</button>
-      <button id="btnExportPdf" class="btn btn-accent" title="Export PDF plan sheet">Export PDF</button>
-      <button id="btnMenu" class="btn icon-btn" aria-label="More" title="More">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg>
-      </button>
-    </div>
-  </header>
-
-  <!-- ===== Body: palette | canvas | inspector ===== -->
-  <div class="workspace">
-    <!-- Palette -->
-    <aside class="palette" id="palette" aria-label="Component palette">
-      <div class="palette-scroll" id="paletteScroll"></div>
-    </aside>
-
-    <!-- Mobile palette toggle -->
-    <button id="paletteToggle" class="palette-toggle" aria-label="Toggle palette">
-      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
-    </button>
-
-    <!-- Canvas -->
-    <main class="canvas-wrap" id="canvasWrap">
-      <svg id="canvas" xmlns="http://www.w3.org/2000/svg"></svg>
-
-      <!-- Floating canvas controls -->
-      <div class="canvas-tools">
-        <button id="toolSelect" class="ctool active" title="Select / move" aria-label="Select tool">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 3l7 17 2.5-6.5L20 11z"/></svg>
-        </button>
-        <button id="toolPipe" class="ctool" title="Draw pipe" aria-label="Pipe tool">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 18v-5a4 4 0 0 1 4-4h6"/><path d="M20 6v5a4 4 0 0 1-4 4h-2"/><circle cx="4" cy="18" r="2"/><circle cx="20" cy="6" r="2"/></svg>
-        </button>
-        <button id="toolHand" class="ctool" title="Pan" aria-label="Pan tool">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 11V6a2 2 0 0 0-4 0M14 10V4a2 2 0 0 0-4 0v2M10 10.5V6a2 2 0 0 0-4 0v8"/><path d="M18 8a2 2 0 0 1 4 0v6a8 8 0 0 1-8 8h-2a8 8 0 0 1-7-4l-3-5a2 2 0 0 1 3.4-2L6 14"/></svg>
-        </button>
-      </div>
-
-      <div class="zoom-tools">
-        <button id="snapToggle" class="ztool snap-on" title="Toggle snap to grid">Snap</button>
-        <button id="zoomOut" class="ztool" aria-label="Zoom out">&minus;</button>
-        <span id="zoomLabel" class="zoom-label">100%</span>
-        <button id="zoomIn" class="ztool" aria-label="Zoom in">+</button>
-        <button id="zoomFit" class="ztool" title="Fit to screen" aria-label="Fit">Fit</button>
-      </div>
-
-      <!-- Pipe drawing hint -->
-      <div id="pipeHint" class="pipe-hint" hidden>
-        Tap a component to start, tap to add bends, tap a component to finish &middot;
-        <button id="pipeCancel" class="link-btn">Cancel</button>
-      </div>
-
-      <!-- Flow mode hint -->
-      <div id="flowHint" class="flow-hint" hidden>
-        <span class="flow-dot"></span>Flow mode &middot; tap a pipe to toggle it on/off &middot; tap the spillover to toggle its cascade
-      </div>
-
-      <!-- Empty state -->
-      <div id="emptyState" class="empty-state">
-        <div class="empty-card">
-          <span class="empty-logo"></span>
-          <h2>Start your plumbing plan</h2>
-          <p>Drag pool, spa, fittings and equipment from the palette onto the grid. Connect them with the pipe tool, label sizes, then export a clean PDF plan sheet.</p>
+    <div class="canvasWrap">
+      <div class="canvasShell">
+        <div class="rulerX" id="rulerX"></div>
+        <div class="rulerY" id="rulerY"></div>
+        <div class="stage" id="stage">
+          <svg id="edgeSvg" class="svg"></svg>
+          <svg id="dimSvg" class="svg"></svg>
         </div>
       </div>
-    </main>
-
-    <!-- Inspector -->
-    <aside class="inspector" id="inspector" aria-label="Properties" hidden>
-      <div class="inspector-head">
-        <span id="inspTitle">Properties</span>
-        <button id="inspClose" class="icon-btn small" aria-label="Close panel">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"/></svg>
-        </button>
-      </div>
-      <div class="inspector-body" id="inspBody"></div>
-    </aside>
-  </div>
+    </div>
+  </main>
 </div>
 
-<!-- ===== Modals ===== -->
-<div id="modalLayer" class="modal-layer" hidden></div>
+<script>
+const stage=document.getElementById('stage'),edgeSvg=document.getElementById('edgeSvg'),dimSvg=document.getElementById('dimSvg');
+const state={items:[],edges:[],dims:[],selected:[],animate:true,nextId:1,lastSolve:null};
+const tools=[['pool','Pool'],['spa','Spa'],['pad','Equip Pad'],['pump','Pump'],['filter','Filter'],['heater','Heater'],['return','Return'],['skimmer','Skimmer'],['jet','Spa Jet'],['bubbler','Bubbler'],['deckjet','Deck Jet'],['slide','Slide'],['feature','Feature'],['light','Light'],['conduit','Conduit'],['valve2','2-Way Valve'],['valve3','3-Way Valve'],['tee','Tee'],['bodylink','Spill Link']];
+const defaults={pool:[300,170],spa:[160,110],pad:[240,120],pump:[110,56],filter:[110,56],heater:[110,56],return:[80,48],skimmer:[90,48],jet:[80,48],bubbler:[90,48],deckjet:[90,48],slide:[90,48],feature:[110,52],light:[78,46],conduit:[92,46],valve2:[92,52],valve3:[100,54],tee:[72,52],bodylink:[110,46]};
+const cls={pool:'body-pool',spa:'body-spa',pad:'body-pad',light:'fixture-light',conduit:'fixture-conduit',valve2:'valve',valve3:'valve',tee:'tee'};
+const colors={suction:'var(--primary)',return:'var(--blue)',spillover:'var(--purple)',feature:'var(--warning)',conduit:'var(--orange)'};
+function uid(){return 'n'+(state.nextId++)} function snap(v){const p=(+document.getElementById('ppu').value||20)*(+document.getElementById('grid').value||2);return Math.round(v/p)*p}
+function unit(px){const ppu=+document.getElementById('ppu').value||20,u=document.getElementById('unit').value;return (px/ppu).toFixed(u==='ft'?1:0)+' '+u}
+function center(i){return{x:i.x+i.w/2,y:i.y+i.h/2}} function getItem(id){return state.items.find(i=>i.id===id)}
+function toolButton(type,label){const b=document.createElement('button');b.textContent=label;b.onclick=()=>addItem(type,120+Math.random()*600,100+Math.random()*400);document.getElementById('toolbox').appendChild(b)} tools.forEach(([a,b])=>toolButton(a,b));
+function labelFor(type){return({pool:'Pool',spa:'Spa',pad:'Equipment Pad',pump:'Pump',filter:'Filter',heater:'Heater',return:'Return',skimmer:'Skimmer',jet:'Spa Jet',bubbler:'Bubbler',deckjet:'Deck Jet',slide:'Slide',feature:'Feature',light:'Light',conduit:'Conduit',valve2:'2-Way Valve',valve3:'3-Way Valve',tee:'Tee',bodylink:'Spill Link'})[type]||type}
+function addItem(type,x,y,extra={}){const [w,h]=defaults[type]||[100,50];const item={id:uid(),type,label:extra.label||labelFor(type),size:extra.size||'',notes:extra.notes||'',relation:extra.relation||'',valveState:extra.valveState||'',x:snap(x),y:snap(y),w:extra.w||w,h:extra.h||h};state.items.push(item);renderItem(item);sync();return item}
+function renderItem(item){const el=document.createElement('div');el.className='node '+(cls[item.type]||'');el.dataset.id=item.id;Object.assign(el.style,{left:item.x+'px',top:item.y+'px',width:item.w+'px',height:item.h+'px'});el.innerHTML=`<div class="title">${item.label}</div><div class="meta">${meta(item)}</div>`;stage.appendChild(el);el.addEventListener('click',e=>{e.stopPropagation();toggle(item.id,e.shiftKey)});el.addEventListener('dblclick',()=>cycleValve(item));interact(el).draggable({listeners:{move(ev){item.x=snap(item.x+ev.dx);item.y=snap(item.y+ev.dy);Object.assign(el.style,{left:item.x+'px',top:item.y+'px'});sync()}}}).resizable({edges:{left:true,right:true,top:true,bottom:true},listeners:{move(ev){item.x=snap(item.x+ev.deltaRect.left);item.y=snap(item.y+ev.deltaRect.top);item.w=Math.max(60,snap(ev.rect.width));item.h=Math.max(42,snap(ev.rect.height));Object.assign(el.style,{left:item.x+'px',top:item.y+'px',width:item.w+'px',height:item.h+'px'});sync()}}})}
+function meta(item){const bits=[];if(item.size)bits.push(item.size);if(item.valveState)bits.push(item.valveState);if(item.relation)bits.push('to '+item.relation);if(item.notes)bits.push(item.notes);return bits.join(' · ')||item.type}
+function toggle(id,add){if(!add)state.selected=[];state.selected.includes(id)?state.selected=state.selected.filter(v=>v!==id):state.selected.push(id);updateSelectionUI()}
+function updateSelectionUI(){document.querySelectorAll('.node').forEach(n=>n.classList.toggle('selected',state.selected.includes(n.dataset.id)));const item=getItem(state.selected[0]);document.getElementById('pLabel').value=item?.label||'';document.getElementById('pSize').value=item?.size||'';document.getElementById('pW').value=item?.w||'';document.getElementById('pH').value=item?.h||'';document.getElementById('pNotes').value=item?.notes||'';document.getElementById('bodyRelation').value=item?.relation||'';document.getElementById('valveState').value=item?.valveState||''}
+function cycleValve(item){if(item.type==='valve2'){item.valveState=item.valveState==='open'?'closed':'open';sync();solveFlow()} if(item.type==='valve3'){const order=['a','b','both'];item.valveState=order[(order.indexOf(item.valveState)+1+order.length)%order.length]||'a';sync();solveFlow()}}
+function apply(){const item=getItem(state.selected[0]);if(!item)return;item.label=document.getElementById('pLabel').value||item.label;item.size=document.getElementById('pSize').value;item.w=+document.getElementById('pW').value||item.w;item.h=+document.getElementById('pH').value||item.h;item.notes=document.getElementById('pNotes').value;item.relation=document.getElementById('bodyRelation').value;item.valveState=document.getElementById('valveState').value;sync()}
+function removeSel(){const ids=new Set(state.selected);state.items=state.items.filter(i=>!ids.has(i.id));state.edges=state.edges.filter(e=>!ids.has(e.from)&&!ids.has(e.to));state.dims=state.dims.filter(d=>!ids.has(d.a)&&!ids.has(d.b));document.querySelectorAll('.node').forEach(n=>{if(ids.has(n.dataset.id))n.remove()});state.selected=[];sync();solveFlow()}
+function connectSelected(){if(state.selected.length<2)return;for(let i=0;i<state.selected.length-1;i++){const from=state.selected[i],to=state.selected[i+1],src=getItem(from),dst=getItem(to);state.edges.push({id:uid(),from,to,type:document.getElementById('edgeType').value,size:document.getElementById('edgeSize').value,label:(document.getElementById('edgeFromText').value||src.label)+' → '+(document.getElementById('edgeToText').value||dst.label),active:false,blocked:false})}sync();solveFlow()}
+function measure(){if(state.selected.length!==2)return;state.dims.push({a:state.selected[0],b:state.selected[1],label:'Spacing'});sync()}
+function drawRulers(){const rx=document.getElementById('rulerX'),ry=document.getElementById('rulerY'),ppu=+document.getElementById('ppu').value||20,major=ppu*5,u=document.getElementById('unit').value;rx.innerHTML='';ry.innerHTML='';for(let i=0;i<1900;i+=major){const l=document.createElement('div');l.style.cssText=`position:absolute;left:${i}px;top:0;bottom:0;width:1px;background:var(--border)`;const t=document.createElement('div');t.textContent=(i/ppu)+u;t.style.cssText=`position:absolute;left:${i+4}px;top:11px;font-size:11px;color:var(--muted)`;rx.append(l,t)}for(let i=0;i<1200;i+=major){const l=document.createElement('div');l.style.cssText=`position:absolute;top:${i}px;left:0;right:0;height:1px;background:var(--border)`;const t=document.createElement('div');t.textContent=(i/ppu)+u;t.style.cssText=`position:absolute;top:${i+4}px;left:5px;font-size:11px;color:var(--muted)`;ry.append(l,t)}}
+function drawEdges(){const defs=`<defs><marker id="arr-suction" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="var(--primary)"/></marker><marker id="arr-return" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="var(--blue)"/></marker><marker id="arr-spillover" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="var(--purple)"/></marker><marker id="arr-feature" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="var(--warning)"/></marker><marker id="arr-conduit" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="var(--orange)"/></marker><style>.flow{fill:none;stroke-width:4}.active{stroke-dasharray:12 10;animation:dash 1s linear infinite}.blocked{opacity:.28;stroke-dasharray:4 8}@keyframes dash{to{stroke-dashoffset:-22}}</style></defs>`;let html=defs;for(const e of state.edges){const a=getItem(e.from),b=getItem(e.to);if(!a||!b)continue;const p1=center(a),p2=center(b),mx=(p1.x+p2.x)/2;const d=`M ${p1.x} ${p1.y} C ${mx} ${p1.y}, ${mx} ${p2.y}, ${p2.x} ${p2.y}`;const cls=['flow'];if(e.active&&state.animate)cls.push('active');if(e.blocked)cls.push('blocked');html+=`<path d="${d}" class="${cls.join(' ')}" stroke="${colors[e.type]}" marker-end="url(#arr-${e.type})"></path>`;if(document.getElementById('showLabels').checked){const lx=(p1.x+p2.x)/2,ly=(p1.y+p2.y)/2-10;const len=Math.hypot(p2.x-p1.x,p2.y-p1.y);html+=`<text x="${lx}" y="${ly}" text-anchor="middle" class="flowText">${e.label} · ${e.size||'-'} · ${unit(len)}</text>`;if(e.type==='spillover')html+=`<text x="${lx}" y="${ly+16}" text-anchor="middle" class="flowText">Spillover path</text>`}}edgeSvg.innerHTML=html}
+function drawDims(){if(!document.getElementById('showDims').checked){dimSvg.innerHTML='';return}let html='';for(const d of state.dims){const a=getItem(d.a),b=getItem(d.b);if(!a||!b)continue;const ca=center(a),cb=center(b),y=Math.min(ca.y,cb.y)-34,x1=Math.min(ca.x,cb.x),x2=Math.max(ca.x,cb.x),dist=Math.abs(cb.x-ca.x);html+=`<line x1="${ca.x}" y1="${ca.y}" x2="${ca.x}" y2="${y}" stroke="var(--muted)" stroke-dasharray="5 5"/><line x1="${cb.x}" y1="${cb.y}" x2="${cb.x}" y2="${y}" stroke="var(--muted)" stroke-dasharray="5 5"/><line x1="${x1}" y1="${y}" x2="${x2}" y2="${y}" stroke="var(--text)"/><polygon points="${x1},${y} ${x1+8},${y-4} ${x1+8},${y+4}" fill="var(--text)"/><polygon points="${x2},${y} ${x2-8},${y-4} ${x2-8},${y+4}" fill="var(--text)"/><text x="${(x1+x2)/2}" y="${y-8}" text-anchor="middle" class="measureText">${d.label}: ${unit(dist)}</text>`}dimSvg.innerHTML=html}
+function sync(){for(const i of state.items){const el=document.querySelector(`.node[data-id="${i.id}"]`);if(el){el.innerHTML=`<div class="title">${i.label}</div><div class="meta">${meta(i)}</div>`;Object.assign(el.style,{width:i.w+'px',height:i.h+'px'})}}drawRulers();drawEdges();drawDims();updateSelectionUI();filterLayer();renderTakeoff()}
+function filterLayer(){const sl=document.getElementById('showLights').checked,sc=document.getElementById('showConduit').checked;for(const i of state.items){const el=document.querySelector(`.node[data-id="${i.id}"]`);if(!el)continue;el.style.display=(i.type==='light'&&!sl)||(i.type==='conduit'&&!sc)?'none':'flex'}}
+function adjacency(){const map={};for(const i of state.items)map[i.id]=[];for(const e of state.edges)map[e.from].push(e);return map}
+function valveAllows(node,edges,index){if(node.type==='valve2')return node.valveState!=='closed'; if(node.type==='valve3'){if(node.valveState==='both'||!node.valveState)return true; if(node.valveState==='a')return index===0; if(node.valveState==='b')return index===1; return false} return true}
+function solveFlow(){state.edges.forEach(e=>{e.active=false;e.blocked=false});const issues=[];const adj=adjacency();const pumps=state.items.filter(i=>i.type==='pump');const results=[];for(const pump of pumps){const incoming=state.edges.filter(e=>e.to===pump.id&&e.type!=='conduit');const outgoing=state.edges.filter(e=>e.from===pump.id&&e.type!=='conduit');if(!incoming.length)issues.push(`Pump ${pump.label} has no suction source.`);if(!outgoing.length)issues.push(`Pump ${pump.label} has no return destination.`);for(const inc of incoming)inc.active=true;for(const out of outgoing){traverse(out,pump.label,new Set([pump.id]))}}
+    function traverse(edge,root,seen){edge.active=true;const node=getItem(edge.to);if(!node)return; if(seen.has(node.id))return; seen.add(node.id); if(node.type==='valve2'&&node.valveState==='closed'){edge.blocked=true;issues.push(`${node.label} is closed and blocking flow.`);return} const outs=(adj[node.id]||[]).filter(e=>e.type!=='conduit'); if(node.type==='valve3'){outs.forEach((o,idx)=>{if(valveAllows(node,outs,idx))traverse(o,root,new Set(seen));else o.blocked=true}); return} if(node.type==='tee'){if(!outs.length)issues.push(`${node.label} tee has no downstream branch.`); outs.forEach(o=>traverse(o,root,new Set(seen))); return} if(['pool','spa'].includes(node.type)){results.push({root,end:node.label,type:node.type,id:node.id}); return} if(!outs.length){issues.push(`${node.label} ends the route with no downstream body.`); return} outs.forEach(o=>traverse(o,root,new Set(seen)))}
 
-<!-- toast -->
-<div id="toast" class="toast" hidden></div>
+  const spaNodes=state.items.filter(i=>i.type==='spa');
+  for(const spa of spaNodes){const inToSpa=state.edges.filter(e=>e.to===spa.id && ['return','spillover','feature'].includes(e.type) && e.active && !e.blocked); if(inToSpa.length){ const spill=state.edges.filter(e=>e.from===spa.id && (e.type==='spillover'||e.type==='return') && e.active && !e.blocked); const relPool=spa.relation==='pool'; const reachesPool=spill.some(e=>getItem(e.to)?.type==='pool'); if(!(relPool||reachesPool)){issues.push(`Spa ${spa.label} receives water but does not have a valid spillover or return path to pool.`)} }}
 
-<input type="file" id="importFile" accept="application/json,.json" hidden />
+  for(const feat of state.items.filter(i=>i.type==='feature')){ const incoming=state.edges.filter(e=>e.to===feat.id && e.active && !e.blocked); const outgoing=state.edges.filter(e=>e.from===feat.id && e.active && !e.blocked); if(incoming.length && !outgoing.length && !feat.relation){issues.push(`Feature ${feat.label} receives water but has no destination body.`)} }
 
-<script src="./lib/jspdf.umd.min.js"></script>
-<script src="./js/icons.js"></script>
-<script src="./js/catalog.js"></script>
-<script src="./js/app.js"></script>
+  const activeBodies=results.map(r=>r.end).join(', ');
+  const ok=!issues.length;
+  state.lastSolve={issues,results};
+  document.getElementById('statusBox').className='status '+(ok?'ok':'err');
+  document.getElementById('statusBox').textContent=ok?`Valid flow. Water resolves to ${activeBodies || 'configured bodies'}.`:`${issues.length} issue${issues.length===1?'':'s'} found.`;
+  const list=document.getElementById('issues'); list.innerHTML='';
+  if(ok){list.innerHTML='<div class="card">No hydraulic errors detected in the active path set.</div>'} else issues.forEach(t=>{const d=document.createElement('div'); d.className='card'; d.textContent=t; list.appendChild(d)});
+  drawEdges();
+}
+function renderTakeoff(){const counts={};state.items.forEach(i=>{if(i.type==='tee')counts['Tees']=(counts['Tees']||0)+1; if(i.type==='valve2')counts['2-way valves']=(counts['2-way valves']||0)+1; if(i.type==='valve3')counts['3-way valves']=(counts['3-way valves']||0)+1});state.edges.forEach(e=>{const key=`Pipe ${e.size||'unsized'} ${e.type}`;counts[key]=(counts[key]||0)+1; counts['Estimated 90s']=(counts['Estimated 90s']||0)+2});const box=document.getElementById('takeoff');box.innerHTML='';Object.entries(counts).forEach(([k,v])=>{const d=document.createElement('div');d.className='card';d.innerHTML=`<strong>${v}</strong> · ${k}`;box.appendChild(d)});if(!box.children.length)box.innerHTML='<div class="card">No fittings counted yet.</div>'}
+function exportJSON(){const blob=new Blob([JSON.stringify(state,null,2)],{type:'application/json'}),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='poolflow-hydraulic-plan.json';a.click()}
+function exportPDF(){const {jsPDF}=window.jspdf;const doc=new jsPDF({orientation:'landscape',unit:'pt',format:'a4'});doc.setFont('helvetica');doc.setFontSize(18);doc.text('PoolFlow Planner Hydraulic Export',32,32);doc.setFontSize(10);doc.text('Includes parts, active connections, validation, and fittings takeoff.',32,50);let y=74;state.items.forEach(i=>{doc.text(`${i.label} (${i.type}) size:${i.size||'-'} valve:${i.valveState||'-'} relation:${i.relation||'-'} notes:${i.notes||'-'}`,32,y);y+=14;if(y>520){doc.addPage();y=32}});doc.addPage();doc.setFontSize(16);doc.text('Connections',32,32);y=56;state.edges.forEach(e=>{doc.text(`${getItem(e.from)?.label} -> ${getItem(e.to)?.label} | ${e.type} | ${e.size} | ${e.active?'active':'inactive'}${e.blocked?' blocked':''}`,32,y);y+=14;if(y>540){doc.addPage();y=32}});doc.addPage();doc.setFontSize(16);doc.text('Validation',32,32);y=56;(state.lastSolve?.issues?.length?state.lastSolve.issues:['No hydraulic errors detected.']).forEach(t=>{doc.text(t,32,y);y+=14});doc.addPage();doc.setFontSize(16);doc.text('Fittings Takeoff',32,32);y=56;[...document.getElementById('takeoff').children].forEach(c=>{doc.text(c.textContent.trim(),32,y);y+=14});doc.save('poolflow-hydraulic-export.pdf')}
+async function updateGitHub(){const token=prompt('GitHub personal access token with repo permission');if(!token)return;const html=document.documentElement.outerHTML;const content=btoa(unescape(encodeURIComponent(html)));const url='https://api.github.com/repos/reifere-stack/poolflow-planner/contents/index.html';const get=await fetch(url,{headers:{Authorization:`Bearer ${token}`,Accept:'application/vnd.github+json'}});const existing=await get.json();await fetch(url,{method:'PUT',headers:{Authorization:`Bearer ${token}`,Accept:'application/vnd.github+json','Content-Type':'application/json'},body:JSON.stringify({message:'Add hydraulic solver, valves, tees, spillover validation, and fittings takeoff',content,sha:existing.sha})});alert('GitHub updated. Give Pages a minute to redeploy.')}
+function clearAll(){state.items=[];state.edges=[];state.dims=[];state.selected=[];document.querySelectorAll('.node').forEach(n=>n.remove());sync()}
+function demo(){clearAll();const pool=addItem('pool',120,260,{label:'Pool'}),spa=addItem('spa',540,120,{label:'Spa',relation:'pool'}),pad=addItem('pad',1260,180,{label:'Equipment Pad'}),sk=addItem('skimmer',140,140,{label:'Skimmer',size:'2.5"'}),pump=addItem('pump',1280,220,{label:'Pump',size:'2.5"'}),filter=addItem('filter',1400,220,{label:'Filter',size:'2.5"'}),heater=addItem('heater',1520,220,{label:'Heater',size:'2.5"'}),vSuction=addItem('valve3',1020,200,{label:'Suction Valve',valveState:'a'}),vReturn=addItem('valve3',1680,210,{label:'Return Valve',valveState:'both'}),tee1=addItem('tee',1780,210,{label:'Feature Tee'}),ret1=addItem('return',220,500,{label:'Return 1',size:'2"'}),ret2=addItem('return',380,500,{label:'Return 2',size:'2"'}),retSpa=addItem('return',590,220,{label:'Spa Return',size:'2"'}),jet1=addItem('jet',560,160,{label:'Spa Jet 1',size:'2"'}),feature=addItem('feature',820,120,{label:'Water Feature',relation:'spa',size:'2"'}),spill=addItem('bodylink',650,320,{label:'Spa Spill',relation:'pool'}),lightPool=addItem('light',230,320,{label:'Pool Light',size:'1" conduit'}),lightSpa=addItem('light',560,250,{label:'Spa Light',size:'1" conduit'}),conduit=addItem('conduit',960,320,{label:'Conduit Run',size:'1" conduit'}),valveFeature=addItem('valve2',890,210,{label:'Feature Valve',valveState:'open'});
+  const addE=(from,to,type,size,label)=>state.edges.push({id:uid(),from:from.id,to:to.id,type,size,label,active:false,blocked:false});
+  addE(sk,vSuction,'suction','2.5"','Pool suction → valve'); addE(vSuction,pump,'suction','2.5"','Valve → pump'); addE(pump,filter,'return','2.5"','Pump → filter'); addE(filter,heater,'return','2.5"','Filter → heater'); addE(heater,valveFeature,'feature','2"','Heater → feature valve'); addE(valveFeature,feature,'feature','2"','Valve → water feature'); addE(feature,spa,'feature','2"','Feature spills into spa'); addE(heater,vReturn,'return','2.5"','Heater → return valve'); addE(vReturn,tee1,'return','2.5"','Valve → tee'); addE(tee1,ret1,'return','2"','Tee → return 1'); addE(tee1,ret2,'return','2"','Tee → return 2'); addE(vReturn,retSpa,'return','2"','Valve → spa return'); addE(spa,pool,'spillover','2.5"','Spa spillover → pool'); addE(lightPool,conduit,'conduit','1" conduit','Pool light conduit'); addE(lightSpa,conduit,'conduit','1" conduit','Spa light conduit');
+  state.dims.push({a:ret1.id,b:ret2.id,label:'Return spacing'},{a:lightPool.id,b:lightSpa.id,label:'Light spacing'},{a:spa.id,b:pool.id,label:'Body spacing'}); sync(); solveFlow()}
+stage.addEventListener('click',()=>{state.selected=[];updateSelectionUI()});document.getElementById('measureBtn').onclick=measure;document.getElementById('connectBtn').onclick=connectSelected;document.getElementById('solveBtn').onclick=solveFlow;document.getElementById('animBtn').onclick=()=>{state.animate=!state.animate;drawEdges()};document.getElementById('applyBtn').onclick=()=>{apply();solveFlow()};document.getElementById('deleteBtn').onclick=removeSel;document.getElementById('jsonBtn').onclick=exportJSON;document.getElementById('pdfBtn').onclick=exportPDF;document.getElementById('ghBtn').onclick=updateGitHub;document.getElementById('demoBtn').onclick=demo;['showDims','showLabels','showLights','showConduit','ppu','grid','unit'].forEach(id=>document.getElementById(id).addEventListener('change',sync));document.addEventListener('keydown',e=>{if(e.key==='Delete')removeSel()});document.documentElement.setAttribute('data-theme',matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');demo();
+</script>
 </body>
 </html>
