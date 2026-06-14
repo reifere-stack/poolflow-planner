@@ -414,6 +414,18 @@ function onPointerUp(e) {
       // tap → already selected on down; nothing extra
     } else if (p.moved) {
       pushUndo(); // commit move
+      const moved = dragData?.item;
+      if (moved && maybeAutoRelate(moved)) {
+        refreshItem(moved);
+        solveFlow();
+        syncSelectedPanel();
+      }
+      // Pool/Spa moves can re-flow nearby fixtures too
+      if (moved && (moved.type === 'pool' || moved.type === 'spa')) {
+        let any = false;
+        for (const it of state.items) if (maybeAutoRelate(it)) { refreshItem(it); any = true; }
+        if (any) solveFlow();
+      }
     }
     dragMode = null; dragData = null; persist();
     return;
@@ -421,7 +433,19 @@ function onPointerUp(e) {
 
   if (dragMode === 'resize') {
     pushUndo(); persist();
+    const resized = dragData?.item;
     dragMode = null; dragData = null;
+    if (resized) {
+      // resizing a body can change which fixtures it covers
+      if (resized.type === 'pool' || resized.type === 'spa') {
+        let any = false;
+        for (const it of state.items) if (maybeAutoRelate(it)) { refreshItem(it); any = true; }
+        if (any) solveFlow();
+      } else if (maybeAutoRelate(resized)) {
+        refreshItem(resized);
+        solveFlow();
+      }
+    }
     syncSelectedPanel();
     return;
   }
@@ -462,6 +486,70 @@ document.addEventListener('gesturestart', e => e.preventDefault());
 function getItem(id) { return state.items.find(i => i.id === id); }
 function nodeEl(id) { return world.querySelector(`.node[data-id="${id}"]`); }
 
+// Fixture types that can imply a body of water by proximity.
+const FIXTURE_DEFAULT_BODY = {
+  jet: 'spa', bubbler: 'spa',
+  return: 'pool', skimmer: 'pool', drain: 'pool', deckjet: 'pool',
+  sheer: 'pool', slide: 'pool', autofill: 'pool', feature: 'pool',
+  light: null, conduit: null, custom: null,
+};
+
+// Test whether two axis-aligned rects overlap (or one contains the other).
+function rectsOverlap(a, b) {
+  return !(a.x + a.w <= b.x || b.x + b.w <= a.x || a.y + a.h <= b.y || b.y + b.h <= a.y);
+}
+
+function rectArea(r) { return Math.max(0, r.w) * Math.max(0, r.h); }
+
+function rectIntersectArea(a, b) {
+  const x1 = Math.max(a.x, b.x), y1 = Math.max(a.y, b.y);
+  const x2 = Math.min(a.x + a.w, b.x + b.w), y2 = Math.min(a.y + a.h, b.y + b.h);
+  return Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+}
+
+// If a fixture sits on top of (or close to) a Pool/Spa, return that body type.
+// Returns 'pool' | 'spa' | null. Closest wins; overlap beats nearest-by-center.
+function inferBodyRelation(item) {
+  if (!(item.type in FIXTURE_DEFAULT_BODY)) return null;
+  if (FIXTURE_DEFAULT_BODY[item.type] === null) return null;
+  const bodies = state.items.filter(i => i.type === 'pool' || i.type === 'spa');
+  if (!bodies.length) return null;
+  // 1) Prefer the body whose rect overlaps the fixture rect the most.
+  let bestOverlap = 0, overlapBody = null;
+  for (const b of bodies) {
+    const a = rectIntersectArea(item, b);
+    if (a > bestOverlap) { bestOverlap = a; overlapBody = b; }
+  }
+  if (overlapBody) return overlapBody.type;
+  // 2) Otherwise use nearest body within a reasonable distance (about 1 fixture-width away).
+  const cx = item.x + item.w/2, cy = item.y + item.h/2;
+  let bestDist = Infinity, nearest = null;
+  for (const b of bodies) {
+    const bcx = b.x + b.w/2, bcy = b.y + b.h/2;
+    // Distance from fixture center to body edge (negative if inside).
+    const dx = Math.max(b.x - cx, 0, cx - (b.x + b.w));
+    const dy = Math.max(b.y - cy, 0, cy - (b.y + b.h));
+    const d = Math.hypot(dx, dy);
+    if (d < bestDist) { bestDist = d; nearest = b; }
+  }
+  const closeEnoughPx = Math.max(item.w, item.h);
+  if (nearest && bestDist <= closeEnoughPx) return nearest.type;
+  return null;
+}
+
+// Apply inferred relation IF the user hasn't manually set one.
+function maybeAutoRelate(item) {
+  if (!(item.type in FIXTURE_DEFAULT_BODY)) return false;
+  if (item.relationLocked) return false; // user pinned it
+  const inferred = inferBodyRelation(item);
+  if (inferred && item.relation !== inferred) {
+    item.relation = inferred;
+    item.relationAuto = true;
+    return true;
+  }
+  return false;
+}
+
 function addItem(type, opts = {}) {
   const tool = TOOLS[type] || { w:100, h:60, label:type };
   // Place near center of current view
@@ -484,6 +572,11 @@ function addItem(type, opts = {}) {
   pushUndo();
   state.items.push(item);
   renderItem(item);
+  // Auto-infer body relation when the fixture is placed on/near a Pool or Spa,
+  // unless the caller already specified one (e.g. demo seed).
+  if (!item.relation) {
+    if (maybeAutoRelate(item)) refreshItem(item);
+  }
   selectItem(item.id);
   persist();
   return item;
@@ -1243,7 +1336,7 @@ function renderSelected() {
             ${PIPE_SIZES.map(s => `<option ${item.size===s?'selected':''}>${s}</option>`).join('')}
           </select>
         </div>
-        <div class="field"><label>Body relation</label>
+        <div class="field"><label>Body relation${item.relationAuto && !item.relationLocked ? ' \u00b7 auto' : ''}</label>
           <select id="f-relation">
             <option value="">None</option>
             <option ${item.relation==='pool'?'selected':''} value="pool">Flows to pool</option>
@@ -1752,7 +1845,11 @@ function doAction(name, btn) {
       pushUndo();
       item.label = $('f-label')?.value || item.label;
       item.size  = $('f-size')?.value || '';
-      item.relation = $('f-relation')?.value || '';
+      const newRel = $('f-relation')?.value || '';
+      item.relation = newRel;
+      // User picked something explicit — lock it (or clear lock if they reset to none)
+      item.relationLocked = !!newRel;
+      item.relationAuto = false;
       if ($('f-valve')) item.valveState = $('f-valve').value || '';
       if ($('f-spillsInto')) {
         item.spillsInto   = $('f-spillsInto').value || '';
@@ -1771,6 +1868,7 @@ function doAction(name, btn) {
       }
       item.notes = $('f-notes')?.value || '';
       refreshItem(item); solveFlow(); persist();
+      syncSelectedPanel();
       toast('Saved'); break;
     }
     case 'deleteSelected': if (state.selectedId) deleteItem(state.selectedId); renderSheet(); break;
