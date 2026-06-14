@@ -916,6 +916,10 @@ function drawEdges() {
       .spill-wave-anim { animation: spillFlow 1.6s linear infinite; stroke-dasharray:10 8; }
       .spill-badge { fill:#fff; stroke:#2eb6ff; stroke-width:1.5; }
       .spill-text { font: 600 11px -apple-system, system-ui, sans-serif; fill:#0a6e9a; pointer-events:none; }
+      .port-badge { fill:#fff; stroke:var(--accent, #4f8cff); stroke-width:1.5; }
+      .port-badge.active { fill:var(--accent, #4f8cff); }
+      .port-text { font: 700 11px -apple-system, system-ui, sans-serif; fill:var(--accent, #4f8cff); pointer-events:none; text-anchor:middle; dominant-baseline:central; }
+      .port-text.active { fill:#fff; }
       @keyframes flow { to { stroke-dashoffset: -24; } }
       @keyframes spillFlow { to { stroke-dashoffset: -36; } }
     </style>
@@ -926,6 +930,14 @@ function drawEdges() {
   let html = defs;
   // Spillover arrows are drawn first so pipes render above them
   html += renderSpillovers();
+  // Precompute per-3-way-valve output order so we can label A/B badges.
+  // Mirrors the solver: explicit edge.valvePort wins, then insertion order fills.
+  const valve3Outs = {};
+  for (const e of state.edges) {
+    if (e.type === 'conduit') continue;
+    const src = getItem(e.from);
+    if (src && src.type === 'valve3') (valve3Outs[src.id] ||= []).push(e);
+  }
   for (const e of state.edges) {
     const pts = edgeRoutePoints(e);
     if (pts.length < 2) continue;
@@ -967,6 +979,30 @@ function drawEdges() {
       e.waypoints.forEach((wp, idx) => {
         html += `<circle class="pipe-wp" cx="${wp.x}" cy="${wp.y}" r="7" data-edge-id="${e.id}" data-wp-idx="${idx}"></circle>`;
       });
+    }
+  }
+  // A/B port badges on 3-way valve output edges (drawn after pipes so they sit on top).
+  // Only show badges when the valve actually has multiple outputs to disambiguate.
+  for (const [vid, outs] of Object.entries(valve3Outs)) {
+    if (outs.length < 2) continue;
+    const valve = getItem(vid);
+    for (let i = 0; i < outs.length; i++) {
+      const edge = outs[i];
+      const port = valvePortFor(outs, i);
+      if (!port) continue; // only first two outs get a label
+      const pts = edgeRoutePoints(edge);
+      if (pts.length < 2) continue;
+      // Place the badge ~22px along the pipe from the valve so it doesn't sit on the valve body.
+      const dx = pts[1].x - pts[0].x, dy = pts[1].y - pts[0].y;
+      const len = Math.hypot(dx, dy) || 1;
+      const off = Math.min(22, len * 0.4);
+      const bx = pts[0].x + (dx / len) * off;
+      const by = pts[0].y + (dy / len) * off;
+      const active = (valve?.valveState === 'both' || !valve?.valveState || valve?.valveState === port) && edge.active && !edge.blocked;
+      const cls = active ? 'port-badge active' : 'port-badge';
+      const tcls = active ? 'port-text active' : 'port-text';
+      html += `<circle class="${cls}" cx="${bx}" cy="${by}" r="10" pointer-events="none"></circle>`;
+      html += `<text class="${tcls}" x="${bx}" y="${by}" pointer-events="none">${port.toUpperCase()}</text>`;
     }
   }
   edgeSvg.innerHTML = html;
@@ -1082,12 +1118,38 @@ function redrawAll() {
 
 // ---------- Solver ----------
 function adjacency() { const m = {}; state.items.forEach(i => m[i.id] = []); state.edges.forEach(e => m[e.from].push(e)); return m; }
+// Resolve the port label for a given output edge of a 3-way valve.
+// Honors explicit edge.valvePort = 'a' | 'b'. Otherwise, the first unassigned
+// edge becomes 'a' and the second becomes 'b' (insertion-order fallback so
+// existing plans without explicit assignments keep working).
+function valvePortFor(edges, index) {
+  const explicit = edges[index]?.valvePort;
+  if (explicit === 'a' || explicit === 'b') return explicit;
+  // Insertion-order fallback: walk through edges; skip those with explicit ports;
+  // first unassigned -> 'a', second -> 'b'.
+  let assignedA = null, assignedB = null;
+  for (let i = 0; i < edges.length; i++) {
+    const p = edges[i].valvePort;
+    if (p === 'a') assignedA = i;
+    if (p === 'b') assignedB = i;
+  }
+  let nextA = assignedA === null;
+  let nextB = assignedB === null;
+  for (let i = 0; i < edges.length; i++) {
+    if (edges[i].valvePort === 'a' || edges[i].valvePort === 'b') continue;
+    if (nextA) { if (i === index) return 'a'; nextA = false; continue; }
+    if (nextB) { if (i === index) return 'b'; nextB = false; continue; }
+  }
+  return null;
+}
+
 function valveAllows(node, edges, index) {
   if (node.type === 'valve2') return node.valveState !== 'closed';
   if (node.type === 'valve3') {
     if (node.valveState === 'both' || !node.valveState) return true;
-    if (node.valveState === 'a') return index === 0;
-    if (node.valveState === 'b') return index === 1;
+    const port = valvePortFor(edges, index);
+    if (node.valveState === 'a') return port === 'a';
+    if (node.valveState === 'b') return port === 'b';
     return false;
   }
   if (node.type === 'checkvalve') return true;
@@ -1404,6 +1466,41 @@ function renderPipes() {
   const routeStyle = p.routeStyle || 'auto';
   const editing = state.editingEdgeId ? state.edges.find(e => e.id === state.editingEdgeId) : null;
 
+  // If this pipe leaves a 3-way valve, show port-assignment controls.
+  let portPanel = '';
+  if (editing) {
+    const src = getItem(editing.from);
+    if (src && src.type === 'valve3') {
+      const sibs = state.edges.filter(e => e.from === src.id && e.type !== 'conduit');
+      const idx = sibs.indexOf(editing);
+      const inferredPort = idx >= 0 ? valvePortFor(sibs, idx) : null;
+      const explicit = editing.valvePort === 'a' || editing.valvePort === 'b';
+      const labelFor = (p) => p === 'a' ? 'Port A' : p === 'b' ? 'Port B' : '—';
+      const otherEdge = sibs.find((e, i) => i !== idx && valvePortFor(sibs, i) && valvePortFor(sibs, i) !== inferredPort);
+      const otherSummary = otherEdge
+        ? `Port ${(valvePortFor(sibs, sibs.indexOf(otherEdge)) || '?').toUpperCase()}: ${escapeHtml(getItem(otherEdge.to)?.label || '?')}`
+        : 'No second output yet';
+      portPanel = `
+        <div class="panel" style="border:2px solid var(--accent); margin-top:8px;">
+          <h3>3-way valve port</h3>
+          <div style="font-size:13px; color:var(--muted); margin-bottom:6px;">
+            Source: <strong>${escapeHtml(src.label)}</strong> · current valve mode:
+            <strong>${escapeHtml(src.valveState || 'both')}</strong>
+          </div>
+          <div style="font-size:13px; margin-bottom:6px;">
+            This pipe is <strong>${labelFor(inferredPort)}</strong>${explicit ? '' : ' (auto)'}.
+            <br><span style="color:var(--muted); font-size:12px;">${escapeHtml(otherSummary)}</span>
+          </div>
+          <div class="row" style="gap:6px; margin-top:6px;">
+            <button class="btn ${inferredPort==='a' && explicit ? 'primary' : ''}" data-action="setEdgePort" data-port="a">Set as Port A</button>
+            <button class="btn ${inferredPort==='b' && explicit ? 'primary' : ''}" data-action="setEdgePort" data-port="b">Set as Port B</button>
+            <button class="btn" data-action="setEdgePort" data-port="">Auto</button>
+          </div>
+          <p style="color:var(--muted); font-size:12px; margin-top:8px;">Tip: set the valve mode (Open A / Open B / Shared) in the valve’s Selected panel to route flow.</p>
+        </div>`;
+    }
+  }
+
   const editPanel = editing ? `
     <div class="panel" style="border:2px solid var(--accent);">
       <h3>Editing pipe</h3>
@@ -1448,7 +1545,7 @@ function renderPipes() {
         <button class="btn" data-action="clearWaypoints">Clear bends</button>
         <button class="btn" data-action="stopEditEdge">Done</button>
       </div>
-    </div>` : '';
+    </div>${portPanel}` : '';
 
   return `
     ${editPanel}
@@ -1973,6 +2070,26 @@ function doAction(name, btn) {
       e.waypoints = [];
       drawEdges(); persist(); renderSheet();
       toast('Bends cleared');
+      break;
+    }
+    case 'setEdgePort': {
+      const e = state.edges.find(x => x.id === state.editingEdgeId);
+      if (!e) break;
+      const newPort = btn.dataset.port; // 'a' | 'b' | ''
+      pushUndo();
+      if (newPort === 'a' || newPort === 'b') {
+        // Clear any sibling that currently holds the same port so it's unique.
+        for (const sib of state.edges) {
+          if (sib.id !== e.id && sib.from === e.from && sib.valvePort === newPort) {
+            sib.valvePort = '';
+          }
+        }
+        e.valvePort = newPort;
+      } else {
+        e.valvePort = '';
+      }
+      drawEdges(); solveFlow(); persist(); renderSheet();
+      toast(newPort ? `Pipe set as Port ${newPort.toUpperCase()}` : 'Port set to auto');
       break;
     }
     case 'applyEdge': {
