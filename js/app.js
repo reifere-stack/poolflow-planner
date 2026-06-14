@@ -31,6 +31,7 @@ const state = {
   nextId: 1,
   lastSolve: null,
   undoStack: [],
+  editingEdgeId: null,
 };
 
 // ---------- Real-world conversion ----------
@@ -196,6 +197,69 @@ function onPointerDown(e) {
     return;
   }
 
+  // Pipe hit (transparent thick stroke over each routed line)
+  const pipeHit = e.target.closest('.pipe-hit');
+  if (pipeHit && !nodeEl) {
+    const edgeId = pipeHit.dataset.edgeId;
+    if (state.connectMode && state.connectSourceId) {
+      // Insert a tee in the middle of this pipe, connecting source -> new tee
+      const wp = clientToWorld(e.clientX, e.clientY);
+      handleConnectTapOnPipe(edgeId, wp);
+      clearLongPress();
+      e.preventDefault();
+      return;
+    }
+    if (state.editingEdgeId === edgeId) {
+      // Add a waypoint at this point
+      const wp = clientToWorld(e.clientX, e.clientY);
+      const edge = state.edges.find(x => x.id === edgeId);
+      if (edge) {
+        pushUndo();
+        edge.waypoints = edge.waypoints || [];
+        insertWaypointInOrder(edge, wp);
+        if (edge.routeStyle === 'auto' || !edge.routeStyle) edge.routeStyle = 'manual';
+        drawEdges(); persist(); renderSheet();
+        toast('Bend added');
+      }
+      clearLongPress();
+      e.preventDefault();
+      return;
+    }
+    // Otherwise tap just selects this edge for editing
+    state.editingEdgeId = edgeId;
+    drawEdges();
+    openSheetTab('pipes');
+    openSheet();
+    clearLongPress();
+    e.preventDefault();
+    return;
+  }
+
+  // Waypoint handle hit
+  const wpHit = e.target.closest('.pipe-wp');
+  if (wpHit) {
+    const edgeId = wpHit.dataset.edgeId;
+    const idx = parseInt(wpHit.dataset.wpIdx, 10);
+    const edge = state.edges.find(x => x.id === edgeId);
+    if (edge) {
+      dragMode = 'waypoint';
+      const start = clientToWorld(e.clientX, e.clientY);
+      dragData = { edge, idx, startX: e.clientX, startY: e.clientY, origWp: { ...edge.waypoints[idx] } };
+      // long-press deletes the waypoint
+      clearLongPress();
+      longPressTimer = setTimeout(() => {
+        longPressFired = true;
+        pushUndo();
+        edge.waypoints.splice(idx, 1);
+        if (!edge.waypoints.length && edge.routeStyle === 'manual') edge.routeStyle = 'auto';
+        drawEdges(); persist(); renderSheet();
+        toast('Bend removed');
+      }, LONG_PRESS_MS);
+      e.preventDefault();
+      return;
+    }
+  }
+
   if (nodeEl) {
     const id = nodeEl.dataset.id;
     const item = getItem(id);
@@ -292,6 +356,20 @@ function onPointerMove(e) {
     return;
   }
 
+  if (dragMode === 'waypoint') {
+    if (longPressFired) return;
+    if (p.moved) {
+      clearLongPress();
+      const dxw = (e.clientX - dragData.startX) / state.view.scale;
+      const dyw = (e.clientY - dragData.startY) / state.view.scale;
+      const wp = dragData.edge.waypoints[dragData.idx];
+      wp.x = Math.round(dragData.origWp.x + dxw);
+      wp.y = Math.round(dragData.origWp.y + dyw);
+      drawEdges();
+    }
+    return;
+  }
+
   if (dragMode === 'resize' && dragData.item) {
     const dxw = (e.clientX - dragData.startX) / state.view.scale;
     const dyw = (e.clientY - dragData.startY) / state.view.scale;
@@ -345,6 +423,12 @@ function onPointerUp(e) {
     pushUndo(); persist();
     dragMode = null; dragData = null;
     syncSelectedPanel();
+    return;
+  }
+
+  if (dragMode === 'waypoint') {
+    if (p.moved && !longPressFired) { pushUndo(); persist(); }
+    dragMode = null; dragData = null;
     return;
   }
 
@@ -494,6 +578,96 @@ function cancelConnectMode() {
   connectBanner.classList.remove('show');
   world.querySelectorAll('.node.connect-source').forEach(n => n.classList.remove('connect-source'));
 }
+// Insert a waypoint into an edge so its order along the polyline is preserved.
+// We find the closest segment of the existing routed polyline and insert there.
+function insertWaypointInOrder(edge, pt) {
+  const existing = edge.waypoints || [];
+  if (!existing.length) { edge.waypoints = [{ x: Math.round(pt.x), y: Math.round(pt.y) }]; return; }
+  // Build the live anchor sequence (start + waypoints + end) to determine the best insert position
+  const a = getItem(edge.from), b = getItem(edge.to);
+  if (!a || !b) { existing.push({ x: Math.round(pt.x), y: Math.round(pt.y) }); return; }
+  const start = { x: a.x + a.w/2, y: a.y + a.h/2 };
+  const end   = { x: b.x + b.w/2, y: b.y + b.h/2 };
+  const seq = [start, ...existing, end];
+  let bestI = 0, bestD = Infinity;
+  for (let i = 0; i < seq.length - 1; i++) {
+    const d = pointToSegmentDistance(pt, seq[i], seq[i+1]);
+    if (d < bestD) { bestD = d; bestI = i; }
+  }
+  // Insert in the waypoints array at position bestI (since seq[0]=start, waypoints start at seq[1])
+  existing.splice(bestI, 0, { x: Math.round(pt.x), y: Math.round(pt.y) });
+  edge.waypoints = existing;
+}
+
+function pointToSegmentDistance(p, a, b) {
+  const vx = b.x - a.x, vy = b.y - a.y;
+  const wx = p.x - a.x, wy = p.y - a.y;
+  const len2 = vx*vx + vy*vy;
+  if (len2 < 1e-6) return Math.hypot(wx, wy);
+  let t = (wx*vx + wy*vy) / len2;
+  t = Math.max(0, Math.min(1, t));
+  const px = a.x + t * vx, py = a.y + t * vy;
+  return Math.hypot(p.x - px, p.y - py);
+}
+
+// User tapped on an existing pipe while in connect mode (after picking a source).
+// Splice the existing edge at that point with a new tee node, then make a new edge
+// from the connect source -> the new tee.
+function handleConnectTapOnPipe(edgeId, wp) {
+  const edge = state.edges.find(e => e.id === edgeId);
+  if (!edge) { cancelConnectMode(); return; }
+  const sourceId = state.connectSourceId;
+  if (!sourceId) { cancelConnectMode(); return; }
+  if (sourceId === edge.from || sourceId === edge.to) { toast('Pick a different source'); cancelConnectMode(); return; }
+  pushUndo();
+  // Create the tee node at the tap point
+  const teeId = uid();
+  const teeW = TOOLS.tee?.w || 80, teeH = TOOLS.tee?.h || 60;
+  const tee = {
+    id: teeId,
+    type: 'tee',
+    label: 'Tee',
+    x: Math.round(wp.x - teeW/2),
+    y: Math.round(wp.y - teeH/2),
+    w: teeW, h: teeH,
+    size: edge.size,
+  };
+  state.items.push(tee);
+  renderItem(tee);
+  // Split the original edge: change its `to` to the tee, then add edge from tee -> original.to
+  const originalTo = edge.to;
+  edge.to = teeId;
+  state.edges.push({
+    id: uid(),
+    from: teeId,
+    to: originalTo,
+    type: edge.type,
+    size: edge.size,
+    label: `${tee.label} → ${getItem(originalTo)?.label || '?'}`,
+    active: false, blocked: false,
+    routeStyle: edge.routeStyle || 'auto',
+    waypoints: [],
+    fromSize: '', toSize: '',
+  });
+  // Add the new branch from source -> tee using the pending pipe spec
+  const pp = state.pendingPipe;
+  state.edges.push({
+    id: uid(),
+    from: sourceId,
+    to: teeId,
+    type: pp.type,
+    size: pp.size,
+    label: `${getItem(sourceId)?.label || '?'} → ${tee.label}`,
+    active: false, blocked: false,
+    routeStyle: pp.routeStyle || 'auto',
+    waypoints: [],
+    fromSize: '', toSize: '',
+  });
+  toast('Tee inserted into pipe');
+  cancelConnectMode();
+  solveFlow(); persist(); drawEdges(); renderSheet();
+}
+
 function handleConnectTap(id) {
   if (!state.connectSourceId) {
     state.connectSourceId = id;
@@ -519,11 +693,114 @@ function handleConnectTap(id) {
       label: `${from.label} → ${to.label}`,
       active: false,
       blocked: false,
+      routeStyle: state.pendingPipe.routeStyle || 'auto',
+      waypoints: [],
+      fromSize: '',
+      toSize: '',
     });
     toast(`${PIPE_TYPES[state.pendingPipe.type].label} ${state.pendingPipe.size}: ${from.label} → ${to.label}`);
     solveFlow(); persist();
   }
   cancelConnectMode();
+}
+
+// ---------- Routing ----------
+// Compute the orthogonal "L" path between two points based on routeStyle.
+// style: 'auto' (90deg L), '45' (45-then-straight), 'straight' (direct line)
+function autoRoute(p1, p2, style) {
+  const dx = p2.x - p1.x, dy = p2.y - p1.y;
+  if (style === 'straight') return [p1, p2];
+  if (style === '45') {
+    const adx = Math.abs(dx), ady = Math.abs(dy);
+    if (adx < 4 || ady < 4) return [p1, p2];
+    const sx = Math.sign(dx), sy = Math.sign(dy);
+    if (adx > ady) {
+      // 45 diagonal first, then horizontal
+      const corner = { x: p1.x + sx * ady, y: p2.y };
+      return [p1, corner, p2];
+    } else {
+      const corner = { x: p2.x, y: p1.y + sy * adx };
+      return [p1, corner, p2];
+    }
+  }
+  // default: 90deg L. Choose corner to minimize visual overlap
+  // Prefer horizontal-first then vertical
+  if (Math.abs(dx) < 4 || Math.abs(dy) < 4) return [p1, p2];
+  const corner = { x: p2.x, y: p1.y }; // horizontal then vertical
+  return [p1, corner, p2];
+}
+
+// Full route for an edge: anchor points + user waypoints, applying routing style
+function edgeRoutePoints(e) {
+  const a = getItem(e.from), b = getItem(e.to);
+  if (!a || !b) return [];
+  const start = { x: a.x + a.w/2, y: a.y + a.h/2 };
+  const end   = { x: b.x + b.w/2, y: b.y + b.h/2 };
+  const style = e.routeStyle || 'auto';
+  const wps = Array.isArray(e.waypoints) ? e.waypoints : [];
+  if (style === 'manual' || wps.length) {
+    // User-defined waypoints - connect with route style between each segment
+    const segStyle = (style === 'manual') ? '90' : style;
+    const segStyleFn = segStyle === '45' ? '45' : segStyle === 'straight' ? 'straight' : 'auto';
+    const pts = [start, ...wps, end];
+    const out = [pts[0]];
+    for (let i = 1; i < pts.length; i++) {
+      const segPts = autoRoute(pts[i-1], pts[i], segStyleFn);
+      for (let j = 1; j < segPts.length; j++) out.push(segPts[j]);
+    }
+    return out;
+  }
+  // Auto routing
+  if (style === 'straight') return [start, end];
+  if (style === '45') return autoRoute(start, end, '45');
+  return autoRoute(start, end, 'auto');
+}
+
+// Build SVG path string with rounded corners from a list of polyline points
+function polylineRoundedPath(pts, radius) {
+  if (pts.length < 2) return '';
+  if (pts.length === 2) return `M ${pts[0].x} ${pts[0].y} L ${pts[1].x} ${pts[1].y}`;
+  let d = `M ${pts[0].x} ${pts[0].y}`;
+  for (let i = 1; i < pts.length - 1; i++) {
+    const prev = pts[i-1], cur = pts[i], next = pts[i+1];
+    const v1x = cur.x - prev.x, v1y = cur.y - prev.y;
+    const v2x = next.x - cur.x, v2y = next.y - cur.y;
+    const len1 = Math.hypot(v1x, v1y), len2 = Math.hypot(v2x, v2y);
+    const r = Math.min(radius, len1/2, len2/2);
+    if (r < 2 || len1 < 2 || len2 < 2) { d += ` L ${cur.x} ${cur.y}`; continue; }
+    const ax = cur.x - (v1x/len1) * r, ay = cur.y - (v1y/len1) * r;
+    const bx = cur.x + (v2x/len2) * r, by = cur.y + (v2y/len2) * r;
+    d += ` L ${ax} ${ay} Q ${cur.x} ${cur.y} ${bx} ${by}`;
+  }
+  d += ` L ${pts[pts.length-1].x} ${pts[pts.length-1].y}`;
+  return d;
+}
+
+// Classify each interior vertex of a polyline as 90 / 45 / other based on angle change
+function polylineCorners(pts) {
+  const corners = { e90: 0, e45: 0, other: 0 };
+  if (pts.length < 3) return corners;
+  for (let i = 1; i < pts.length - 1; i++) {
+    const v1x = pts[i].x - pts[i-1].x, v1y = pts[i].y - pts[i-1].y;
+    const v2x = pts[i+1].x - pts[i].x, v2y = pts[i+1].y - pts[i].y;
+    const len1 = Math.hypot(v1x, v1y), len2 = Math.hypot(v2x, v2y);
+    if (len1 < 2 || len2 < 2) continue;
+    const dot = (v1x*v2x + v1y*v2y) / (len1*len2);
+    const ang = Math.acos(Math.max(-1, Math.min(1, dot))) * 180 / Math.PI; // turn angle
+    // ~90deg turn (i.e. interior angle 90)
+    if (ang > 70 && ang < 110) corners.e90++;
+    else if (ang > 30 && ang < 60) corners.e45++;
+    else if (ang > 5) corners.other++;
+  }
+  return corners;
+}
+
+function polylineLengthPx(pts) {
+  let len = 0;
+  for (let i = 1; i < pts.length; i++) {
+    len += Math.hypot(pts[i].x - pts[i-1].x, pts[i].y - pts[i-1].y);
+  }
+  return len;
 }
 
 // ---------- Drawing ----------
@@ -534,31 +811,70 @@ function drawEdges() {
         <path d="M0 0L10 5L0 10Z" fill="${v.color}"/>
       </marker>`).join('')}
     <style>
-      .pipe { fill:none; stroke-linecap:round; }
+      .pipe { fill:none; stroke-linecap:round; stroke-linejoin:round; }
       .pipe.active { stroke-dasharray:14 10; animation: flow 1.2s linear infinite; }
       .pipe.blocked { opacity:.3; stroke-dasharray:4 8; }
+      .pipe-hit { fill:none; stroke:transparent; stroke-width:18; cursor:crosshair; pointer-events:stroke; }
+      .pipe-wp { fill:#fff; stroke:#333; stroke-width:1.5; cursor:move; pointer-events:all; }
+      .pipe-wp.selected { stroke:var(--accent); stroke-width:2.5; }
+      .reducer-badge { fill:#fff; stroke:#666; stroke-width:1; }
+      .reducer-text { font: bold 9px -apple-system, system-ui, sans-serif; fill:#222; pointer-events:none; }
       @keyframes flow { to { stroke-dashoffset: -24; } }
     </style>
   </defs>`;
   let html = defs;
   for (const e of state.edges) {
-    const a = getItem(e.from), b = getItem(e.to);
-    if (!a || !b) continue;
-    const p1 = { x: a.x + a.w/2, y: a.y + a.h/2 };
-    const p2 = { x: b.x + b.w/2, y: b.y + b.h/2 };
-    const mx = (p1.x + p2.x) / 2;
-    const d = `M ${p1.x} ${p1.y} C ${mx} ${p1.y}, ${mx} ${p2.y}, ${p2.x} ${p2.y}`;
+    const pts = edgeRoutePoints(e);
+    if (pts.length < 2) continue;
     const t = PIPE_TYPES[e.type] || PIPE_TYPES.return;
     const classes = ['pipe'];
     if (e.active) classes.push('active');
     if (e.blocked) classes.push('blocked');
     const sw = pipeStrokeWidth(e.size);
-    html += `<path d="${d}" class="${classes.join(' ')}" stroke="${t.color}" stroke-width="${sw}" stroke-dasharray="${t.dash}" marker-end="url(#arr-${e.type})"></path>`;
-    // label
-    const lx = (p1.x + p2.x) / 2, ly = (p1.y + p2.y) / 2 - 8;
-    html += `<text class="flow-text" x="${lx}" y="${ly}" text-anchor="middle">${escapeHtml(e.size || '')} ${escapeHtml(t.label)}</text>`;
+    const d = polylineRoundedPath(pts, 10);
+    // Invisible thick stroke for hit-testing (tap on a pipe to add a tee)
+    html += `<path d="${d}" class="pipe-hit" data-edge-id="${e.id}"></path>`;
+    html += `<path d="${d}" class="${classes.join(' ')}" stroke="${t.color}" stroke-width="${sw}" stroke-dasharray="${t.dash}" marker-end="url(#arr-${e.type})" pointer-events="none"></path>`;
+    // Label at midpoint of polyline
+    const totalLen = polylineLengthPx(pts);
+    let target = totalLen / 2, acc = 0, lx = pts[0].x, ly = pts[0].y;
+    for (let i = 1; i < pts.length; i++) {
+      const segLen = Math.hypot(pts[i].x-pts[i-1].x, pts[i].y-pts[i-1].y);
+      if (acc + segLen >= target) {
+        const k = (target - acc) / segLen;
+        lx = pts[i-1].x + (pts[i].x-pts[i-1].x) * k;
+        ly = pts[i-1].y + (pts[i].y-pts[i-1].y) * k - 8;
+        break;
+      }
+      acc += segLen;
+    }
+    html += `<text class="flow-text" x="${lx}" y="${ly}" text-anchor="middle" pointer-events="none">${escapeHtml(e.size || '')} ${escapeHtml(t.label)}</text>`;
+
+    // Reducer bushing badges at endpoints if fromSize/toSize differ from line size
+    if (e.fromSize && e.fromSize !== e.size) {
+      html += reducerBadge(pts[0].x, pts[0].y, e.fromSize, e.size);
+    }
+    if (e.toSize && e.toSize !== e.size) {
+      const last = pts[pts.length-1];
+      html += reducerBadge(last.x, last.y, e.size, e.toSize);
+    }
+
+    // Show waypoint handles if this pipe is being edited
+    if (state.editingEdgeId === e.id && Array.isArray(e.waypoints)) {
+      e.waypoints.forEach((wp, idx) => {
+        html += `<circle class="pipe-wp" cx="${wp.x}" cy="${wp.y}" r="7" data-edge-id="${e.id}" data-wp-idx="${idx}"></circle>`;
+      });
+    }
   }
   edgeSvg.innerHTML = html;
+}
+
+function reducerBadge(x, y, sa, sb) {
+  const label = `${sa}→${sb}`;
+  // simple oval w/ text
+  return `
+    <ellipse class="reducer-badge" cx="${x}" cy="${y-18}" rx="24" ry="9"/>
+    <text class="reducer-text" x="${x}" y="${y-15}" text-anchor="middle">${escapeHtml(label)}</text>`;
 }
 
 function drawDims() {
@@ -849,23 +1165,83 @@ function renderSelected() {
 
 function renderPipes() {
   const p = state.pendingPipe;
-  return `
-    <div class="panel">
-      <h3>Pipe to draw</h3>
-      <div class="field"><label>Type</label>
-        <select id="pipe-type">
-          ${Object.entries(PIPE_TYPES).map(([k, v]) => `<option ${p.type===k?'selected':''} value="${k}">${v.label}</option>`).join('')}
+  const routeStyle = p.routeStyle || 'auto';
+  const editing = state.editingEdgeId ? state.edges.find(e => e.id === state.editingEdgeId) : null;
+
+  const editPanel = editing ? `
+    <div class="panel" style="border:2px solid var(--accent);">
+      <h3>Editing pipe</h3>
+      <div style="font-weight:600; margin-bottom:6px;">${escapeHtml(getItem(editing.from)?.label||'?')} → ${escapeHtml(getItem(editing.to)?.label||'?')}</div>
+      <div class="row tight">
+        <div class="field"><label>Type</label>
+          <select id="edge-type">
+            ${Object.entries(PIPE_TYPES).map(([k, v]) => `<option ${editing.type===k?'selected':''} value="${k}">${v.label}</option>`).join('')}
+          </select>
+        </div>
+        <div class="field"><label>Main size</label>
+          <select id="edge-size">
+            ${PIPE_SIZES.map(s => `<option ${editing.size===s?'selected':''}>${s}</option>`).join('')}
+          </select>
+        </div>
+      </div>
+      <div class="field" style="margin-top:8px;"><label>Route style</label>
+        <select id="edge-route">
+          <option ${(editing.routeStyle||'auto')==='auto'?'selected':''} value="auto">Auto (90° L)</option>
+          <option ${editing.routeStyle==='45'?'selected':''} value="45">45° diagonal</option>
+          <option ${editing.routeStyle==='manual'?'selected':''} value="manual">Manual waypoints (90°)</option>
+          <option ${editing.routeStyle==='straight'?'selected':''} value="straight">Straight (as the crow flies)</option>
         </select>
       </div>
-      <div class="field" style="margin-top:8px;"><label>Size</label>
-        <select id="pipe-size">
-          ${PIPE_SIZES.map(s => `<option ${p.size===s?'selected':''}>${s}</option>`).join('')}
+      <div class="row tight" style="margin-top:8px;">
+        <div class="field"><label>Reducer at start</label>
+          <select id="edge-from-size">
+            <option value="">— same as main —</option>
+            ${PIPE_SIZES.map(s => `<option ${editing.fromSize===s?'selected':''}>${s}</option>`).join('')}
+          </select>
+        </div>
+        <div class="field"><label>Reducer at end</label>
+          <select id="edge-to-size">
+            <option value="">— same as main —</option>
+            ${PIPE_SIZES.map(s => `<option ${editing.toSize===s?'selected':''}>${s}</option>`).join('')}
+          </select>
+        </div>
+      </div>
+      <p style="color:var(--muted); font-size:12px; margin-top:8px;">Tap on the pipe in the canvas to add a 90° bend at that point. Long-press a bend handle to delete it.</p>
+      <div class="row" style="margin-top:8px;">
+        <button class="btn primary" data-action="applyEdge">Apply</button>
+        <button class="btn" data-action="clearWaypoints">Clear bends</button>
+        <button class="btn" data-action="stopEditEdge">Done</button>
+      </div>
+    </div>` : '';
+
+  return `
+    ${editPanel}
+    <div class="panel">
+      <h3>Pipe to draw</h3>
+      <div class="row tight">
+        <div class="field"><label>Type</label>
+          <select id="pipe-type">
+            ${Object.entries(PIPE_TYPES).map(([k, v]) => `<option ${p.type===k?'selected':''} value="${k}">${v.label}</option>`).join('')}
+          </select>
+        </div>
+        <div class="field"><label>Size</label>
+          <select id="pipe-size">
+            ${PIPE_SIZES.map(s => `<option ${p.size===s?'selected':''}>${s}</option>`).join('')}
+          </select>
+        </div>
+      </div>
+      <div class="field" style="margin-top:8px;"><label>Route style for new pipes</label>
+        <select id="pipe-route">
+          <option ${routeStyle==='auto'?'selected':''} value="auto">Auto (90° L)</option>
+          <option ${routeStyle==='45'?'selected':''} value="45">45° diagonal</option>
+          <option ${routeStyle==='manual'?'selected':''} value="manual">Manual (start with no bends, tap to add)</option>
+          <option ${routeStyle==='straight'?'selected':''} value="straight">Straight (no bends)</option>
         </select>
       </div>
       <button class="btn primary full" style="margin-top:12px;" data-action="connectMode">
         Start tap-to-connect
       </button>
-      <p style="color:var(--muted); font-size:12px; margin-top:8px;">Tap two parts in order. Long-press a valve to flip it.</p>
+      <p style="color:var(--muted); font-size:12px; margin-top:8px;">Tap two parts in order. Tap on a pipe to drop into it (auto-inserts a tee). Long-press a valve to flip it.</p>
     </div>
 
     <div class="panel">
@@ -874,12 +1250,18 @@ function renderPipes() {
         state.edges.map(e => {
           const a = getItem(e.from), b = getItem(e.to); if (!a||!b) return '';
           const t = PIPE_TYPES[e.type] || {};
+          const reducerNote = (e.fromSize && e.fromSize!==e.size) || (e.toSize && e.toSize!==e.size)
+            ? ` · reducer${e.fromSize&&e.fromSize!==e.size?' '+e.fromSize+'→'+e.size:''}${e.toSize&&e.toSize!==e.size?' '+e.size+'→'+e.toSize:''}` : '';
+          const bends = Array.isArray(e.waypoints) ? e.waypoints.length : 0;
           return `<div class="row-item" style="padding:8px 10px; background:var(--surface); border:1px solid var(--border); border-radius:10px; margin-bottom:6px;">
-            <div>
+            <div style="flex:1; min-width:0;">
               <div style="font-weight:600;">${escapeHtml(a.label)} → ${escapeHtml(b.label)}</div>
-              <div style="color:var(--muted); font-size:12px;">${t.label||e.type} · ${e.size||'—'}${e.active?' · active':''}${e.blocked?' · blocked':''}</div>
+              <div style="color:var(--muted); font-size:12px;">${t.label||e.type} · ${e.size||'—'} · ${e.routeStyle||'auto'}${bends?` · ${bends} bend${bends>1?'s':''}`:''}${reducerNote}${e.active?' · active':''}${e.blocked?' · blocked':''}</div>
             </div>
-            <button class="btn" data-action="deletePipe" data-pid="${e.id}">Delete</button>
+            <div class="row" style="gap:6px;">
+              <button class="btn" data-action="editEdge" data-pid="${e.id}">Edit</button>
+              <button class="btn" data-action="deletePipe" data-pid="${e.id}">Delete</button>
+            </div>
           </div>`;
         }).join('')
       }
@@ -914,26 +1296,9 @@ function renderValidate() {
 }
 
 // ---------- BOM computation ----------
-// Sample a cubic Bezier (matches drawEdges) and sum segment lengths to get pixels
+// Length from the actual routed polyline (90s/45s included).
 function edgePathLengthPx(edge) {
-  const a = getItem(edge.from), b = getItem(edge.to);
-  if (!a || !b) return 0;
-  const p1 = { x: a.x + a.w/2, y: a.y + a.h/2 };
-  const p2 = { x: b.x + b.w/2, y: b.y + b.h/2 };
-  const mx = (p1.x + p2.x) / 2;
-  const c1 = { x: mx, y: p1.y };
-  const c2 = { x: mx, y: p2.y };
-  const N = 24;
-  let len = 0, prev = p1;
-  for (let i = 1; i <= N; i++) {
-    const t = i / N;
-    const u = 1 - t;
-    const x = u*u*u*p1.x + 3*u*u*t*c1.x + 3*u*t*t*c2.x + t*t*t*p2.x;
-    const y = u*u*u*p1.y + 3*u*u*t*c1.y + 3*u*t*t*c2.y + t*t*t*p2.y;
-    len += Math.hypot(x - prev.x, y - prev.y);
-    prev = { x, y };
-  }
-  return len;
+  return polylineLengthPx(edgeRoutePoints(edge));
 }
 
 function edgeAngleDeg(edge) {
@@ -950,13 +1315,15 @@ function computeBOM() {
   const wasteFactor = 1.10;
   const pipeByKey = {};
   const fitBySize = {};
+  const reducers = {}; // key: 'fromSize→toSize' -> count
   const ensureFit = (size) => {
     if (!fitBySize[size]) fitBySize[size] = { elbow90:0, elbow45:0, coupling:0, tee:0, union:0 };
     return fitBySize[size];
   };
 
   for (const e of state.edges) {
-    const ft = pxToFeet(edgePathLengthPx(e));
+    const pts = edgeRoutePoints(e);
+    const ft = pxToFeet(polylineLengthPx(pts));
     const typeLabel = (PIPE_TYPES[e.type]?.label) || e.type;
     const size = e.size || '—';
     const key = typeLabel + '|' + size;
@@ -964,15 +1331,21 @@ function computeBOM() {
     pipeByKey[key].ft += ft;
 
     const fit = ensureFit(size);
-    const ang = edgeAngleDeg(e);
-    if (ang >= BOM_RULES.use45DegMin && ang <= BOM_RULES.use45DegMax) {
-      fit.elbow45 += 2;
-      fit.elbow90 += 1;
-    } else {
-      fit.elbow90 += BOM_RULES.minElbowsPerRun;
-    }
+    // Real corner counts from the routed polyline
+    const corners = polylineCorners(pts);
+    fit.elbow90 += corners.e90;
+    fit.elbow45 += corners.e45;
     fit.coupling += Math.max(0, Math.floor(ft / BOM_RULES.couplingEveryFt));
-    if (ft > BOM_RULES.longRunFt) fit.coupling += 1;
+
+    // Reducer bushings on this edge if fromSize/toSize differ from line size
+    if (e.fromSize && e.fromSize !== size) {
+      const k = e.fromSize + ' × ' + size; // e.g. 4" x 2"
+      reducers[k] = (reducers[k] || 0) + 1;
+    }
+    if (e.toSize && e.toSize !== size) {
+      const k = size + ' × ' + e.toSize;
+      reducers[k] = (reducers[k] || 0) + 1;
+    }
   }
 
   const adj = {};
@@ -980,9 +1353,21 @@ function computeBOM() {
   state.edges.forEach(e => { if (adj[e.from]) adj[e.from].out.push(e); if (adj[e.to]) adj[e.to].in.push(e); });
   for (const item of state.items) {
     if (item.type === 'tee') {
-      const sizes = [...(adj[item.id]?.in||[]), ...(adj[item.id]?.out||[])].map(e => e.size).filter(Boolean);
+      // Tee size = the size of the run it sits on. Branch reducers counted via fromSize/toSize on attached edges.
+      const connected = [...(adj[item.id]?.in||[]), ...(adj[item.id]?.out||[])];
+      const sizes = connected.map(e => e.size).filter(Boolean);
       const s = sizes[0] || '—';
       ensureFit(s).tee += 1;
+      // If a branch off the tee has a different size, count a reducer on the branch
+      const runSizes = sizes.filter(x => x);
+      const distinct = [...new Set(runSizes)];
+      if (distinct.length > 1) {
+        // bushing for each distinct branch != main
+        distinct.slice(1).forEach(b => {
+          const k = s + ' × ' + b;
+          reducers[k] = (reducers[k] || 0) + 1;
+        });
+      }
     }
     if (EQUIPMENT_TYPES.has(item.type)) {
       const connSizes = [...(adj[item.id]?.in||[]), ...(adj[item.id]?.out||[])].map(e => e.size).filter(Boolean);
@@ -1036,12 +1421,12 @@ function computeBOM() {
     sticks20: Math.ceil((p.ft * wasteFactor) / 20),
   }));
 
-  return { pipeList, fitBySize, equipment, valves, fixtures };
+  return { pipeList, fitBySize, equipment, valves, fixtures, reducers };
 }
 
 function renderTakeoff() {
   const bom = computeBOM();
-  const { pipeList, fitBySize, equipment, valves, fixtures } = bom;
+  const { pipeList, fitBySize, equipment, valves, fixtures, reducers } = bom;
 
   const pipeRows = pipeList.length
     ? pipeList.map(p => `<div class="row-item"><span>${escapeHtml(p.typeLabel)} · ${escapeHtml(p.size)}</span><span class="qty">${p.withWasteFt.toFixed(1)} ft · ${p.sticks20}× 20′ sticks</span></div>`).join('')
@@ -1071,6 +1456,10 @@ function renderTakeoff() {
     ? Object.entries(fixtures).map(([k,v]) => `<div class="row-item"><span>${escapeHtml(k)}</span><span class="qty">${v}</span></div>`).join('')
     : `<div class="row-item">No fixtures placed.</div>`;
 
+  const reducerRows = Object.keys(reducers || {}).length
+    ? Object.entries(reducers).sort().map(([k,v]) => `<div class="row-item"><span>${escapeHtml(k)} reducer bushing</span><span class="qty">${v}</span></div>`).join('')
+    : `<div class="row-item">No reducer bushings needed.</div>`;
+
   return `
     <div class="panel">
       <h3>Pipe — linear feet (with 10% waste)</h3>
@@ -1089,6 +1478,11 @@ function renderTakeoff() {
     <div class="panel">
       <h3>Equipment</h3>
       <div class="takeoff-list">${eqRows}</div>
+    </div>
+    <div class="panel">
+      <h3>Reducer bushings</h3>
+      <div class="takeoff-list">${reducerRows}</div>
+      <p style="color:var(--muted); font-size:12px; margin-top:8px;">Counted from pipe reducer settings (fromSize / toSize) and from tee branches that change size.</p>
     </div>
     <div class="panel">
       <h3>Fixtures &amp; features</h3>
@@ -1175,9 +1569,10 @@ function bindSheetActions() {
   }
 
   // Pipe selectors auto-save
-  const pipeType = $('pipe-type'), pipeSize = $('pipe-size');
+  const pipeType = $('pipe-type'), pipeSize = $('pipe-size'), pipeRoute = $('pipe-route');
   if (pipeType) pipeType.onchange = () => { state.pendingPipe.type = pipeType.value; persist(); };
   if (pipeSize) pipeSize.onchange = () => { state.pendingPipe.size = pipeSize.value; persist(); };
+  if (pipeRoute) pipeRoute.onchange = () => { state.pendingPipe.routeStyle = pipeRoute.value; persist(); };
 }
 
 function doAction(name, btn) {
@@ -1283,7 +1678,41 @@ function doAction(name, btn) {
       pushUndo();
       const pid = btn.dataset.pid;
       state.edges = state.edges.filter(e => e.id !== pid);
-      solveFlow(); persist(); renderSheet(); break;
+      if (state.editingEdgeId === pid) state.editingEdgeId = null;
+      solveFlow(); persist(); renderSheet(); drawEdges(); break;
+    }
+    case 'editEdge': {
+      state.editingEdgeId = btn.dataset.pid;
+      drawEdges(); renderSheet();
+      toast('Tap on the pipe to add a bend');
+      break;
+    }
+    case 'stopEditEdge': {
+      state.editingEdgeId = null;
+      drawEdges(); renderSheet();
+      break;
+    }
+    case 'clearWaypoints': {
+      const e = state.edges.find(x => x.id === state.editingEdgeId);
+      if (!e) break;
+      pushUndo();
+      e.waypoints = [];
+      drawEdges(); persist(); renderSheet();
+      toast('Bends cleared');
+      break;
+    }
+    case 'applyEdge': {
+      const e = state.edges.find(x => x.id === state.editingEdgeId);
+      if (!e) break;
+      pushUndo();
+      const t = $('edge-type')?.value; if (t) e.type = t;
+      const s = $('edge-size')?.value; if (s) e.size = s;
+      const r = $('edge-route')?.value; if (r) e.routeStyle = r;
+      e.fromSize = $('edge-from-size')?.value || '';
+      e.toSize = $('edge-to-size')?.value || '';
+      drawEdges(); solveFlow(); persist(); renderSheet();
+      toast('Pipe updated');
+      break;
     }
     case 'connectMode': startConnectMode(); break;
     case 'solveFlow': solveFlow(); renderSheet(); break;
@@ -1425,6 +1854,19 @@ function exportPDF() {
       if (f.union)   lines.push(`• ${f.union} × union`);
       lines.forEach(l => { doc.text('    ' + l, 32, y); y += 14; if (y>540){doc.addPage();y=36;} });
       y += 4;
+    });
+  }
+
+  doc.addPage(); doc.setFontSize(16); doc.text('Bill of Materials — Reducer Bushings', 32, 36);
+  doc.setFontSize(9); doc.setTextColor(120); doc.text('Counted from per-pipe reducer settings and tee branches that change size.', 32, 50);
+  doc.setTextColor(0); doc.setFontSize(10); y = 70;
+  const reducerEntries = Object.entries(bom.reducers || {}).sort();
+  if (!reducerEntries.length) {
+    doc.text('• No reducer bushings needed.', 32, y); y += 14;
+  } else {
+    reducerEntries.forEach(([k,v]) => {
+      doc.text(`• ${v} × ${k} reducer bushing`, 32, y);
+      y += 14; if (y>540){doc.addPage();y=36;}
     });
   }
 
