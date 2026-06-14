@@ -819,10 +819,20 @@ function drawEdges() {
       .pipe-wp.selected { stroke:var(--accent); stroke-width:2.5; }
       .reducer-badge { fill:#fff; stroke:#666; stroke-width:1; }
       .reducer-text { font: bold 9px -apple-system, system-ui, sans-serif; fill:#222; pointer-events:none; }
+      .spill-wave { fill:none; stroke:#2eb6ff; stroke-width:4; stroke-linecap:round; opacity:.85; }
+      .spill-wave-anim { animation: spillFlow 1.6s linear infinite; stroke-dasharray:10 8; }
+      .spill-badge { fill:#fff; stroke:#2eb6ff; stroke-width:1.5; }
+      .spill-text { font: 600 11px -apple-system, system-ui, sans-serif; fill:#0a6e9a; pointer-events:none; }
       @keyframes flow { to { stroke-dashoffset: -24; } }
+      @keyframes spillFlow { to { stroke-dashoffset: -36; } }
     </style>
+    <marker id="arr-spill" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0L10 5L0 10Z" fill="#2eb6ff"/>
+    </marker>
   </defs>`;
   let html = defs;
+  // Spillover arrows are drawn first so pipes render above them
+  html += renderSpillovers();
   for (const e of state.edges) {
     const pts = edgeRoutePoints(e);
     if (pts.length < 2) continue;
@@ -867,6 +877,75 @@ function drawEdges() {
     }
   }
   edgeSvg.innerHTML = html;
+}
+
+// ---------- Spillover (water-body to water-body) ----------
+function renderSpillovers() {
+  let svg = '';
+  for (const item of state.items) {
+    if ((item.type !== 'pool' && item.type !== 'spa') || !item.spillsInto) continue;
+    const target = getItem(item.spillsInto);
+    if (!target || (target.type !== 'pool' && target.type !== 'spa')) continue;
+    // Anchor at edge of source nearest to target
+    const a = nearestEdgePoint(item, target);
+    const b = nearestEdgePoint(target, item);
+    // Build a wavy path along the line a -> b
+    const path = wavyPathBetween(a, b, 8, 18);
+    svg += `<path class="spill-wave spill-wave-anim" d="${path}" marker-end="url(#arr-spill)"></path>`;
+    // Label at midpoint with feature name
+    const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+    const featLabel = SPILL_FEATURE_LABEL[item.spillFeature] || 'Spillover';
+    const width = item.spillWidth ? ' · ' + item.spillWidth : '';
+    const qty = (item.spillQty && item.spillQty > 1) ? (item.spillQty + '× ') : '';
+    const text = qty + featLabel + width;
+    const w = Math.max(80, text.length * 6.2);
+    svg += `<rect class="spill-badge" x="${mx - w/2}" y="${my - 12}" width="${w}" height="22" rx="11"/>`;
+    svg += `<text class="spill-text" x="${mx}" y="${my + 4}" text-anchor="middle">${escapeHtml(text)}</text>`;
+  }
+  return svg;
+}
+
+const SPILL_FEATURE_LABEL = {
+  waterfall: 'Waterfall',
+  sheer:     'Sheer descent',
+  weir:      'Weir / dam plate',
+  bondbeam:  'Raised bond beam',
+  scupper:   'Scupper',
+  rainwall:  'Rain curtain',
+  runnel:    'Runnel',
+};
+
+function nearestEdgePoint(from, to) {
+  // Project the center-to-center line onto the source rect's boundary
+  const fc = { x: from.x + from.w/2, y: from.y + from.h/2 };
+  const tc = { x: to.x + to.w/2,   y: to.y + to.h/2 };
+  const dx = tc.x - fc.x, dy = tc.y - fc.y;
+  if (dx === 0 && dy === 0) return fc;
+  const hx = from.w / 2, hy = from.h / 2;
+  const scale = Math.min(
+    hx / Math.max(Math.abs(dx), 0.001),
+    hy / Math.max(Math.abs(dy), 0.001)
+  );
+  return { x: fc.x + dx * scale, y: fc.y + dy * scale };
+}
+
+function wavyPathBetween(a, b, amplitude, wavelength) {
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const len = Math.hypot(dx, dy);
+  if (len < 4) return `M ${a.x} ${a.y} L ${b.x} ${b.y}`;
+  const ux = dx / len, uy = dy / len;
+  const nx = -uy, ny = ux;
+  const steps = Math.max(4, Math.floor(len / wavelength));
+  let d = `M ${a.x} ${a.y}`;
+  for (let i = 1; i <= steps; i++) {
+    const t = i / steps;
+    const px = a.x + ux * len * t;
+    const py = a.y + uy * len * t;
+    const off = Math.sin(t * Math.PI * steps / 2) * amplitude * ((i % 2) ? 1 : -1);
+    d += ` L ${px + nx * off} ${py + ny * off}`;
+  }
+  d += ` L ${b.x} ${b.y}`;
+  return d;
 }
 
 function reducerBadge(x, y, sa, sb) {
@@ -965,16 +1044,18 @@ function solveFlow() {
     outgoing.forEach(o => traverse(o, pump.label, new Set([pump.id])));
   }
 
-  // Spillover check
-  for (const spa of state.items.filter(i => i.type === 'spa')) {
-    const inToSpa = state.edges.filter(e => e.to === spa.id && ['return','spillover','feature'].includes(e.type) && e.active && !e.blocked);
-    if (inToSpa.length) {
-      const out = state.edges.filter(e => e.from === spa.id && (e.type === 'spillover' || e.type === 'return') && e.active && !e.blocked);
-      const reachesPool = out.some(e => getItem(e.to)?.type === 'pool');
-      const relPool = spa.relation === 'pool';
-      if (!relPool && !reachesPool) {
-        issues.push(`Spa ${spa.label} has no spillover/return to pool.`);
-      }
+  // Spillover check — a body receiving water must have a way back to the source body
+  // either via piped return, an explicit spillsInto, or relation hint.
+  for (const body of state.items.filter(i => i.type === 'pool' || i.type === 'spa')) {
+    const inToBody = state.edges.filter(e => e.to === body.id && ['return','spillover','feature'].includes(e.type) && e.active && !e.blocked);
+    if (!inToBody.length) continue;
+    const pipedOut = state.edges.filter(e => e.from === body.id && (e.type === 'spillover' || e.type === 'return') && e.active && !e.blocked);
+    const reachesOther = pipedOut.some(e => { const t = getItem(e.to); return t && t.type !== body.type && (t.type === 'pool' || t.type === 'spa'); });
+    const hasGravitySpill = !!(body.spillsInto && getItem(body.spillsInto));
+    const relOther = body.relation && body.relation !== body.type;
+    if (!relOther && !reachesOther && !hasGravitySpill) {
+      const where = body.type === 'spa' ? 'pool' : 'spa';
+      issues.push(`${body.label} (${body.type}) receives water but has no spillover or return path to a ${where}. Set a spillover destination in the Selected panel.`);
     }
   }
 
@@ -1116,6 +1197,18 @@ function renderSelected() {
   const item = getItem(state.selectedId);
   if (!item) return `<div class="panel"><p style="color:var(--muted);">Tap a part on the canvas to edit it.</p></div>`;
   const isValve = item.type === 'valve2' || item.type === 'valve3' || item.type === 'actuated';
+  const isBody = item.type === 'pool' || item.type === 'spa';
+  const otherBodies = state.items.filter(i => (i.type === 'pool' || i.type === 'spa') && i.id !== item.id);
+  const spillFeatures = [
+    ['waterfall',  'Waterfall'],
+    ['sheer',      'Sheer descent'],
+    ['weir',       'Weir / dam plate'],
+    ['bondbeam',   'Raised bond beam'],
+    ['scupper',    'Scupper'],
+    ['rainwall',   'Rain curtain / wall'],
+    ['runnel',     'Runnel / channel'],
+  ];
+  const spillSizes = ['6"','12"','18"','24"','36"','48"','60"','72"','custom'];
   return `
     <div class="panel">
       <div class="row" style="margin-bottom:10px;">
@@ -1151,6 +1244,36 @@ function renderSelected() {
       </div>` : ''}
       ${renderEquipmentModelPicker(item)}
       ${renderSizeFields(item)}
+      ${isBody ? `
+      <div class="panel" style="margin:10px 0 0; padding:10px; border:1px dashed var(--border); background:color-mix(in srgb, var(--accent) 5%, transparent);">
+        <div style="font-weight:600; margin-bottom:6px;">Spillover (gravity)</div>
+        <p style="font-size:12px; color:var(--muted); margin:0 0 8px;">If this body spills into another, set the destination and feature here. The app will draw a wavy gravity arrow and add the feature to the takeoff.</p>
+        <div class="row tight">
+          <div class="field"><label>Spills into</label>
+            <select id="f-spillsInto">
+              <option value="">None</option>
+              ${otherBodies.map(b => `<option ${item.spillsInto===b.id?'selected':''} value="${b.id}">${escapeHtml(b.label)} (${b.type})</option>`).join('')}
+            </select>
+          </div>
+          <div class="field"><label>Feature</label>
+            <select id="f-spillFeature">
+              <option value="">—</option>
+              ${spillFeatures.map(([k,lbl]) => `<option ${item.spillFeature===k?'selected':''} value="${k}">${lbl}</option>`).join('')}
+            </select>
+          </div>
+        </div>
+        <div class="row tight" style="margin-top:8px;">
+          <div class="field"><label>Feature width</label>
+            <select id="f-spillWidth">
+              <option value="">—</option>
+              ${spillSizes.map(s => `<option ${item.spillWidth===s?'selected':''} value="${escapeHtml(s)}">${escapeHtml(s)}</option>`).join('')}
+            </select>
+          </div>
+          <div class="field"><label>Quantity</label>
+            <input id="f-spillQty" type="number" min="1" step="1" value="${item.spillQty||1}"/>
+          </div>
+        </div>
+      </div>` : ''}
       <div class="field" style="margin-top:8px;"><label>Notes</label><input id="f-notes" value="${escapeHtml(item.notes||'')}" placeholder="e.g. branch A, custom feature"/></div>
       <div class="row" style="margin-top:12px;">
         <button class="btn primary" data-action="applySelected">Apply</button>
@@ -1421,12 +1544,30 @@ function computeBOM() {
     sticks20: Math.ceil((p.ft * wasteFactor) / 20),
   }));
 
-  return { pipeList, fitBySize, equipment, valves, fixtures, reducers };
+  // Spillover features (gravity — body to body)
+  const spillovers = [];
+  for (const item of state.items) {
+    if ((item.type !== 'pool' && item.type !== 'spa') || !item.spillsInto) continue;
+    const tgt = getItem(item.spillsInto);
+    if (!tgt) continue;
+    const featLabel = SPILL_FEATURE_LABEL[item.spillFeature] || 'Spillover';
+    spillovers.push({
+      from: item.label,
+      fromType: item.type,
+      to: tgt.label,
+      toType: tgt.type,
+      feature: featLabel,
+      width: item.spillWidth || '',
+      qty: Math.max(1, item.spillQty || 1),
+    });
+  }
+
+  return { pipeList, fitBySize, equipment, valves, fixtures, reducers, spillovers };
 }
 
 function renderTakeoff() {
   const bom = computeBOM();
-  const { pipeList, fitBySize, equipment, valves, fixtures, reducers } = bom;
+  const { pipeList, fitBySize, equipment, valves, fixtures, reducers, spillovers } = bom;
 
   const pipeRows = pipeList.length
     ? pipeList.map(p => `<div class="row-item"><span>${escapeHtml(p.typeLabel)} · ${escapeHtml(p.size)}</span><span class="qty">${p.withWasteFt.toFixed(1)} ft · ${p.sticks20}× 20′ sticks</span></div>`).join('')
@@ -1460,6 +1601,10 @@ function renderTakeoff() {
     ? Object.entries(reducers).sort().map(([k,v]) => `<div class="row-item"><span>${escapeHtml(k)} reducer bushing</span><span class="qty">${v}</span></div>`).join('')
     : `<div class="row-item">No reducer bushings needed.</div>`;
 
+  const spillRows = (spillovers || []).length
+    ? spillovers.map(s => `<div class="row-item"><span>${escapeHtml(s.from)} → ${escapeHtml(s.to)}<br><span style="color:var(--muted); font-size:12px;">${escapeHtml(s.feature)}${s.width?(' · '+escapeHtml(s.width)):''}</span></span><span class="qty">${s.qty}×</span></div>`).join('')
+    : `<div class="row-item">No spillovers configured. Open a Pool or Spa in the Selected tab to add one.</div>`;
+
   return `
     <div class="panel">
       <h3>Pipe — linear feet (with 10% waste)</h3>
@@ -1483,6 +1628,11 @@ function renderTakeoff() {
       <h3>Reducer bushings</h3>
       <div class="takeoff-list">${reducerRows}</div>
       <p style="color:var(--muted); font-size:12px; margin-top:8px;">Counted from pipe reducer settings (fromSize / toSize) and from tee branches that change size.</p>
+    </div>
+    <div class="panel">
+      <h3>Spillovers (gravity flow)</h3>
+      <div class="takeoff-list">${spillRows}</div>
+      <p style="color:var(--muted); font-size:12px; margin-top:8px;">Spillovers are configured on each Pool/Spa (Selected tab). They model water moving by gravity between bodies and add the feature to the parts order.</p>
     </div>
     <div class="panel">
       <h3>Fixtures &amp; features</h3>
@@ -1584,6 +1734,12 @@ function doAction(name, btn) {
       item.size  = $('f-size')?.value || '';
       item.relation = $('f-relation')?.value || '';
       if ($('f-valve')) item.valveState = $('f-valve').value || '';
+      if ($('f-spillsInto')) {
+        item.spillsInto   = $('f-spillsInto').value || '';
+        item.spillFeature = $('f-spillFeature')?.value || '';
+        item.spillWidth   = $('f-spillWidth')?.value || '';
+        item.spillQty     = Math.max(1, parseInt($('f-spillQty')?.value || '1', 10) || 1);
+      }
       if ($('f-w-ft')) {
         const wPx = fiToPx($('f-w-ft').value, $('f-w-in').value);
         const hPx = fiToPx($('f-h-ft').value, $('f-h-in').value);
@@ -1857,6 +2013,20 @@ function exportPDF() {
     });
   }
 
+  doc.addPage(); doc.setFontSize(16); doc.text('Bill of Materials — Spillovers (gravity flow)', 32, 36);
+  doc.setFontSize(9); doc.setTextColor(120); doc.text('Body-to-body spillovers — not pumped. Driven by water level difference.', 32, 50);
+  doc.setTextColor(0); doc.setFontSize(10); y = 70;
+  const spills = bom.spillovers || [];
+  if (!spills.length) {
+    doc.text('• No spillovers configured.', 32, y); y += 14;
+  } else {
+    spills.forEach(s => {
+      const sizeBit = s.width ? ' (' + s.width + ')' : '';
+      doc.text(`• ${s.qty} × ${s.feature}${sizeBit}  —  ${s.from} → ${s.to}`, 32, y);
+      y += 14; if (y>540){doc.addPage();y=36;}
+    });
+  }
+
   doc.addPage(); doc.setFontSize(16); doc.text('Bill of Materials — Reducer Bushings', 32, 36);
   doc.setFontSize(9); doc.setTextColor(120); doc.text('Counted from per-pipe reducer settings and tee branches that change size.', 32, 50);
   doc.setTextColor(0); doc.setFontSize(10); y = 70;
@@ -1926,6 +2096,48 @@ function renderWorldToImage() {
   ctx.strokeStyle = '#eef0f3'; ctx.lineWidth = 1;
   for (let x = 0; x < w; x += 24) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,h); ctx.stroke(); }
   for (let y = 0; y < h; y += 24) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(w,y); ctx.stroke(); }
+
+  // spillovers (drawn under pipes)
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  for (const item of state.items) {
+    if ((item.type !== 'pool' && item.type !== 'spa') || !item.spillsInto) continue;
+    const tgt = getItem(item.spillsInto); if (!tgt) continue;
+    const a0 = nearestEdgePoint(item, tgt);
+    const b0 = nearestEdgePoint(tgt, item);
+    const a = { x: a0.x + ox, y: a0.y + oy };
+    const b = { x: b0.x + ox, y: b0.y + oy };
+    ctx.strokeStyle = '#2eb6ff'; ctx.lineWidth = 4; ctx.setLineDash([10, 8]);
+    ctx.beginPath();
+    const len = Math.hypot(b.x-a.x, b.y-a.y);
+    const ux = (b.x-a.x)/len, uy = (b.y-a.y)/len, nx = -uy, ny = ux;
+    const steps = Math.max(4, Math.floor(len / 18));
+    ctx.moveTo(a.x, a.y);
+    for (let i = 1; i <= steps; i++) {
+      const t = i / steps;
+      const px = a.x + ux * len * t;
+      const py = a.y + uy * len * t;
+      const off = Math.sin(t * Math.PI * steps / 2) * 8 * ((i % 2) ? 1 : -1);
+      ctx.lineTo(px + nx * off, py + ny * off);
+    }
+    ctx.lineTo(b.x, b.y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    // arrowhead at b
+    const ang = Math.atan2(b.y - a.y, b.x - a.x);
+    ctx.fillStyle = '#2eb6ff';
+    ctx.beginPath();
+    ctx.moveTo(b.x, b.y);
+    ctx.lineTo(b.x - 12*Math.cos(ang-0.4), b.y - 12*Math.sin(ang-0.4));
+    ctx.lineTo(b.x - 12*Math.cos(ang+0.4), b.y - 12*Math.sin(ang+0.4));
+    ctx.closePath(); ctx.fill();
+    // label
+    const featLabel = (typeof SPILL_FEATURE_LABEL !== 'undefined' && SPILL_FEATURE_LABEL[item.spillFeature]) || 'Spillover';
+    const widthBit = item.spillWidth ? ' · ' + item.spillWidth : '';
+    const qtyBit = (item.spillQty && item.spillQty > 1) ? (item.spillQty + '× ') : '';
+    ctx.fillStyle = '#0a6e9a'; ctx.font = 'bold 11px -apple-system, system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(qtyBit + featLabel + widthBit, (a.x+b.x)/2, (a.y+b.y)/2 - 8);
+  }
 
   // edges
   for (const e of state.edges) {
