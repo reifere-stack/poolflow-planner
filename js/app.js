@@ -743,6 +743,28 @@ function renderParts() {
   `;
 }
 
+function renderEquipmentModelPicker(item) {
+  const models = EQUIPMENT_MODELS[item.type];
+  if (!models || !models.length) return '';
+  const cur = item.modelId || '';
+  const m = cur ? findEquipmentModel(cur) : null;
+  const detail = m
+    ? `<div style="color:var(--muted); font-size:12px; margin-top:4px;">${escapeHtml(m.brand)} · ${escapeHtml(m.name)} — ${m.wIn}″ × ${m.dIn}″${m.hIn?` × ${m.hIn}″ H`:''}${m.port?` · ${escapeHtml(m.port)}`:''}${m.btu?` · ${escapeHtml(m.btu)} BTU`:''}${m.area?` · ${escapeHtml(m.area)}`:''}</div>`
+    : `<div style="color:var(--muted); font-size:12px; margin-top:4px;">Pick a model to scale this part on the pad.</div>`;
+  return `
+    <div class="group" style="margin-top:10px;">
+      <div class="group-title">Model (to scale)</div>
+      <div class="field">
+        <select id="f-model">
+          <option value="">— generic —</option>
+          ${models.map(mm => `<option value="${mm.id}" ${mm.id===cur?'selected':''}>${escapeHtml(mm.brand)} — ${escapeHtml(mm.name)}</option>`).join('')}
+        </select>
+      </div>
+      ${detail}
+      <button class="btn" data-action="applyModel" style="margin-top:8px;">Snap to actual size</button>
+    </div>`;
+}
+
 function renderSizeFields(item) {
   if (RESIZABLE.has(item.type)) {
     const w = pxToFI(item.w), h = pxToFI(item.h);
@@ -811,6 +833,7 @@ function renderSelected() {
           <option ${item.valveState==='both'?'selected':''} value="both">3-way shared</option>
         </select>
       </div>` : ''}
+      ${renderEquipmentModelPicker(item)}
       ${renderSizeFields(item)}
       <div class="field" style="margin-top:8px;"><label>Notes</label><input id="f-notes" value="${escapeHtml(item.notes||'')}" placeholder="e.g. branch A, custom feature"/></div>
       <div class="row" style="margin-top:12px;">
@@ -890,35 +913,186 @@ function renderValidate() {
     </div>`;
 }
 
-function renderTakeoff() {
-  const counts = {};
+// ---------- BOM computation ----------
+// Sample a cubic Bezier (matches drawEdges) and sum segment lengths to get pixels
+function edgePathLengthPx(edge) {
+  const a = getItem(edge.from), b = getItem(edge.to);
+  if (!a || !b) return 0;
+  const p1 = { x: a.x + a.w/2, y: a.y + a.h/2 };
+  const p2 = { x: b.x + b.w/2, y: b.y + b.h/2 };
+  const mx = (p1.x + p2.x) / 2;
+  const c1 = { x: mx, y: p1.y };
+  const c2 = { x: mx, y: p2.y };
+  const N = 24;
+  let len = 0, prev = p1;
+  for (let i = 1; i <= N; i++) {
+    const t = i / N;
+    const u = 1 - t;
+    const x = u*u*u*p1.x + 3*u*u*t*c1.x + 3*u*t*t*c2.x + t*t*t*p2.x;
+    const y = u*u*u*p1.y + 3*u*u*t*c1.y + 3*u*t*t*c2.y + t*t*t*p2.y;
+    len += Math.hypot(x - prev.x, y - prev.y);
+    prev = { x, y };
+  }
+  return len;
+}
+
+function edgeAngleDeg(edge) {
+  const a = getItem(edge.from), b = getItem(edge.to);
+  if (!a || !b) return 0;
+  const dx = (b.x + b.w/2) - (a.x + a.w/2);
+  const dy = (b.y + b.h/2) - (a.y + a.h/2);
+  let ang = Math.abs(Math.atan2(dy, dx) * 180 / Math.PI);
+  if (ang > 90) ang = 180 - ang;
+  return ang;
+}
+
+function computeBOM() {
+  const wasteFactor = 1.10;
+  const pipeByKey = {};
+  const fitBySize = {};
+  const ensureFit = (size) => {
+    if (!fitBySize[size]) fitBySize[size] = { elbow90:0, elbow45:0, coupling:0, tee:0, union:0 };
+    return fitBySize[size];
+  };
+
+  for (const e of state.edges) {
+    const ft = pxToFeet(edgePathLengthPx(e));
+    const typeLabel = (PIPE_TYPES[e.type]?.label) || e.type;
+    const size = e.size || '—';
+    const key = typeLabel + '|' + size;
+    if (!pipeByKey[key]) pipeByKey[key] = { typeLabel, size, ft:0 };
+    pipeByKey[key].ft += ft;
+
+    const fit = ensureFit(size);
+    const ang = edgeAngleDeg(e);
+    if (ang >= BOM_RULES.use45DegMin && ang <= BOM_RULES.use45DegMax) {
+      fit.elbow45 += 2;
+      fit.elbow90 += 1;
+    } else {
+      fit.elbow90 += BOM_RULES.minElbowsPerRun;
+    }
+    fit.coupling += Math.max(0, Math.floor(ft / BOM_RULES.couplingEveryFt));
+    if (ft > BOM_RULES.longRunFt) fit.coupling += 1;
+  }
+
+  const adj = {};
+  state.items.forEach(i => adj[i.id] = { in:[], out:[] });
+  state.edges.forEach(e => { if (adj[e.from]) adj[e.from].out.push(e); if (adj[e.to]) adj[e.to].in.push(e); });
+  for (const item of state.items) {
+    if (item.type === 'tee') {
+      const sizes = [...(adj[item.id]?.in||[]), ...(adj[item.id]?.out||[])].map(e => e.size).filter(Boolean);
+      const s = sizes[0] || '—';
+      ensureFit(s).tee += 1;
+    }
+    if (EQUIPMENT_TYPES.has(item.type)) {
+      const connSizes = [...(adj[item.id]?.in||[]), ...(adj[item.id]?.out||[])].map(e => e.size).filter(Boolean);
+      const s = connSizes[0] || '2"';
+      ensureFit(s).union += BOM_RULES.unionsPerEquipment;
+    }
+  }
+
+  const equipment = state.items
+    .filter(i => EQUIPMENT_TYPES.has(i.type))
+    .map(i => {
+      const m = i.modelId ? findEquipmentModel(i.modelId) : null;
+      return {
+        id: i.id,
+        type: i.type,
+        label: i.label,
+        model: m ? (m.brand + ' ' + m.name) : '(generic)',
+        footprint: m ? (m.wIn + '″ × ' + m.dIn + '″' + (m.hIn ? (' × ' + m.hIn + '″ H') : '')) : '',
+        port: m?.port || '',
+      };
+    });
+
+  const valves = state.items
+    .filter(i => ['valve2','valve3','checkvalve','actuated'].includes(i.type))
+    .map(i => {
+      const m = i.modelId ? findEquipmentModel(i.modelId) : null;
+      const typeLabel = {valve2:'2-way',valve3:'3-way',checkvalve:'Check',actuated:'Actuated'}[i.type];
+      return {
+        type: i.type,
+        typeLabel,
+        label: i.label,
+        size: i.size || (m?.port || '—'),
+        model: m ? (m.brand + ' ' + m.name) : '(generic)',
+      };
+    });
+
+  const fixtureTypes = ['return','skimmer','drain','jet','bubbler','deckjet','sheer','slide','autofill','light','feature','custom'];
+  const fixtures = {};
   state.items.forEach(i => {
-    if (i.type === 'tee') counts['Tees'] = (counts['Tees']||0)+1;
-    if (i.type === 'valve2') counts['2-way valves'] = (counts['2-way valves']||0)+1;
-    if (i.type === 'valve3') counts['3-way valves'] = (counts['3-way valves']||0)+1;
-    if (i.type === 'checkvalve') counts['Check valves'] = (counts['Check valves']||0)+1;
-    if (i.type === 'actuated') counts['Actuated valves'] = (counts['Actuated valves']||0)+1;
-    if (i.type === 'return') counts['Returns'] = (counts['Returns']||0)+1;
-    if (i.type === 'skimmer') counts['Skimmers'] = (counts['Skimmers']||0)+1;
-    if (i.type === 'drain') counts['Main drains'] = (counts['Main drains']||0)+1;
-    if (i.type === 'jet') counts['Spa jets'] = (counts['Spa jets']||0)+1;
-    if (i.type === 'bubbler') counts['Bubblers'] = (counts['Bubblers']||0)+1;
-    if (i.type === 'deckjet') counts['Deck jets'] = (counts['Deck jets']||0)+1;
+    if (fixtureTypes.includes(i.type)) {
+      const k = TOOLS[i.type]?.label || i.type;
+      fixtures[k] = (fixtures[k] || 0) + 1;
+    }
   });
-  state.edges.forEach(e => {
-    const key = `${(PIPE_TYPES[e.type]?.label)||e.type} pipe ${e.size||'—'}`;
-    counts[key] = (counts[key]||0)+1;
-    counts['Est. 90° elbows'] = (counts['Est. 90° elbows']||0)+2;
-  });
-  const entries = Object.entries(counts);
+
+  const pipeList = Object.values(pipeByKey).map(p => ({
+    typeLabel: p.typeLabel,
+    size: p.size,
+    rawFt: p.ft,
+    withWasteFt: p.ft * wasteFactor,
+    sticks20: Math.ceil((p.ft * wasteFactor) / 20),
+  }));
+
+  return { pipeList, fitBySize, equipment, valves, fixtures };
+}
+
+function renderTakeoff() {
+  const bom = computeBOM();
+  const { pipeList, fitBySize, equipment, valves, fixtures } = bom;
+
+  const pipeRows = pipeList.length
+    ? pipeList.map(p => `<div class="row-item"><span>${escapeHtml(p.typeLabel)} · ${escapeHtml(p.size)}</span><span class="qty">${p.withWasteFt.toFixed(1)} ft · ${p.sticks20}× 20′ sticks</span></div>`).join('')
+    : `<div class="row-item">No pipes yet. Draw connections in the Pipes tab.</div>`;
+
+  const fitRows = Object.keys(fitBySize).length
+    ? Object.entries(fitBySize).sort().map(([size, f]) => {
+        const parts = [];
+        if (f.elbow90) parts.push(f.elbow90 + '× 90°');
+        if (f.elbow45) parts.push(f.elbow45 + '× 45°');
+        if (f.tee)     parts.push(f.tee + '× tee');
+        if (f.coupling)parts.push(f.coupling + '× coupling');
+        if (f.union)   parts.push(f.union + '× union');
+        return `<div class="row-item"><span>Size ${escapeHtml(size)}</span><span class="qty" style="text-align:right;">${parts.join(' · ') || '—'}</span></div>`;
+      }).join('')
+    : `<div class="row-item">No fittings estimated yet.</div>`;
+
+  const valveRows = valves.length
+    ? valves.map(v => `<div class="row-item"><span>${escapeHtml(v.typeLabel)} · ${escapeHtml(v.size)}</span><span class="qty">${escapeHtml(v.model)}</span></div>`).join('')
+    : `<div class="row-item">No valves placed.</div>`;
+
+  const eqRows = equipment.length
+    ? equipment.map(e => `<div class="row-item"><span>${escapeHtml(e.label)}</span><span class="qty" style="text-align:right;">${escapeHtml(e.model)}${e.footprint?(' · '+escapeHtml(e.footprint)):''}</span></div>`).join('')
+    : `<div class="row-item">No equipment placed.</div>`;
+
+  const fixRows = Object.keys(fixtures).length
+    ? Object.entries(fixtures).map(([k,v]) => `<div class="row-item"><span>${escapeHtml(k)}</span><span class="qty">${v}</span></div>`).join('')
+    : `<div class="row-item">No fixtures placed.</div>`;
+
   return `
     <div class="panel">
-      <h3>Fittings takeoff</h3>
-      <div class="takeoff-list">
-        ${entries.length === 0
-          ? `<div class="row-item">Nothing counted yet — add parts and pipes.</div>`
-          : entries.map(([k,v]) => `<div class="row-item"><span>${escapeHtml(k)}</span><span class="qty">${v}</span></div>`).join('')}
-      </div>
+      <h3>Pipe — linear feet (with 10% waste)</h3>
+      <div class="takeoff-list">${pipeRows}</div>
+      <p style="color:var(--muted); font-size:12px; margin-top:8px;">Lengths measured from canvas at ${pxPerFoot()} px/ft. Adjust scale in Export tab.</p>
+    </div>
+    <div class="panel">
+      <h3>Fittings (estimated)</h3>
+      <div class="takeoff-list">${fitRows}</div>
+      <p style="color:var(--muted); font-size:12px; margin-top:8px;">Heuristic: 2× elbows per run, +1 coupling every 20′, unions on each side of equipment, tees from explicit tee nodes.</p>
+    </div>
+    <div class="panel">
+      <h3>Valves</h3>
+      <div class="takeoff-list">${valveRows}</div>
+    </div>
+    <div class="panel">
+      <h3>Equipment</h3>
+      <div class="takeoff-list">${eqRows}</div>
+    </div>
+    <div class="panel">
+      <h3>Fixtures &amp; features</h3>
+      <div class="takeoff-list">${fixRows}</div>
     </div>`;
 }
 
@@ -1029,6 +1203,37 @@ function doAction(name, btn) {
       toast('Saved'); break;
     }
     case 'deleteSelected': if (state.selectedId) deleteItem(state.selectedId); renderSheet(); break;
+    case 'applyModel': {
+      const item = getItem(state.selectedId); if (!item) return;
+      const sel = $('f-model');
+      if (!sel) return;
+      const id = sel.value;
+      pushUndo();
+      if (!id) {
+        item.modelId = '';
+        item.modelLabel = '';
+      } else {
+        const m = findEquipmentModel(id);
+        if (m) {
+          item.modelId = id;
+          item.modelLabel = `${m.brand} ${m.name}`;
+          // Snap footprint to scale (W × D in plan view)
+          const wPx = Math.max(20, Math.round(feetToPx(m.wIn / 12)));
+          const dPx = Math.max(16, Math.round(feetToPx(m.dIn / 12)));
+          item.w = wPx;
+          item.h = dPx;
+          // Auto-update label only if user hasn't customized it (still default label for type)
+          const defaultLabel = TOOLS[item.type]?.label;
+          if (!item.label || item.label === defaultLabel) {
+            item.label = `${m.brand} ${m.name}`;
+          }
+        }
+      }
+      refreshItem(item); persist();
+      renderSheet();
+      toast(item.modelId ? 'Snapped to actual size' : 'Cleared model');
+      break;
+    }
     case 'preset-size': {
       const item = getItem(state.selectedId); if (!item) return;
       const fw = parseFloat(btn.dataset.fw), fh = parseFloat(btn.dataset.fh);
@@ -1188,18 +1393,73 @@ function exportPDF() {
   const issues = state.lastSolve?.issues?.length ? state.lastSolve.issues : ['No hydraulic errors detected.'];
   issues.forEach(t => { doc.text('• ' + t, 32, y); y += 14; if (y>540){doc.addPage();y=36;} });
 
-  // Takeoff
-  doc.addPage(); doc.setFontSize(16); doc.text('Fittings takeoff', 32, 36);
+  // BOM / Takeoff
+  const bom = computeBOM();
+
+  doc.addPage(); doc.setFontSize(16); doc.text('Bill of Materials — Pipe', 32, 36);
+  doc.setFontSize(9); doc.setTextColor(120); doc.text('Linear feet measured from canvas Beziers, +10% waste, rounded to 20′ sticks.', 32, 50);
+  doc.setTextColor(0); doc.setFontSize(10); y = 70;
+  if (!bom.pipeList.length) {
+    doc.text('• No pipes drawn.', 32, y); y += 14;
+  } else {
+    bom.pipeList.forEach(p => {
+      doc.text(`• ${p.typeLabel}  ${p.size}: ${p.withWasteFt.toFixed(1)} ft  (${p.sticks20} × 20′ sticks)`, 32, y);
+      y += 14; if (y>540){doc.addPage();y=36;}
+    });
+  }
+
+  doc.addPage(); doc.setFontSize(16); doc.text('Bill of Materials — Fittings', 32, 36);
   doc.setFontSize(10); y = 60;
-  // recompute counts
-  const counts = {};
-  state.items.forEach(i => { counts[i.type] = (counts[i.type]||0)+1; });
-  state.edges.forEach(e => {
-    const k = `${PIPE_TYPES[e.type]?.label||e.type} pipe ${e.size||'—'}`;
-    counts[k] = (counts[k]||0)+1;
-    counts['Est. 90° elbows'] = (counts['Est. 90° elbows']||0)+2;
-  });
-  Object.entries(counts).forEach(([k,v]) => { doc.text(`• ${v} × ${k}`, 32, y); y += 14; if (y>540){doc.addPage();y=36;} });
+  const sizes = Object.keys(bom.fitBySize).sort();
+  if (!sizes.length) {
+    doc.text('• No fittings estimated.', 32, y);
+  } else {
+    sizes.forEach(s => {
+      const f = bom.fitBySize[s];
+      doc.setFont('helvetica','bold'); doc.text(`Size ${s}`, 32, y); doc.setFont('helvetica','normal'); y += 14;
+      const lines = [];
+      if (f.elbow90) lines.push(`• ${f.elbow90} × 90° elbow`);
+      if (f.elbow45) lines.push(`• ${f.elbow45} × 45° elbow`);
+      if (f.tee)     lines.push(`• ${f.tee} × tee`);
+      if (f.coupling)lines.push(`• ${f.coupling} × coupling`);
+      if (f.union)   lines.push(`• ${f.union} × union`);
+      lines.forEach(l => { doc.text('    ' + l, 32, y); y += 14; if (y>540){doc.addPage();y=36;} });
+      y += 4;
+    });
+  }
+
+  doc.addPage(); doc.setFontSize(16); doc.text('Bill of Materials — Equipment', 32, 36);
+  doc.setFontSize(10); y = 60;
+  if (!bom.equipment.length) {
+    doc.text('• No equipment placed.', 32, y);
+  } else {
+    bom.equipment.forEach(e => {
+      doc.text(`• ${e.label}: ${e.model}${e.footprint?'  ('+e.footprint+')':''}${e.port?'  port: '+e.port:''}`, 32, y);
+      y += 14; if (y>540){doc.addPage();y=36;}
+    });
+  }
+
+  doc.addPage(); doc.setFontSize(16); doc.text('Bill of Materials — Valves & Fixtures', 32, 36);
+  doc.setFontSize(11); doc.text('Valves', 32, 60); doc.setFontSize(10); y = 76;
+  if (!bom.valves.length) {
+    doc.text('• No valves placed.', 32, y); y += 14;
+  } else {
+    bom.valves.forEach(v => {
+      doc.text(`• ${v.typeLabel} ${v.size}: ${v.label} — ${v.model}`, 32, y);
+      y += 14; if (y>540){doc.addPage();y=36;}
+    });
+  }
+  y += 8;
+  if (y > 500) { doc.addPage(); y = 36; }
+  doc.setFontSize(11); doc.text('Fixtures', 32, y); y += 16; doc.setFontSize(10);
+  const fixEntries = Object.entries(bom.fixtures);
+  if (!fixEntries.length) {
+    doc.text('• No fixtures placed.', 32, y);
+  } else {
+    fixEntries.forEach(([k,v]) => {
+      doc.text(`• ${v} × ${k}`, 32, y); y += 14; if (y>540){doc.addPage();y=36;}
+    });
+  }
 
   doc.save(`poolflow-plan-${Date.now()}.pdf`);
   toast('PDF exported');
