@@ -1674,6 +1674,7 @@ function renderPipes() {
       <p style="color:var(--muted); font-size:12px; margin-top:8px;">Tap on the pipe in the canvas to add a 90° bend at that point. Long-press a bend handle to delete it.</p>
       <div class="row" style="margin-top:8px;">
         <button class="btn primary" data-action="applyEdge">Apply</button>
+        <button class="btn" data-action="flipEdge">Reverse arrow</button>
         <button class="btn" data-action="clearWaypoints">Clear bends</button>
         <button class="btn" data-action="stopEditEdge">Done</button>
       </div>
@@ -2202,6 +2203,23 @@ function doAction(name, btn) {
       e.waypoints = [];
       drawEdges(); persist(); renderSheet();
       toast('Bends cleared');
+      break;
+    }
+    case 'flipEdge': {
+      const e = state.edges.find(x => x.id === state.editingEdgeId);
+      if (!e) break;
+      pushUndo();
+      // Swap endpoints, reverse waypoints, swap reducer ends, and refresh label.
+      const from = e.from, to = e.to;
+      e.from = to; e.to = from;
+      if (Array.isArray(e.waypoints)) e.waypoints = [...e.waypoints].reverse();
+      const fs = e.fromSize || '', ts = e.toSize || '';
+      e.fromSize = ts; e.toSize = fs;
+      e.label = `${getItem(e.from)?.label || '?'} → ${getItem(e.to)?.label || '?'}`;
+      // Branch labels on 3-way valves are keyed by edge.id (unchanged), so they
+      // automatically still apply to the (now-reversed) pipe.
+      drawEdges(); solveFlow(); persist(); renderSheet();
+      toast('Arrow flipped');
       break;
     }
     case 'setBranchLabel': {
