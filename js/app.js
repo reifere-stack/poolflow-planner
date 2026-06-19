@@ -1779,64 +1779,20 @@ const SOURCE_COLORS = {
 };
 const MIXED_COLOR = 'var(--src-mixed)';
 
+// Junction items (tees, manifolds, 3-way valves) split or merge flow into
+// multiple parallel branches. A pipe entering a junction is NOT in the same
+// hydraulic branch as the pipes on the OTHER sides — so the trace must stop
+// at junctions to avoid bleeding sibling-branch sources back into this pipe.
+const JUNCTION_TYPES = new Set(['tee', 'manifold', 'valve3']);
+function isJunction(item) {
+  return !!(item && JUNCTION_TYPES.has(item.type));
+}
+
 // A "source fixture" for trace-coloring is any leaf fixture a pipe touches
 // (skimmer/drain on suction side, return/jet/etc on delivery side).
 function isSourceFixture(item) {
   if (!item) return false;
   return SUCTION_FIXTURES.has(item.type) || RETURN_FIXTURES.has(item.type);
-}
-
-// BFS-trace from one side of `edge` through pass-through items (tees, valves,
-// filters, heaters, manifolds, etc.) and collect every source-fixture type
-// reachable along edges of the SAME hydraulic role (suction-only or
-// return-only). This is the critical rule: a suction pipe must NEVER walk
-// through a pump to discharge-side fixtures, and vice versa — otherwise a
-// suction line from a skimmer would falsely "see" the spa jets downstream
-// of the pump.
-//
-// `role` = 'suction' or 'return' — must match the edge being traced.
-function resolvePipeSourcesSide(edge, side, itemById, role) {
-  const startId = side === 'from' ? edge.from : edge.to;
-  const startItem = itemById[startId];
-  if (!startItem) return [];
-  const found = new Set();
-  // The starting endpoint counts as a source if it's a matching fixture.
-  if (isSourceFixture(startItem) && fixtureMatchesRole(startItem, role)) {
-    found.add(startItem.type);
-  }
-  const visited = new Set([startId]);
-  const queue = [startId];
-  while (queue.length) {
-    const id = queue.shift();
-    const item = itemById[id];
-    if (!item) continue;
-    // A pump is a hard barrier — it terminates the trace on its current side.
-    // Don't expand neighbors from a pump (except the starting node itself,
-    // which is handled by the edge filter below since we only follow role-
-    // matching edges).
-    if (id !== startId && item.type === 'pump') continue;
-    // Don't traverse past a source fixture — it IS a terminal endpoint.
-    if (id !== startId && isSourceFixture(item)) continue;
-    for (const e of state.edges) {
-      if (e === edge) continue;
-      // Only follow edges of the SAME hydraulic role. This naturally prevents
-      // crossing a pump (intake = suction, discharge = return) and prevents
-      // crossing role-changing valves.
-      if (e.type !== role) continue;
-      let otherId = null;
-      if (e.from === id) otherId = e.to;
-      else if (e.to === id) otherId = e.from;
-      if (!otherId || visited.has(otherId)) continue;
-      visited.add(otherId);
-      const otherItem = itemById[otherId];
-      if (otherItem && isSourceFixture(otherItem) && fixtureMatchesRole(otherItem, role)) {
-        found.add(otherItem.type);
-        continue; // terminal — don't queue
-      }
-      queue.push(otherId);
-    }
-  }
-  return Array.from(found);
 }
 
 // True if `item`'s fixture role matches the pipe role we're tracing.
@@ -1849,18 +1805,94 @@ function fixtureMatchesRole(item, role) {
   return false;
 }
 
-// Returns all unique source-fixture types reachable from EITHER end of the
-// pipe via the hydraulic graph, restricted to the pipe's own role. This is
-// the set we'll color the pipe with.
-function resolvePipeSources(edge) {
-  if (!edge || !isHydraulicPipe(edge.type)) return [];
+// Build a map: edgeId -> Set of fixture-types whose flow passes through this edge.
+//
+// Strategy: trace from EACH source fixture along role-matching edges. Every
+// edge on that fixture's reachable path "carries" this fixture's water. Once
+// all fixtures have traced, each edge knows exactly which fixtures
+// contribute to its flow — that's the correct color set.
+//
+// Why this is correct for tees:
+//   skimmer—A—tee—C—pump
+//   drain  —B—/
+// • skimmer trace visits A, then expands through tee → C (then stops at pump).
+//   So skimmer marks {A, C}. It does NOT mark B because B leads back to a
+//   different source fixture (drain), and we stop at other source fixtures.
+// • drain trace symmetrically marks {B, C}.
+// • Final: A={skimmer}, B={drain}, C={skimmer, drain}.
+//
+// Stopping at other source fixtures is what prevents bleed-through across
+// the tee.
+let _pipeSourceCache = null;
+let _pipeSourceCacheKey = null;
+
+function computePipeSourceMap() {
+  const key = state.edges.map(e => `${e.id}|${e.from}|${e.to}|${e.type}`).join('\u0001')
+            + '\u0002' + state.items.map(i => `${i.id}|${i.type}`).join('\u0001');
+  if (_pipeSourceCacheKey === key && _pipeSourceCache) return _pipeSourceCache;
+
   const itemById = {};
   for (const it of state.items) itemById[it.id] = it;
-  const role = edge.type; // 'suction' or 'return'
-  const a = resolvePipeSourcesSide(edge, 'from', itemById, role);
-  const b = resolvePipeSourcesSide(edge, 'to',   itemById, role);
-  const set = new Set([...a, ...b]);
-  return Array.from(set);
+
+  // Adjacency: itemId -> list of {edge, otherId}, hydraulic pipes only.
+  const adj = new Map();
+  for (const e of state.edges) {
+    if (!isHydraulicPipe(e.type)) continue;
+    if (!adj.has(e.from)) adj.set(e.from, []);
+    if (!adj.has(e.to))   adj.set(e.to,   []);
+    adj.get(e.from).push({ edge: e, otherId: e.to });
+    adj.get(e.to).push  ({ edge: e, otherId: e.from });
+  }
+
+  const edgeSources = new Map(); // edgeId -> Set<fixtureType>
+  const ensure = (eid) => {
+    if (!edgeSources.has(eid)) edgeSources.set(eid, new Set());
+    return edgeSources.get(eid);
+  };
+
+  // For each source fixture, BFS along role-matching edges from that fixture,
+  // marking every visited edge as carrying this fixture's flow. Stop at
+  // pumps (hydraulic barrier) and at OTHER source fixtures (sibling
+  // territories).
+  for (const fixture of state.items) {
+    if (!isSourceFixture(fixture)) continue;
+    const role = SUCTION_FIXTURES.has(fixture.type) ? 'suction' : 'return';
+    const visitedNodes = new Set([fixture.id]);
+    const queue = [fixture.id];
+    while (queue.length) {
+      const id = queue.shift();
+      const neighbors = adj.get(id) || [];
+      for (const { edge, otherId } of neighbors) {
+        if (edge.type !== role) continue; // role-restricted (no pump-crossing)
+        const other = itemById[otherId];
+        // Don't step into an edge that leads to ANOTHER source fixture: that
+        // edge belongs to that fixture's territory, not ours. (We still want
+        // to walk INTO edges leading to pumps, tees, valves, etc.)
+        if (other && isSourceFixture(other) && other.id !== fixture.id) continue;
+        // Mark this edge as carrying this fixture's flow.
+        ensure(edge.id).add(fixture.type);
+        if (visitedNodes.has(otherId)) continue;
+        visitedNodes.add(otherId);
+        if (!other) continue;
+        // Stop expanding at pumps (hard hydraulic barrier).
+        if (other.type === 'pump') continue;
+        // Otherwise (tee, manifold, valve, filter, heater) keep going.
+        queue.push(otherId);
+      }
+    }
+  }
+
+  _pipeSourceCacheKey = key;
+  _pipeSourceCache = edgeSources;
+  return edgeSources;
+}
+
+// Returns the unique source-fixture types whose flow passes through `edge`.
+function resolvePipeSources(edge) {
+  if (!edge || !isHydraulicPipe(edge.type)) return [];
+  const map = computePipeSourceMap();
+  const set = map.get(edge.id);
+  return set ? Array.from(set) : [];
 }
 
 function itemFixtureRole(item) {
