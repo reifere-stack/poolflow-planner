@@ -6562,20 +6562,68 @@ function _insertRelativeTo(anchor, side, direction, type, label) {
   } else {
     // No existing edge to splice -> attach as a new branch off `anchor`.
     const edgeType = side === 'suction' ? 'suction' : 'return';
+    // Single-port guard: pump/filter/heater/etc. have ONE intake and ONE discharge.
+    // If we'd be adding a 2nd upstream input to a non-junction, auto-insert a Tee.
+    const isJunction = _PSBRANCH_TYPES.has(anchor.type);
     if (attachDir === 'upstream') {
-      // newItem flows INTO anchor
-      state.edges.push({
-        id: uid(), from: newItem.id, to: anchor.id, type: edgeType, size: '',
-        label: `${newItem.label} \u2192 ${anchor.label || ''}`,
-        active: false, blocked: false, fromPort: '', toPort: '',
-      });
+      const existingUpstream = state.edges.filter(e => e.type === edgeType && e.to === anchor.id);
+      if (!isJunction && existingUpstream.length >= 1) {
+        // Convert: existing parents -> Tee -> anchor; new item also joins the Tee.
+        const tee = addItem('tee', {
+          x: (anchor.x || 0) - 100,
+          y: (anchor.y || 0) - 100,
+          label: _uniqLabel(side === 'suction' ? 'Suction Tee' : 'Return Tee'),
+        });
+        // Rewire each existing upstream edge to point at the Tee instead.
+        existingUpstream.forEach(e => { e.to = tee.id; e.toPort = ''; });
+        // Tee -> anchor.
+        state.edges.push({
+          id: uid(), from: tee.id, to: anchor.id, type: edgeType, size: '',
+          label: `${tee.label} \u2192 ${anchor.label || ''}`,
+          active: false, blocked: false, fromPort: '', toPort: '',
+        });
+        // New item -> Tee.
+        state.edges.push({
+          id: uid(), from: newItem.id, to: tee.id, type: edgeType, size: '',
+          label: `${newItem.label} \u2192 ${tee.label}`,
+          active: false, blocked: false, fromPort: '', toPort: '',
+        });
+      } else {
+        // newItem flows INTO anchor
+        state.edges.push({
+          id: uid(), from: newItem.id, to: anchor.id, type: edgeType, size: '',
+          label: `${newItem.label} \u2192 ${anchor.label || ''}`,
+          active: false, blocked: false, fromPort: '', toPort: '',
+        });
+      }
     } else {
-      // anchor flows INTO newItem
-      state.edges.push({
-        id: uid(), from: anchor.id, to: newItem.id, type: edgeType, size: '',
-        label: `${anchor.label || ''} \u2192 ${newItem.label}`,
-        active: false, blocked: false, fromPort: '', toPort: '',
-      });
+      const existingDownstream = state.edges.filter(e => e.type === edgeType && e.from === anchor.id);
+      if (!isJunction && existingDownstream.length >= 1) {
+        // Convert: anchor -> Tee -> existing children; new item also joins.
+        const tee = addItem('tee', {
+          x: (anchor.x || 0) + 100,
+          y: (anchor.y || 0) + 100,
+          label: _uniqLabel(side === 'suction' ? 'Suction Tee' : 'Return Tee'),
+        });
+        existingDownstream.forEach(e => { e.from = tee.id; e.fromPort = ''; });
+        state.edges.push({
+          id: uid(), from: anchor.id, to: tee.id, type: edgeType, size: '',
+          label: `${anchor.label || ''} \u2192 ${tee.label}`,
+          active: false, blocked: false, fromPort: '', toPort: '',
+        });
+        state.edges.push({
+          id: uid(), from: tee.id, to: newItem.id, type: edgeType, size: '',
+          label: `${tee.label} \u2192 ${newItem.label}`,
+          active: false, blocked: false, fromPort: '', toPort: '',
+        });
+      } else {
+        // anchor flows INTO newItem
+        state.edges.push({
+          id: uid(), from: anchor.id, to: newItem.id, type: edgeType, size: '',
+          label: `${anchor.label || ''} \u2192 ${newItem.label}`,
+          active: false, blocked: false, fromPort: '', toPort: '',
+        });
+      }
     }
   }
   migratePortsOnLoad(state);
