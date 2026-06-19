@@ -103,6 +103,9 @@ function restore() {
     // Valves: use direction-based heuristic + geometry (left = A, right = B).
     // Pumps:  incoming = intake (suction), outgoing = discharge (return).
     migratePortsOnLoad(state);
+    // Self-heal: insert a Tee in front of any non-junction node that ended up
+    // with multiple inputs/outputs (from buggy older deletes etc.).
+    healSinglePortTopology(state);
     // Migration: shrink legacy oversized compact fixtures to new scale-appropriate
     // defaults. Old defaults were ~32-60px; new defaults are ~18-34px. We only
     // resize items whose size matches a known LEGACY default (so users who
@@ -285,6 +288,63 @@ const PASS_THROUGH_TYPES = new Set([
 // special-purpose and left alone).
 function isHydraulicPipe(type) {
   return type === 'suction' || type === 'return';
+}
+
+// Self-heal: for any non-junction node that ended up with multiple inputs or
+// multiple outputs on the same hydraulic role, insert a Tee so the topology
+// stays physically valid (every single-port pill = one pipe per side).
+const _JUNCTION_TYPES_FOR_HEAL = new Set(['tee', 'manifold', 'valve3', 'valve2']);
+function healSinglePortTopology(s) {
+  if (!s || !Array.isArray(s.items) || !Array.isArray(s.edges)) return;
+  let nextId = s.nextId || (s.items.length + 1);
+  const uniq = (lbl) => {
+    const used = new Set(s.items.map(i => i.label || ''));
+    let n = 0, cand = lbl;
+    while (used.has(cand)) { n += 1; cand = `${lbl} ${n + 1}`; }
+    return cand;
+  };
+  for (const item of [...s.items]) {
+    if (_JUNCTION_TYPES_FOR_HEAL.has(item.type)) continue;
+    for (const role of ['suction', 'return']) {
+      // Multiple inputs?
+      const inc = s.edges.filter(e => e.type === role && e.to === item.id);
+      if (inc.length > 1) {
+        const tee = {
+          id: 'h' + (nextId++),
+          type: 'tee',
+          label: uniq(role === 'suction' ? 'Suction Tee' : 'Return Tee'),
+          x: (item.x || 0) - 80, y: (item.y || 0) - 80,
+        };
+        s.items.push(tee);
+        // Rewire each incoming edge to point at the tee instead.
+        inc.forEach(e => { e.to = tee.id; e.toPort = ''; });
+        // Tee -> original item.
+        s.edges.push({
+          id: 'h' + (nextId++), from: tee.id, to: item.id, type: role, size: '',
+          label: `${tee.label} \u2192 ${item.label || ''}`,
+          active: false, blocked: false, fromPort: '', toPort: '',
+        });
+      }
+      // Multiple outputs?
+      const out = s.edges.filter(e => e.type === role && e.from === item.id);
+      if (out.length > 1) {
+        const tee = {
+          id: 'h' + (nextId++),
+          type: 'tee',
+          label: uniq(role === 'suction' ? 'Suction Tee' : 'Return Tee'),
+          x: (item.x || 0) + 80, y: (item.y || 0) + 80,
+        };
+        s.items.push(tee);
+        out.forEach(e => { e.from = tee.id; e.fromPort = ''; });
+        s.edges.push({
+          id: 'h' + (nextId++), from: item.id, to: tee.id, type: role, size: '',
+          label: `${item.label || ''} \u2192 ${tee.label}`,
+          active: false, blocked: false, fromPort: '', toPort: '',
+        });
+      }
+    }
+  }
+  s.nextId = nextId;
 }
 
 // Items that source/sink AIR (not water). A blower discharges air;
@@ -5059,18 +5119,37 @@ function flowsRemoveTreeStep(itemId) {
   for (const e of touching) if (byRole[e.type]) byRole[e.type].push(e);
 
   const newBridges = [];
+  // Helper: which item types can accept multiple inputs or outputs (junctions only)?
+  const canBranch = (it) => it && _PSBRANCH_TYPES.has(it.type);
   for (const role of ['suction', 'return']) {
     const edges = byRole[role];
     if (!edges.length) continue;
-    // Bridge each pair (upstream, downstream). Heuristic: if exactly 2 edges,
-    // bridge them; otherwise pair the one with target=item (incoming) to each
-    // edge with source=item (outgoing).
     const incoming = edges.filter(e => e.to === itemId);
     const outgoing = edges.filter(e => e.from === itemId);
     if (incoming.length && outgoing.length) {
-      for (const inE of incoming) {
+      // If removing this junction would create multiple inputs into a single-port
+      // node (pump/filter/etc.) or multiple outputs from one, insert a replacement
+      // Tee to preserve a valid topology rather than bridging every-to-every.
+      const needReplacementTee = (
+        (incoming.length > 1 && outgoing.some(e => !canBranch(state.items.find(i => i.id === e.to)))) ||
+        (outgoing.length > 1 && incoming.some(e => !canBranch(state.items.find(i => i.id === e.from))))
+      );
+      if (needReplacementTee) {
+        const tee = addItem('tee', {
+          x: (item.x || 0), y: (item.y || 0),
+          label: _uniqLabel(role === 'suction' ? 'Suction Tee' : 'Return Tee'),
+        });
+        for (const inE of incoming) {
+          newBridges.push({ from: inE.from, to: tee.id, type: role, size: inE.size || '', fromPort: inE.fromPort || '', toPort: '' });
+        }
         for (const outE of outgoing) {
-          newBridges.push({ from: inE.from, to: outE.to, type: role, size: inE.size || outE.size || '', fromPort: inE.fromPort || '', toPort: outE.toPort || '' });
+          newBridges.push({ from: tee.id, to: outE.to, type: role, size: outE.size || '', fromPort: '', toPort: outE.toPort || '' });
+        }
+      } else {
+        for (const inE of incoming) {
+          for (const outE of outgoing) {
+            newBridges.push({ from: inE.from, to: outE.to, type: role, size: inE.size || outE.size || '', fromPort: inE.fromPort || '', toPort: outE.toPort || '' });
+          }
         }
       }
     } else if (edges.length === 2) {
