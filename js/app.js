@@ -365,6 +365,18 @@ function onPointerDown(e) {
       return;
     }
 
+    // Tap a 3-way valve port chip = flip the valve to that position.
+    // (A=pos1, B=pos2, Trunk=shared). Skip drag setup in this case.
+    const portChip = e.target.closest && e.target.closest('.valve3-port');
+    if (portChip && item.type === 'valve3') {
+      const port = portChip.dataset.port;
+      selectItem(id);
+      setValve3ByPort(item, port);
+      clearLongPress();
+      e.preventDefault();
+      return;
+    }
+
     dragMode = 'node';
     dragData = {
       item,
@@ -504,7 +516,12 @@ function onPointerUp(e) {
   if (dragMode === 'node') {
     dragData?.element?.classList.remove('dragging');
     if (!p.moved && !longPressFired) {
-      // tap → already selected on down; nothing extra
+      // A clean tap (no drag, no long-press) on a 2-way valve toggles it.
+      // 3-way valves flip via port-chip taps instead.
+      const tappedItem = dragData?.item;
+      if (tappedItem && tappedItem.type === 'valve2') {
+        cycleValve(tappedItem);
+      }
     } else if (p.moved) {
       pushUndo(); // commit move
       const moved = dragData?.item;
@@ -831,7 +848,39 @@ function cycleValve(item) {
     const cur = order.indexOf(item.valveState);
     item.valveState = order[(cur + 1) % order.length] || 'shared';
   }
-  refreshItem(item); solveFlow(); persist();
+  refreshItem(item); solveFlow(); persist(); drawEdges();
+  if (item.type === 'valve3') {
+    const info = valveBranchInfo(item);
+    const label = item.valveState === 'pos1' ? info.pos1
+                : item.valveState === 'pos2' ? info.pos2
+                : 'Shared';
+    toast(`${item.label}: → ${label}`);
+  } else {
+    toast(`${item.label}: ${item.valveState}`);
+  }
+}
+
+// Set a 3-way valve to a specific port (tap-on-port-chip):
+//   tap A     -> open to A only (pos1)
+//   tap B     -> open to B only (pos2)
+//   tap Trunk -> open to both branches (shared)
+function setValve3ByPort(item, port) {
+  if (!item || item.type !== 'valve3') return;
+  const target = port === 'a' ? 'pos1' : port === 'b' ? 'pos2' : 'shared';
+  if (item.valveState === target) {
+    // Tapping the already-open port has no effect, but give visual feedback.
+    const info = valveBranchInfo(item);
+    const lbl = target === 'pos1' ? info.pos1 : target === 'pos2' ? info.pos2 : 'Shared';
+    toast(`${item.label}: already → ${lbl}`);
+    return;
+  }
+  pushUndo();
+  item.valveState = target;
+  refreshItem(item); solveFlow(); persist(); drawEdges();
+  syncSelectedPanel();
+  const info = valveBranchInfo(item);
+  const lbl = target === 'pos1' ? info.pos1 : target === 'pos2' ? info.pos2 : 'Shared';
+  toast(`${item.label}: → ${lbl}`);
 }
 
 // ---------- Connect mode ----------
@@ -1844,23 +1893,23 @@ function renderSelected() {
       </div>
       ${isValve ? (item.type === 'valve3' ? (() => {
         const info = valveBranchInfo(item);
+        const vs = item.valveState || 'shared';
+        const pill = (state, label) => `<button class="valve-pill ${vs===state?'on':''}" data-action="setValveState" data-item-id="${item.id}" data-state="${state}">${label}</button>`;
         return `
-      <div class="field" style="margin-top:8px;"><label>Valve position</label>
-        <select id="f-valve">
-          <option ${item.valveState==='pos1'?'selected':''} value="pos1">Open to ${escapeHtml(info.pos1)}</option>
-          <option ${item.valveState==='pos2'?'selected':''} value="pos2">Open to ${escapeHtml(info.pos2)}</option>
-          <option ${(item.valveState==='shared'||!item.valveState)?'selected':''} value="shared">Shared (both branches open)</option>
-        </select>
+      <div class="field" style="margin-top:8px;"><label>Valve position — tap to flip</label></div>
+      <div class="valve-pills">
+        ${pill('pos1', 'A: ' + escapeHtml(info.pos1))}
+        ${pill('shared', 'Shared')}
+        ${pill('pos2', 'B: ' + escapeHtml(info.pos2))}
       </div>
-      <p style="color:var(--muted); font-size:12px; margin-top:6px;">Branches are auto-named from the plumbing downstream. Rename a branch by tapping its pipe in the Pipes tab.</p>`;
+      <p style="color:var(--muted); font-size:12px; margin-top:6px;">Tip: tap a port (A / B / T) directly on the valve to flip it. Branches are auto-named from the plumbing downstream.</p>`;
       })() : `
-      <div class="field" style="margin-top:8px;"><label>Valve mode</label>
-        <select id="f-valve">
-          <option value="">N/A</option>
-          <option ${item.valveState==='open'?'selected':''} value="open">Open</option>
-          <option ${item.valveState==='closed'?'selected':''} value="closed">Closed</option>
-        </select>
-      </div>`) : ''}
+      <div class="field" style="margin-top:8px;"><label>Valve mode — tap to flip</label></div>
+      <div class="valve-pills">
+        <button class="valve-pill ${item.valveState==='open'?'on':''}"   data-action="setValveState" data-item-id="${item.id}" data-state="open">Open</button>
+        <button class="valve-pill ${item.valveState==='closed'?'on':''}" data-action="setValveState" data-item-id="${item.id}" data-state="closed">Closed</button>
+      </div>
+      <p style="color:var(--muted); font-size:12px; margin-top:6px;">Tip: just tap the valve on the canvas to toggle it.</p>`) : ''}
       ${renderEquipmentModelPicker(item)}
       ${renderSizeFields(item)}
       ${isBody ? `
@@ -2569,6 +2618,24 @@ function doAction(name, btn) {
       break;
     }
     case 'connectMode': startConnectMode(); break;
+    case 'setValveState': {
+      const targetId = btn.dataset.itemId;
+      const next     = btn.dataset.state;
+      const item = getItem(targetId);
+      if (!item) break;
+      if (item.type === 'valve3') {
+        const port = next === 'pos1' ? 'a' : next === 'pos2' ? 'b' : 'trunk';
+        setValve3ByPort(item, port);
+      } else if (item.type === 'valve2' || item.type === 'actuated') {
+        if (item.valveState === next) break;
+        pushUndo();
+        item.valveState = next;
+        refreshItem(item); solveFlow(); persist(); drawEdges();
+        syncSelectedPanel();
+        toast(`${item.label}: ${next}`);
+      }
+      break;
+    }
     case 'solveFlow': solveFlow(); renderSheet(); break;
     case 'exportPDF': exportPDF(); break;
     case 'exportJSON': exportJSON(); break;
