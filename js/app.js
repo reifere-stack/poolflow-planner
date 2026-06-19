@@ -1834,15 +1834,28 @@ function computePipeSourceMap() {
   const itemById = {};
   for (const it of state.items) itemById[it.id] = it;
 
-  // Adjacency: itemId -> list of {edge, otherId}, hydraulic pipes only.
+  // Adjacency: itemId -> list of {edge, otherId, portHere}, hydraulic pipes only.
+  // portHere = which port of THIS node the edge connects to (matters for
+  // valve3 where 'trunk' is shared between branches but 'a' and 'b' are not).
   const adj = new Map();
   for (const e of state.edges) {
     if (!isHydraulicPipe(e.type)) continue;
     if (!adj.has(e.from)) adj.set(e.from, []);
     if (!adj.has(e.to))   adj.set(e.to,   []);
-    adj.get(e.from).push({ edge: e, otherId: e.to });
-    adj.get(e.to).push  ({ edge: e, otherId: e.from });
+    adj.get(e.from).push({ edge: e, otherId: e.to,   portHere: e.fromPort || '' });
+    adj.get(e.to).push  ({ edge: e, otherId: e.from, portHere: e.toPort   || '' });
   }
+
+  // A 3-way valve separates its A and B branches: they only connect through
+  // the trunk port. Returns true if an edge entering on `inPort` can pass
+  // through the valve and exit on `outPort`. Allowed: trunk↔a, trunk↔b,
+  // a↔a, b↔b. Disallowed: a↔b (the two branches don't see each other).
+  const valve3PortsConnected = (inPort, outPort) => {
+    if (!inPort || !outPort) return true; // unknown ports — don't block
+    if (inPort === outPort) return true;
+    if (inPort === 'trunk' || outPort === 'trunk') return true;
+    return false; // a↔b blocked
+  };
 
   const edgeSources = new Map(); // edgeId -> Set<fixtureType>
   const ensure = (eid) => {
@@ -1859,11 +1872,26 @@ function computePipeSourceMap() {
     const role = SUCTION_FIXTURES.has(fixture.type) ? 'suction' : 'return';
     const visitedNodes = new Set([fixture.id]);
     const queue = [fixture.id];
+    // Tracks: for each queued node, which port of that node we arrived on.
+    // Only consulted for valve3 routing.
+    const queuedPortAt = new Map();
     while (queue.length) {
       const id = queue.shift();
       const neighbors = adj.get(id) || [];
-      for (const { edge, otherId } of neighbors) {
+      const currentItem = itemById[id];
+      // For valve3, we need to know which port we ARRIVED on so we can enforce
+      // the a↔b barrier when exiting. The arrival port is tracked via the
+      // entry edge — stored alongside the queued node.
+      const arrivePort = (id === fixture.id) ? null : queuedPortAt.get(id);
+      for (const { edge, otherId, portHere } of neighbors) {
         if (edge.type !== role) continue; // role-restricted (no pump-crossing)
+        // valve3 port barrier: if we're mid-trace at a valve3, only follow
+        // edges whose port at this valve is compatible with the port we
+        // arrived on. (Prevents flow leaking from the A branch into the B
+        // branch through the valve body.)
+        if (currentItem && currentItem.type === 'valve3' && id !== fixture.id) {
+          if (!valve3PortsConnected(arrivePort, portHere)) continue;
+        }
         const other = itemById[otherId];
         // Don't step into an edge that leads to ANOTHER source fixture: that
         // edge belongs to that fixture's territory, not ours. (We still want
@@ -1876,6 +1904,9 @@ function computePipeSourceMap() {
         if (!other) continue;
         // Stop expanding at pumps (hard hydraulic barrier).
         if (other.type === 'pump') continue;
+        // Record which port of `other` we arrived on (for valve3 routing).
+        const otherPort = (edge.from === id) ? (edge.toPort || '') : (edge.fromPort || '');
+        queuedPortAt.set(otherId, otherPort);
         // Otherwise (tee, manifold, valve, filter, heater) keep going.
         queue.push(otherId);
       }
