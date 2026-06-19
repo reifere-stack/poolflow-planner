@@ -6040,10 +6040,15 @@ function _wizFinalize() {
   if (wantSpa  && !spaBody)  spaBody  = addItem('spa',  { x: 320, y: 220, label: 'Spa', relation: 'pool' });
   const bodyOf = (b) => (b === 'spa' ? spaBody : poolBody);
 
-  // Suction sources \u2014 stamped with body assignment
+  // Suction sources \u2014 stamped with body assignment.
+  // Body-aware label: a Spa-bound "Main Drain" becomes "Spa Main Drain"; a pool-bound
+  // "Main Drain" stays "Main Drain" (kept short since pool is the default body).
   const srcItems = _wizState.sources.map((s, i) => {
-    const body = bodyOf(s.body || 'pool');
-    const item = addItem(s.type, { x: baseX - 800, y: padY + i * 120, label: s.label });
+    const bodyName = s.body || 'pool';
+    const body = bodyOf(bodyName);
+    let lbl = s.label || '';
+    if (bodyName === 'spa' && !/^Spa\b/i.test(lbl)) lbl = `Spa ${lbl}`;
+    const item = addItem(s.type, { x: baseX - 800, y: padY + i * 120, label: _uniqLabel(lbl) });
     if (body) {
       item.bodyId = body.id;
       item.relation = body.type;
@@ -6083,10 +6088,15 @@ function _wizFinalize() {
     prev = eq; prevPort = '';
   });
 
-  // Destinations \u2014 stamped with body assignment
+  // Destinations \u2014 stamped with body assignment.
+  // Rewrite labels so a Spa-bound "Pool Return" becomes "Spa Return".
   const dstItems = _wizState.destinations.map((d, i) => {
-    const body = bodyOf(d.body || (d.type === 'jet' ? 'spa' : 'pool'));
-    const item = addItem(d.type, { x: baseX + 1400, y: padY + i * 120, label: d.label });
+    const bodyName = d.body || (d.type === 'jet' ? 'spa' : 'pool');
+    const body = bodyOf(bodyName);
+    // Body-aware default label: replace 'Pool ' prefix with body name when relevant.
+    let lbl = d.label || '';
+    if (bodyName === 'spa' && /^Pool /.test(lbl)) lbl = lbl.replace(/^Pool /, 'Spa ');
+    const item = addItem(d.type, { x: baseX + 1400, y: padY + i * 120, label: _uniqLabel(lbl) });
     if (body) {
       item.bodyId = body.id;
       item.relation = body.type;
