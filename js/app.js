@@ -5029,8 +5029,8 @@ renderFlows = function renderFlowsTree() {
   if (!cards.length) {
     host.innerHTML = `
       <div class="flows-empty">
-        <p><strong>No pumps yet</strong></p>
-        <p>Add a pump on the Diagram tab and connect fixtures to it. Each pump shows here as its own flow.</p>
+        <p><strong>No flows yet</strong></p>
+        <p>Tap <strong>+ Add Flow</strong> below to build a pump flow step-by-step \u2014 suction sources, equipment, returns, and bodies, all from here.</p>
       </div>`;
     return;
   }
@@ -5217,6 +5217,7 @@ function flowsDeletePumpCard(pump) {
       padding:0;
     }
     .pump-tree .tree-pill .pill-btn-danger { background:var(--error); }
+    .pump-tree .tree-pill .pill-btn-swap { background:var(--accent); font-size:11px; }
     .flow-card.editing .pump-tree .tree-pill .pill-btn { display:inline-flex; }
     /* Simple vertical arrow segment between two stacked pills */
     .pump-tree .tree-arrow-v {
@@ -5662,6 +5663,7 @@ _psRenderPill = function _psRenderPillExt(item, flowId, opts) {
         <span class="pill-icon">${icon}</span>
         <span class="pill-label" ${editing && renamable ? `data-act="rename-pill" data-flow-id="${flowId}" data-item-id="${item.id}"` : ''}>${escapeHtml(label)}</span>
         ${swapHint}
+        ${branchable ? `<button type="button" class="pill-btn pill-btn-swap" data-act="swap-junction" data-flow-id="${flowId}" data-item-id="${item.id}" title="Change junction type">\u21C4</button>` : ''}
         ${branchable ? `<button type="button" class="pill-btn" data-act="branch-step" data-flow-id="${flowId}" data-item-id="${item.id}" title="Add branch">+</button>` : ''}
         ${removable ? `<button type="button" class="pill-btn pill-btn-danger" data-act="remove-tree-step" data-flow-id="${flowId}" data-item-id="${item.id}" title="Remove">\u2715</button>` : ''}
       </div>
@@ -5772,9 +5774,11 @@ const _WIZ_RET_TYPES = [
 const _wizState = {
   step: 0,
   pumpLabel: 'Pool Flow',
-  sources: [],      // [{type, label}]
-  equipment: [],    // [{type, label}] in order
-  destinations: [], // [{type, label}]
+  sources: [],         // [{type, label, body}]   body: 'pool' | 'spa'
+  equipment: [],       // [{type, label}] in order
+  destinations: [],    // [{type, label, body}]
+  sucJunction: 'tee',  // 'tee' | 'valve3' | 'manifold' \u2014 used when 2+ sources
+  retJunction: 'tee',  // same, for destinations
 };
 
 function _wizReset() {
@@ -5783,7 +5787,19 @@ function _wizReset() {
   _wizState.sources = [];
   _wizState.equipment = [];
   _wizState.destinations = [];
+  _wizState.sucJunction = 'tee';
+  _wizState.retJunction = 'tee';
 }
+
+const _WIZ_JUNCTION_OPTIONS = [
+  { type: 'tee',      label: 'Tee',        sub: 'passive split' },
+  { type: 'valve3',   label: '3-Way Valve', sub: 'select one side' },
+  { type: 'manifold', label: 'Manifold',   sub: '3+ legs' },
+];
+const _WIZ_JUNCTION_LABELS = { tee: 'Suction Tee', valve3: 'Suction Valve', manifold: 'Suction Manifold' };
+const _WIZ_RET_JUNCTION_LABELS = { tee: 'Return Tee', valve3: 'Return Valve', manifold: 'Return Manifold' };
+// Small helper so we don't depend on environment Object.values shimming.
+function _Object_values(obj) { return Object.keys(obj).map(k => obj[k]); }
 
 function openAddFlowWizard() {
   _wizReset();
@@ -5832,20 +5848,37 @@ function _wizRenderStep0() {
 }
 
 function _wizRenderStep1() {
-  const selectedHtml = _wizState.sources.map((s, i) => `
-    <div class="wiz-chip">
-      <span>${escapeHtml(s.label)}</span>
-      <button type="button" data-wiz-remove-source="${i}" aria-label="Remove">\u2715</button>
-    </div>`).join('') || `<div style="color:var(--muted); font-size:12px;">No sources yet \u2014 add at least one below.</div>`;
+  const selectedHtml = _wizState.sources.map((s, i) => {
+    const body = s.body || 'pool';
+    return `
+    <div class="wiz-chip" style="flex-direction:column; align-items:stretch; gap:4px; min-width:0; padding:8px;">
+      <div style="display:flex; justify-content:space-between; align-items:center; gap:6px;">
+        <span style="font-weight:600; font-size:13px;">${escapeHtml(s.label)}</span>
+        <button type="button" data-wiz-remove-source="${i}" aria-label="Remove" style="background:none; border:none; cursor:pointer; color:var(--muted); font-size:14px;">\u2715</button>
+      </div>
+      <div style="display:flex; gap:4px; font-size:11px;">
+        <button type="button" class="btn ${body==='pool'?'primary':''}" data-wiz-src-body="${i}" data-body="pool" style="padding:3px 8px; font-size:11px; flex:1;">Pool</button>
+        <button type="button" class="btn ${body==='spa'?'primary':''}"  data-wiz-src-body="${i}" data-body="spa"  style="padding:3px 8px; font-size:11px; flex:1;">Spa</button>
+      </div>
+    </div>`;
+  }).join('') || `<div style="color:var(--muted); font-size:12px; grid-column:1 / -1; padding:6px;">No sources yet \u2014 add at least one below.</div>`;
+
+  // Junction selector \u2014 only when 2+ sources
+  const junctionHtml = _wizState.sources.length >= 2 ? `
+    <div style="font-weight:600; font-size:12px; color:var(--muted); margin:12px 0 4px; text-transform:uppercase; letter-spacing:.04em;">How do the sources join?</div>
+    <div style="display:grid; grid-template-columns:repeat(3,1fr); gap:6px;">
+      ${_WIZ_JUNCTION_OPTIONS.map(j => `<button type="button" class="btn ${_wizState.sucJunction === j.type ? 'primary' : ''}" data-wiz-suc-junction="${j.type}" style="display:flex; flex-direction:column; gap:2px; padding:8px 6px; line-height:1.2;"><span style="font-weight:600;">${escapeHtml(j.label)}</span><span style="font-size:10px; opacity:.75;">${escapeHtml(j.sub)}</span></button>`).join('')}
+    </div>` : '';
 
   modalContent.innerHTML = `
     <h3>New Flow \u00b7 Step 2 of 4</h3>
-    <p style="color:var(--muted); font-size:13px;">Where does water come <strong>from</strong>? Add one or more suction sources. Multiple sources will share a Tee automatically.</p>
-    <div id="wiz-source-list" class="wiz-chips" style="margin:8px 0;">${selectedHtml}</div>
+    <p style="color:var(--muted); font-size:13px;">Where does water come <strong>from</strong>? Add suction sources. Each can be assigned to Pool or Spa.</p>
+    <div id="wiz-source-list" style="margin:8px 0; display:grid; grid-template-columns:repeat(2,1fr); gap:8px;">${selectedHtml}</div>
     <div style="font-weight:600; font-size:12px; color:var(--muted); margin:8px 0 4px; text-transform:uppercase; letter-spacing:.04em;">Add source</div>
     <div style="display:grid; grid-template-columns:repeat(2,1fr); gap:8px;">
       ${_WIZ_SUC_TYPES.map(t => `<button type="button" class="btn" data-wiz-add-source="${t.type}">${escapeHtml(t.label)}</button>`).join('')}
     </div>
+    ${junctionHtml}
     ${_wizFooter('\u2190 Back', 'Next \u2192', _wizState.sources.length === 0)}
   `;
   $('wiz-cancel').onclick = closeModal;
@@ -5857,7 +5890,7 @@ function _wizRenderStep1() {
       const def = _WIZ_SUC_TYPES.find(x => x.type === type);
       const count = _wizState.sources.filter(s => s.type === type).length + 1;
       const label = count === 1 ? def.label : `${def.label} ${count}`;
-      _wizState.sources.push({ type, label });
+      _wizState.sources.push({ type, label, body: 'pool' });
       _wizRender();
     };
   });
@@ -5866,6 +5899,17 @@ function _wizRenderStep1() {
       const idx = parseInt(b.getAttribute('data-wiz-remove-source'), 10);
       _wizState.sources.splice(idx, 1); _wizRender();
     };
+  });
+  modalContent.querySelectorAll('[data-wiz-src-body]').forEach(b => {
+    b.onclick = () => {
+      const idx = parseInt(b.getAttribute('data-wiz-src-body'), 10);
+      const body = b.getAttribute('data-body');
+      if (_wizState.sources[idx]) _wizState.sources[idx].body = body;
+      _wizRender();
+    };
+  });
+  modalContent.querySelectorAll('[data-wiz-suc-junction]').forEach(b => {
+    b.onclick = () => { _wizState.sucJunction = b.getAttribute('data-wiz-suc-junction'); _wizRender(); };
   });
 }
 
@@ -5906,20 +5950,38 @@ function _wizRenderStep2() {
 }
 
 function _wizRenderStep3() {
-  const dstHtml = _wizState.destinations.map((d, i) => `
-    <div class="wiz-chip">
-      <span>${escapeHtml(d.label)}</span>
-      <button type="button" data-wiz-remove-dst="${i}" aria-label="Remove">\u2715</button>
-    </div>`).join('') || `<div style="color:var(--muted); font-size:12px;">No destinations yet \u2014 add at least one below.</div>`;
+  const dstHtml = _wizState.destinations.map((d, i) => {
+    // Default body: Spa Jets default to spa, others default to pool unless overridden.
+    let body = d.body;
+    if (!body) body = (d.type === 'jet') ? 'spa' : 'pool';
+    return `
+    <div class="wiz-chip" style="flex-direction:column; align-items:stretch; gap:4px; min-width:0; padding:8px;">
+      <div style="display:flex; justify-content:space-between; align-items:center; gap:6px;">
+        <span style="font-weight:600; font-size:13px;">${escapeHtml(d.label)}</span>
+        <button type="button" data-wiz-remove-dst="${i}" aria-label="Remove" style="background:none; border:none; cursor:pointer; color:var(--muted); font-size:14px;">\u2715</button>
+      </div>
+      <div style="display:flex; gap:4px; font-size:11px;">
+        <button type="button" class="btn ${body==='pool'?'primary':''}" data-wiz-dst-body="${i}" data-body="pool" style="padding:3px 8px; font-size:11px; flex:1;">Pool</button>
+        <button type="button" class="btn ${body==='spa'?'primary':''}"  data-wiz-dst-body="${i}" data-body="spa"  style="padding:3px 8px; font-size:11px; flex:1;">Spa</button>
+      </div>
+    </div>`;
+  }).join('') || `<div style="color:var(--muted); font-size:12px; grid-column:1 / -1; padding:6px;">No destinations yet \u2014 add at least one below.</div>`;
+
+  const junctionHtml = _wizState.destinations.length >= 2 ? `
+    <div style="font-weight:600; font-size:12px; color:var(--muted); margin:12px 0 4px; text-transform:uppercase; letter-spacing:.04em;">How do the returns split?</div>
+    <div style="display:grid; grid-template-columns:repeat(3,1fr); gap:6px;">
+      ${_WIZ_JUNCTION_OPTIONS.map(j => `<button type="button" class="btn ${_wizState.retJunction === j.type ? 'primary' : ''}" data-wiz-ret-junction="${j.type}" style="display:flex; flex-direction:column; gap:2px; padding:8px 6px; line-height:1.2;"><span style="font-weight:600;">${escapeHtml(j.label)}</span><span style="font-size:10px; opacity:.75;">${escapeHtml(j.sub)}</span></button>`).join('')}
+    </div>` : '';
 
   modalContent.innerHTML = `
     <h3>New Flow \u00b7 Step 4 of 4</h3>
-    <p style="color:var(--muted); font-size:13px;">Where does water come <strong>out</strong>? Add one or more return destinations. Multiple destinations will share a Tee automatically.</p>
-    <div id="wiz-dst-list" class="wiz-chips" style="margin:8px 0;">${dstHtml}</div>
+    <p style="color:var(--muted); font-size:13px;">Where does water come <strong>out</strong>? Add return destinations. Each can be assigned to Pool or Spa.</p>
+    <div id="wiz-dst-list" style="margin:8px 0; display:grid; grid-template-columns:repeat(2,1fr); gap:8px;">${dstHtml}</div>
     <div style="font-weight:600; font-size:12px; color:var(--muted); margin:8px 0 4px; text-transform:uppercase; letter-spacing:.04em;">Add destination</div>
     <div style="display:grid; grid-template-columns:repeat(2,1fr); gap:8px;">
       ${_WIZ_RET_TYPES.map(t => `<button type="button" class="btn" data-wiz-add-dst="${t.type}">${escapeHtml(t.label)}</button>`).join('')}
     </div>
+    ${junctionHtml}
     ${_wizFooter('\u2190 Back', 'Create flow', _wizState.destinations.length === 0)}
   `;
   $('wiz-cancel').onclick = closeModal;
@@ -5931,7 +5993,8 @@ function _wizRenderStep3() {
       const def = _WIZ_RET_TYPES.find(x => x.type === type);
       const count = _wizState.destinations.filter(s => s.type === type).length + 1;
       const label = count === 1 ? def.label : `${def.label} ${count}`;
-      _wizState.destinations.push({ type, label });
+      const defaultBody = (type === 'jet') ? 'spa' : 'pool';
+      _wizState.destinations.push({ type, label, body: defaultBody });
       _wizRender();
     };
   });
@@ -5941,6 +6004,17 @@ function _wizRenderStep3() {
       _wizState.destinations.splice(idx, 1); _wizRender();
     };
   });
+  modalContent.querySelectorAll('[data-wiz-dst-body]').forEach(b => {
+    b.onclick = () => {
+      const idx = parseInt(b.getAttribute('data-wiz-dst-body'), 10);
+      const body = b.getAttribute('data-body');
+      if (_wizState.destinations[idx]) _wizState.destinations[idx].body = body;
+      _wizRender();
+    };
+  });
+  modalContent.querySelectorAll('[data-wiz-ret-junction]').forEach(b => {
+    b.onclick = () => { _wizState.retJunction = b.getAttribute('data-wiz-ret-junction'); _wizRender(); };
+  });
 }
 
 // Materialize: create real items + edges from the wizard config.
@@ -5949,17 +6023,44 @@ function _wizFinalize() {
   const baseX = 200, baseY = 200;
   const stepX = 160, padY  = 360;
 
-  // Pump
-  const pump = addItem('pump', { x: baseX + (_wizState.equipment.length ? 0 : 0), y: baseY, label: _wizState.pumpLabel.replace(/\s*flow$/i, '').trim() || 'Pump' });
+  // Pump label: use the user-typed flow name as the pump label so it reads naturally
+  // in the tree ("Pool Flow Pump" / "Spa Jets Pump"). Avoid stripping "flow" \u2014
+  // that produced confusing pump pills like "Pool" that looked like a body.
+  const rawName = (_wizState.pumpLabel || '').trim();
+  const pumpLabel = rawName ? (/(pump)$/i.test(rawName) ? rawName : `${rawName} Pump`) : 'Pump';
+  const pump = addItem('pump', { x: baseX + (_wizState.equipment.length ? 0 : 0), y: baseY, label: pumpLabel });
 
-  // Suction sources
-  const srcItems = _wizState.sources.map((s, i) => addItem(s.type, { x: baseX - 800, y: padY + i * 120, label: s.label }));
+  // Ensure Pool and Spa bodies exist (only the ones referenced by sources/destinations).
+  // We re-use an existing pool/spa by type rather than creating duplicates.
+  const wantPool = _wizState.sources.some(s => (s.body||'pool') === 'pool') || _wizState.destinations.some(d => (d.body||'pool') === 'pool');
+  const wantSpa  = _wizState.sources.some(s => s.body === 'spa') || _wizState.destinations.some(d => d.body === 'spa');
+  let poolBody = state.items.find(i => i.type === 'pool');
+  let spaBody  = state.items.find(i => i.type === 'spa');
+  if (wantPool && !poolBody) poolBody = addItem('pool', { x: 60, y: 420, label: 'Pool' });
+  if (wantSpa  && !spaBody)  spaBody  = addItem('spa',  { x: 320, y: 220, label: 'Spa', relation: 'pool' });
+  const bodyOf = (b) => (b === 'spa' ? spaBody : poolBody);
+
+  // Suction sources \u2014 stamped with body assignment
+  const srcItems = _wizState.sources.map((s, i) => {
+    const body = bodyOf(s.body || 'pool');
+    const item = addItem(s.type, { x: baseX - 800, y: padY + i * 120, label: s.label });
+    if (body) {
+      item.bodyId = body.id;
+      item.relation = body.type;
+      item.relationLocked = true;
+      item.relationAuto = false;
+    }
+    return item;
+  });
+
+  // Determine suction joiner type
   let sucJoiner = null;
   if (srcItems.length === 1) {
     sucJoiner = srcItems[0];
   } else {
-    // Combine via a Tee/manifold
-    sucJoiner = addItem('tee', { x: baseX - 400, y: baseY + 100, label: 'Suction Tee' });
+    const jt = _wizState.sucJunction || 'tee';
+    const jLabel = _WIZ_JUNCTION_LABELS[jt] || 'Suction Tee';
+    sucJoiner = addItem(jt, { x: baseX - 400, y: baseY + 100, label: jLabel, valveState: jt === 'valve3' ? 'shared' : '' });
     for (const s of srcItems) {
       state.edges.push({ id: uid(), from: s.id, to: sucJoiner.id, type: 'suction', size: '', label: `${s.label} \u2192 ${sucJoiner.label}`, active: false, blocked: false, fromPort: '', toPort: '' });
     }
@@ -5971,7 +6072,7 @@ function _wizFinalize() {
   let prevPort = 'discharge';
   const eqItems = [];
   _wizState.equipment.forEach((e, i) => {
-    const eq = addItem(e.type, { x: baseX + 200 + i * stepX, y: baseY, label: e.label });
+    const eq = addItem(e.type, { x: baseX + 200 + i * stepX, y: baseY, label: e.label, valveState: e.type === 'valve3' ? 'shared' : '' });
     eqItems.push(eq);
     state.edges.push({
       id: uid(), from: prev.id, to: eq.id, type: 'return', size: '',
@@ -5982,24 +6083,47 @@ function _wizFinalize() {
     prev = eq; prevPort = '';
   });
 
-  // Destinations
-  const dstItems = _wizState.destinations.map((d, i) => addItem(d.type, { x: baseX + 1400, y: padY + i * 120, label: d.label }));
-  let retJoiner = null;
+  // Destinations \u2014 stamped with body assignment
+  const dstItems = _wizState.destinations.map((d, i) => {
+    const body = bodyOf(d.body || (d.type === 'jet' ? 'spa' : 'pool'));
+    const item = addItem(d.type, { x: baseX + 1400, y: padY + i * 120, label: d.label });
+    if (body) {
+      item.bodyId = body.id;
+      item.relation = body.type;
+      item.relationLocked = true;
+      item.relationAuto = false;
+    }
+    return item;
+  });
+
+  // If the last equipment item is itself a junction type, use it as the return joiner
+  // (avoids creating two splitters in series when the user explicitly added a 3-Way Valve
+  // or Manifold in the equipment step).
+  const JOINER_TYPES = new Set(['tee', 'manifold', 'valve3']);
+  const lastEq = eqItems.length ? eqItems[eqItems.length - 1] : null;
+  const lastEqIsJoiner = lastEq && JOINER_TYPES.has(lastEq.type);
+
   if (dstItems.length === 1) {
-    retJoiner = dstItems[0];
-    state.edges.push({ id: uid(), from: prev.id, to: retJoiner.id, type: 'return', size: '', label: `${prev.label} \u2192 ${retJoiner.label}`, active: false, blocked: false, fromPort: prevPort, toPort: '' });
-  } else {
-    const retTee = addItem('tee', { x: baseX + 1100, y: baseY + 100, label: 'Return Tee' });
-    state.edges.push({ id: uid(), from: prev.id, to: retTee.id, type: 'return', size: '', label: `${prev.label} \u2192 ${retTee.label}`, active: false, blocked: false, fromPort: prevPort, toPort: '' });
+    state.edges.push({ id: uid(), from: prev.id, to: dstItems[0].id, type: 'return', size: '', label: `${prev.label} \u2192 ${dstItems[0].label}`, active: false, blocked: false, fromPort: prevPort, toPort: '' });
+  } else if (lastEqIsJoiner) {
+    // The last-added equipment already serves as the splitter \u2014 just hang destinations off it.
     for (const d of dstItems) {
-      state.edges.push({ id: uid(), from: retTee.id, to: d.id, type: 'return', size: '', label: `${retTee.label} \u2192 ${d.label}`, active: false, blocked: false, fromPort: '', toPort: '' });
+      state.edges.push({ id: uid(), from: lastEq.id, to: d.id, type: 'return', size: '', label: `${lastEq.label} \u2192 ${d.label}`, active: false, blocked: false, fromPort: '', toPort: '' });
+    }
+  } else {
+    const jt = _wizState.retJunction || 'tee';
+    const jLabel = _WIZ_RET_JUNCTION_LABELS[jt] || 'Return Tee';
+    const retJun = addItem(jt, { x: baseX + 1100, y: baseY + 100, label: jLabel, valveState: jt === 'valve3' ? 'shared' : '' });
+    state.edges.push({ id: uid(), from: prev.id, to: retJun.id, type: 'return', size: '', label: `${prev.label} \u2192 ${retJun.label}`, active: false, blocked: false, fromPort: prevPort, toPort: '' });
+    for (const d of dstItems) {
+      state.edges.push({ id: uid(), from: retJun.id, to: d.id, type: 'return', size: '', label: `${retJun.label} \u2192 ${d.label}`, active: false, blocked: false, fromPort: '', toPort: '' });
     }
   }
 
-  // Make sure there's a Pool body if we have any pool-y fixtures
-  if (!state.items.some(i => i.type === 'pool')) {
-    addItem('pool', { x: 60, y: 420, label: 'Pool' });
-  }
+  // Connect destinations to their assigned body via return edges (so the tree
+  // ends in the body pill and bodies appear in the spillover picker).
+  // Pool bodies are placed after fixtures; connections are implied by bodyId on the leaf
+  // pills, which is what the tree renderer reads.
 
   migratePortsOnLoad(state);
   closeModal();
@@ -6191,6 +6315,39 @@ function flowsOpenTreePicker(role, attachToItem, opts) {
         titleOverride: `Insert ${directionLabel} ${escapeHtml(_psPillLabel(anchor))}`,
         onPick: (type, label) => _insertRelativeTo(anchor, side, directionLabel, type, label),
       });
+      return;
+    }
+    if (act === 'swap-junction') {
+      const item = state.items.find(i => i.id === itemId);
+      if (!item || !_PSBRANCH_TYPES.has(item.type)) return;
+      // Determine side: if any incoming edges to this item are 'suction', it's on the suction side.
+      // If any outgoing edges are 'return', it's on the return side. Default to return.
+      let isSuctionSide = false;
+      for (const e of state.edges) {
+        if (e.to === item.id && e.type === 'suction') { isSuctionSide = true; break; }
+        if (e.from === item.id && e.type === 'suction' && e.to) {
+          // upstream of pump on suction side
+          isSuctionSide = true; break;
+        }
+      }
+      // Cycle: tee -> valve3 -> manifold -> tee
+      const cycleOrder = ['tee', 'valve3', 'manifold'];
+      const curIdx = cycleOrder.indexOf(item.type);
+      const nextType = cycleOrder[(curIdx + 1) % cycleOrder.length];
+      const labelMap = isSuctionSide ? _WIZ_JUNCTION_LABELS : _WIZ_RET_JUNCTION_LABELS;
+      pushUndo();
+      item.type = nextType;
+      // Only update label if it matches a known auto-generated junction label
+      // (avoid overwriting user-renamed labels).
+      const autoLabels = new Set([
+        ..._Object_values(_WIZ_JUNCTION_LABELS),
+        ..._Object_values(_WIZ_RET_JUNCTION_LABELS),
+      ]);
+      if (autoLabels.has(item.label)) {
+        item.label = labelMap[nextType] || labelMap.tee;
+      }
+      persist();
+      _flowsRerenderAll();
       return;
     }
   });
