@@ -5208,6 +5208,24 @@ function flowsDeletePumpCard(pump) {
     .pump-tree .tree-empty {
       font-size:12px; color:var(--muted); padding:6px 0;
     }
+    /* Ghost-branch slot: dashed pill in a fork col, opens picker on click. */
+    .pump-tree .tree-fork-col-ghost { opacity:0.95; }
+    .pump-tree .ghost-branch {
+      display:inline-flex; align-items:center; justify-content:center;
+      padding:6px 12px; min-height:34px;
+      border:1.5px dashed var(--primary, #4c6ef5);
+      background:transparent;
+      color:var(--primary, #4c6ef5);
+      border-radius:999px;
+      font-size:12px; font-weight:600;
+      cursor:pointer; white-space:nowrap;
+      transition:background 0.12s ease, color 0.12s ease;
+    }
+    .pump-tree .ghost-branch:hover {
+      background:var(--primary, #4c6ef5);
+      color:#fff;
+    }
+    .pump-tree .ghost-branch:focus { outline:2px solid var(--primary, #4c6ef5); outline-offset:2px; }
   `;
   const style = document.createElement('style');
   style.textContent = css;
@@ -5298,18 +5316,65 @@ function _psCycleFixtureBody(item) {
 //    fixtures.
 //  - Show a "+ Add sibling" button under any leaf in edit mode.
 
+// Decide whether a junction node needs an additional "ghost branch" slot rendered.
+// Tees & 3-way valves require exactly 2 outflows; manifolds need at least 2.
+function _psNeedsExtraBranch(item, kidCount) {
+  if (!item) return false;
+  if (item.type === 'tee')      return kidCount < 2;
+  if (item.type === 'valve3')   return kidCount < 2;
+  if (item.type === 'manifold') return kidCount < 2;
+  return false;
+}
+
+// Build a ghost-branch column HTML (dashed "+ Add branch" pill) that re-uses
+// the existing branch-step picker tied to the junction id.
+function _psGhostBranchCol(flowId, junctionId, side) {
+  const sideAttr = side ? ` data-side="${side}"` : '';
+  return `<div class="tree-fork-col tree-fork-col-ghost">
+            <div class="tree-fork-stem"></div>
+            <button type="button" class="ghost-branch" data-act="branch-step" data-flow-id="${flowId}" data-item-id="${junctionId}"${sideAttr}>+ Add branch</button>
+          </div>`;
+}
+
 const _psRenderReturnSubtreeOriginal = _psRenderReturnSubtree;
 _psRenderReturnSubtree = function _psRenderReturnSubtreeExt(treeNode, flowId) {
   if (!treeNode) return '';
   const item = treeNode.item;
   const kids = treeNode.children || [];
   const editing = _flowsEditState.editingFlowId === flowId;
+  const needsGhost = editing && _psNeedsExtraBranch(item, kids.length);
 
   // Recursive child rendering (same shape as the original).
   let kidsHtml = '';
-  if (kids.length === 1) {
+  if (needsGhost && kids.length === 1) {
+    // Upgrade single-child layout into a fork with one real branch + ghost slot.
+    kidsHtml = `
+      <div class="tree-arrow-v"></div>
+      <div class="tree-fork tree-fork-down">
+        <div class="tree-fork-line"></div>
+        <div class="tree-fork-cols">
+          <div class="tree-fork-col">
+            <div class="tree-fork-stem"></div>
+            ${_psRenderReturnSubtree(kids[0].node, flowId)}
+          </div>
+          ${_psGhostBranchCol(flowId, item.id, 'return')}
+        </div>
+      </div>`;
+  } else if (needsGhost && kids.length === 0) {
+    // Junction with NO children yet — show two ghost slots so user fills both.
+    kidsHtml = `
+      <div class="tree-arrow-v"></div>
+      <div class="tree-fork tree-fork-down">
+        <div class="tree-fork-line"></div>
+        <div class="tree-fork-cols">
+          ${_psGhostBranchCol(flowId, item.id, 'return')}
+          ${_psGhostBranchCol(flowId, item.id, 'return')}
+        </div>
+      </div>`;
+  } else if (kids.length === 1) {
     kidsHtml = `<div class="tree-arrow-v"></div>${_psRenderReturnSubtree(kids[0].node, flowId)}`;
   } else if (kids.length > 1) {
+    const ghostCol = needsGhost ? _psGhostBranchCol(flowId, item.id, 'return') : '';
     kidsHtml = `
       <div class="tree-arrow-v"></div>
       <div class="tree-fork tree-fork-down">
@@ -5320,6 +5385,7 @@ _psRenderReturnSubtree = function _psRenderReturnSubtreeExt(treeNode, flowId) {
               <div class="tree-fork-stem"></div>
               ${_psRenderReturnSubtree(c.node, flowId)}
             </div>`).join('')}
+          ${ghostCol}
         </div>
       </div>`;
   }
@@ -5347,11 +5413,43 @@ _psRenderSuctionSubtree = function _psRenderSuctionSubtreeExt(treeNode, flowId, 
   const item = treeNode.item;
   const kids = treeNode.children || [];
   const editing = _flowsEditState.editingFlowId === flowId;
+  const needsGhost = editing && !isRoot && _psNeedsExtraBranch(item, kids.length);
+
+  // Ghost-branch col for SUCTION side: stem BELOW the ghost button so it visually
+  // feeds into the fork-line directly above the junction pill.
+  const ghostSucCol = (jid) => `<div class="tree-fork-col tree-fork-col-ghost">
+            <button type="button" class="ghost-branch" data-act="branch-step" data-flow-id="${flowId}" data-item-id="${jid}" data-side="suction">+ Add branch</button>
+            <div class="tree-fork-stem"></div>
+          </div>`;
 
   let kidsHtml = '';
-  if (kids.length === 1) {
+  if (needsGhost && kids.length === 1) {
+    kidsHtml = `
+      <div class="tree-fork tree-fork-up">
+        <div class="tree-fork-cols">
+          <div class="tree-fork-col">
+            ${_psRenderSuctionSubtree(kids[0].node, flowId, false)}
+            <div class="tree-fork-stem"></div>
+          </div>
+          ${ghostSucCol(item.id)}
+        </div>
+        <div class="tree-fork-line"></div>
+      </div>
+      <div class="tree-arrow-v"></div>`;
+  } else if (needsGhost && kids.length === 0) {
+    kidsHtml = `
+      <div class="tree-fork tree-fork-up">
+        <div class="tree-fork-cols">
+          ${ghostSucCol(item.id)}
+          ${ghostSucCol(item.id)}
+        </div>
+        <div class="tree-fork-line"></div>
+      </div>
+      <div class="tree-arrow-v"></div>`;
+  } else if (kids.length === 1) {
     kidsHtml = `${_psRenderSuctionSubtree(kids[0].node, flowId, false)}<div class="tree-arrow-v"></div>`;
   } else if (kids.length > 1) {
+    const ghostCol = needsGhost ? ghostSucCol(item.id) : '';
     kidsHtml = `
       <div class="tree-fork tree-fork-up">
         <div class="tree-fork-cols">
@@ -5360,6 +5458,7 @@ _psRenderSuctionSubtree = function _psRenderSuctionSubtreeExt(treeNode, flowId, 
               ${_psRenderSuctionSubtree(c.node, flowId, false)}
               <div class="tree-fork-stem"></div>
             </div>`).join('')}
+          ${ghostCol}
         </div>
         <div class="tree-fork-line"></div>
       </div>
@@ -6311,6 +6410,296 @@ function _insertEquipmentAfterPump(pump, type, label) {
   document.head.appendChild(style);
 })();
 
+
+// ==================================================================
+// ============== SPILLOVER LINKS ON FLOWS TAB ======================
+// ==================================================================
+//
+// Lets the user declare "this body spills into that body" right from the
+// Flows tab without touching the Diagram. Reuses the existing 'spillover'
+// edge type, so BOM, validation, PDF export, and the Diagram tab all stay
+// consistent.
+//
+// UI surfaces:
+//  1. Below every Pool/Spa closure pill, render a small dashed purple line
+//     "\u21B3 spills to <other body>" when a spillover edge exists from that
+//     body. In edit mode the line is clickable to change/remove the link.
+//  2. A top-of-tab "Spillover Links" card that lists all links as chips and
+//     offers a "+ Add link" button - useful when the user wants to set up
+//     the spillover before building any flow.
+
+function _psGetSpilloverTarget(body) {
+  if (!body) return null;
+  const e = state.edges.find(x => x.from === body.id && x.type === 'spillover' && !x.blocked);
+  if (!e) return null;
+  return state.items.find(i => i.id === e.to) || null;
+}
+
+function _psAllBodies() {
+  return state.items.filter(i => i.type === 'pool' || i.type === 'spa');
+}
+
+// Ensure both bodies exist; create the missing one near the existing one.
+function _psEnsureBody(type) {
+  let body = state.items.find(i => i.type === type);
+  if (body) return body;
+  const other = state.items.find(i => i.type === (type === 'pool' ? 'spa' : 'pool'));
+  const label = type === 'pool' ? 'Pool' : 'Spa';
+  if (other) {
+    body = addItem(type, { x: other.x + other.w + 40, y: other.y, label });
+  } else {
+    body = addItem(type, { x: 60, y: 420, label });
+  }
+  return body;
+}
+
+function _psSetSpillover(fromBody, toBody) {
+  if (!fromBody) return;
+  pushUndo();
+  // Drop any existing spillover originating at fromBody.
+  state.edges = state.edges.filter(e => !(e.from === fromBody.id && e.type === 'spillover'));
+  if (toBody && toBody.id !== fromBody.id) {
+    state.edges.push({
+      id: uid(),
+      from: fromBody.id,
+      to: toBody.id,
+      type: 'spillover',
+      size: '2.5"',
+      label: `${fromBody.label} \u2192 ${toBody.label} (spillover)`,
+      active: false,
+      blocked: false,
+    });
+  }
+  persist();
+  _flowsRerenderAll();
+}
+
+// Open a small picker letting the user pick the target body (or None).
+function _psOpenSpilloverPicker(fromBody) {
+  if (typeof modalContent === 'undefined' || !modalContent) return;
+  const candidates = [];
+  ['pool', 'spa'].forEach(t => {
+    if (fromBody && fromBody.type === t) return;
+    const existing = state.items.find(i => i.type === t);
+    candidates.push({
+      type: t,
+      label: existing ? existing.label : (t === 'pool' ? 'Pool' : 'Spa'),
+      isNew: !existing,
+      id: existing ? existing.id : null,
+    });
+  });
+  const current = _psGetSpilloverTarget(fromBody);
+  modalContent.innerHTML = `
+    <h3>${escapeHtml(fromBody.label || 'Body')} spills into\u2026</h3>
+    <p style="color:var(--muted); font-size:13px; margin-top:6px;">Gravity spillover \u2014 water cascades from this body into the chosen body when the level rises above the spillover.</p>
+    <div style="display:flex; flex-direction:column; gap:8px; margin-top:12px;">
+      ${candidates.map(c => `
+        <button type="button" class="btn" data-spill-pick="${c.type}" style="text-align:left;">
+          <span style="font-weight:700;">${escapeHtml(c.label)}</span>${c.isNew ? '<span style="color:var(--muted); font-weight:500; font-size:12px;"> (will be added)</span>' : ''}${current && current.type === c.type ? '<span style="color:var(--primary); font-weight:600; font-size:12px;"> \u2022 current</span>' : ''}
+        </button>`).join('')}
+      <button type="button" class="btn" data-spill-pick="none" style="text-align:left;">
+        <span style="font-weight:700;">No spillover</span>${!current ? '<span style="color:var(--primary); font-weight:600; font-size:12px;"> \u2022 current</span>' : '<span style="color:var(--muted); font-weight:500; font-size:12px;"> (removes existing link)</span>'}
+      </button>
+    </div>
+    <div class="row" style="margin-top:14px; justify-content:flex-end;">
+      <button class="btn" id="spill-cancel">Cancel</button>
+    </div>`;
+  modalBackdrop.classList.add('show');
+  $('spill-cancel').onclick = closeModal;
+  modalContent.querySelectorAll('[data-spill-pick]').forEach(b => {
+    b.onclick = () => {
+      const pick = b.getAttribute('data-spill-pick');
+      if (pick === 'none') {
+        _psSetSpillover(fromBody, null);
+      } else {
+        const target = _psEnsureBody(pick);
+        _psSetSpillover(fromBody, target);
+      }
+      closeModal();
+    };
+  });
+}
+
+// Wrap _psRenderPill again to append a spillover sub-pill under closure pills.
+const _psRenderPillBeforeSpill = _psRenderPill;
+_psRenderPill = function _psRenderPillWithSpill(item, flowId, opts) {
+  opts = opts || {};
+  const base = _psRenderPillBeforeSpill(item, flowId, opts);
+  if (!opts.isClosure) return base;
+  if (item.type !== 'pool' && item.type !== 'spa') return base;
+  // Only render under RETURN-side closure pills so we don't double-show on
+  // suction side (water entering the body is what triggers spillover).
+  if (opts.side === 'suction') return base;
+  const editing = _flowsEditState.editingFlowId === flowId;
+  const target = _psGetSpilloverTarget(item);
+  if (!target && !editing) return base;
+  const label = target
+    ? `\u21B3 spills to ${escapeHtml(target.label || (target.type === 'spa' ? 'Spa' : 'Pool'))}`
+    : '+ link spillover';
+  const actAttr = editing
+    ? ` data-act="spill-link" data-flow-id="${flowId}" data-body-id="${item.id}" role="button" tabindex="0"`
+    : '';
+  const cls = ['spill-link-pill'];
+  if (target) cls.push('has-link');
+  if (editing) cls.push('is-clickable');
+  if (!target && editing) cls.push('is-empty');
+  return base + `<div class="${cls.join(' ')}"${actAttr} title="${editing ? 'Tap to choose spillover destination' : ''}">${label}</div>`;
+};
+
+// Click dispatcher for spillover actions (capture-phase so we don't have to
+// rewire the existing tree-click router).
+document.addEventListener('click', (ev) => {
+  const t = ev.target.closest('[data-act="spill-link"], [data-act="spill-link-add"], [data-act="spill-link-remove"]');
+  if (!t) return;
+  const act = t.getAttribute('data-act');
+  ev.preventDefault();
+  ev.stopPropagation();
+  if (act === 'spill-link') {
+    const bodyId = t.getAttribute('data-body-id');
+    const body = state.items.find(i => i.id === bodyId);
+    if (!body) return;
+    _psOpenSpilloverPicker(body);
+    return;
+  }
+  if (act === 'spill-link-add') {
+    const bodies = _psAllBodies();
+    if (bodies.length === 0) {
+      const pool = _psEnsureBody('pool');
+      persist();
+      _psOpenSpilloverPicker(pool);
+      return;
+    }
+    if (bodies.length === 1) {
+      _psOpenSpilloverPicker(bodies[0]);
+      return;
+    }
+    modalContent.innerHTML = `
+      <h3>Add spillover link</h3>
+      <p style="color:var(--muted); font-size:13px;">Which body spills into the other?</p>
+      <div style="display:flex; flex-direction:column; gap:8px; margin-top:12px;">
+        ${bodies.map(b => `<button type="button" class="btn" data-spill-src="${b.id}" style="text-align:left;"><span style="font-weight:700;">${escapeHtml(b.label || b.type)}</span> spills into\u2026</button>`).join('')}
+      </div>
+      <div class="row" style="margin-top:14px; justify-content:flex-end;">
+        <button class="btn" id="spill-src-cancel">Cancel</button>
+      </div>`;
+    modalBackdrop.classList.add('show');
+    $('spill-src-cancel').onclick = closeModal;
+    modalContent.querySelectorAll('[data-spill-src]').forEach(b => {
+      b.onclick = () => {
+        const src = state.items.find(i => i.id === b.getAttribute('data-spill-src'));
+        if (src) _psOpenSpilloverPicker(src);
+      };
+    });
+    return;
+  }
+  if (act === 'spill-link-remove') {
+    const bodyId = t.getAttribute('data-body-id');
+    const body = state.items.find(i => i.id === bodyId);
+    if (!body) return;
+    _psSetSpillover(body, null);
+    return;
+  }
+}, true);
+
+// Inject the top-of-tab "Spillover Links" summary card on every Flows render.
+const _renderFlowsBeforeSpill = renderFlows;
+renderFlows = function renderFlowsWithSpill() {
+  _renderFlowsBeforeSpill();
+  const host = $('flowsList');
+  if (!host) return;
+  const links = state.edges.filter(e => e.type === 'spillover');
+  const bodies = _psAllBodies();
+  if (!bodies.length && !links.length) return;
+  const chipsHtml = links.map(e => {
+    const a = state.items.find(i => i.id === e.from);
+    const b = state.items.find(i => i.id === e.to);
+    if (!a || !b) return '';
+    return `<span class="spill-chip">
+      <span class="spill-chip-label">${escapeHtml(a.label)} \u2192 ${escapeHtml(b.label)}</span>
+      <button type="button" class="spill-chip-x" data-act="spill-link-remove" data-body-id="${a.id}" aria-label="Remove">\u2715</button>
+    </span>`;
+  }).join('');
+  const panel = document.createElement('div');
+  panel.className = 'spillover-panel';
+  panel.innerHTML = `
+    <div class="spillover-panel-head">
+      <span class="spillover-panel-title">\u21B3 Spillover links</span>
+      <button type="button" class="btn" data-act="spill-link-add">+ Add link</button>
+    </div>
+    ${links.length
+      ? `<div class="spillover-panel-chips">${chipsHtml}</div>`
+      : `<div class="spillover-panel-empty">No spillovers yet. Add one if a body of water overflows into another \u2014 e.g. spa spills into pool.</div>`}
+  `;
+  host.insertBefore(panel, host.firstChild);
+};
+
+// Style the new pieces.
+(function injectSpilloverCss() {
+  const css = `
+    .spill-link-pill {
+      display:inline-flex; align-items:center; gap:6px;
+      margin-top:6px; padding:3px 9px;
+      font-size:11px; font-weight:600;
+      color:var(--pipe-spillover, #7c4dff);
+      border:1px dashed var(--pipe-spillover, #7c4dff);
+      border-radius:999px;
+      background:rgba(124,77,255,0.06);
+      white-space:nowrap; letter-spacing:.01em;
+    }
+    .spill-link-pill.is-empty { opacity:0.7; }
+    .spill-link-pill.is-clickable { cursor:pointer; }
+    .spill-link-pill.is-clickable:hover {
+      background:var(--pipe-spillover, #7c4dff); color:#fff;
+    }
+    .spillover-panel {
+      border:1px solid var(--border);
+      border-left:3px solid var(--pipe-spillover, #7c4dff);
+      background:var(--surface);
+      border-radius:10px;
+      padding:10px 12px;
+      margin-bottom:12px;
+    }
+    .spillover-panel-head {
+      display:flex; align-items:center; justify-content:space-between;
+      gap:8px; margin-bottom:6px;
+    }
+    .spillover-panel-title {
+      font-weight:700; font-size:13px;
+      color:var(--pipe-spillover, #7c4dff);
+    }
+    .spillover-panel-head .btn {
+      padding:4px 10px; font-size:12px;
+    }
+    .spillover-panel-chips {
+      display:flex; flex-wrap:wrap; gap:6px;
+    }
+    .spill-chip {
+      display:inline-flex; align-items:center; gap:4px;
+      padding:4px 4px 4px 10px;
+      border:1px solid var(--pipe-spillover, #7c4dff);
+      background:rgba(124,77,255,0.08);
+      color:var(--pipe-spillover, #7c4dff);
+      border-radius:999px;
+      font-size:12px; font-weight:600;
+    }
+    .spill-chip-x {
+      appearance:none; -webkit-appearance:none;
+      background:transparent; border:0;
+      color:var(--pipe-spillover, #7c4dff);
+      font-size:13px; line-height:1; cursor:pointer;
+      padding:2px 6px; border-radius:999px;
+    }
+    .spill-chip-x:hover {
+      background:var(--pipe-spillover, #7c4dff); color:#fff;
+    }
+    .spillover-panel-empty {
+      font-size:12px; color:var(--muted);
+    }
+  `;
+  const style = document.createElement('style');
+  style.textContent = css;
+  document.head.appendChild(style);
+})();
 
 // Resize
 window.addEventListener('resize', () => { applyTransform(); });
