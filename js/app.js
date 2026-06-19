@@ -1786,34 +1786,50 @@ function isSourceFixture(item) {
   return SUCTION_FIXTURES.has(item.type) || RETURN_FIXTURES.has(item.type);
 }
 
-// BFS-trace from one side of `edge` through pass-through items (pumps,
-// valves, tees, filters, heaters, etc.) and collect every source-fixture
-// type reachable from that side via hydraulic pipes (suction OR return).
-// Returns an array of fixture-type strings (e.g. ['skimmer','drain']).
-function resolvePipeSourcesSide(edge, side, itemById) {
+// BFS-trace from one side of `edge` through pass-through items (tees, valves,
+// filters, heaters, manifolds, etc.) and collect every source-fixture type
+// reachable along edges of the SAME hydraulic role (suction-only or
+// return-only). This is the critical rule: a suction pipe must NEVER walk
+// through a pump to discharge-side fixtures, and vice versa — otherwise a
+// suction line from a skimmer would falsely "see" the spa jets downstream
+// of the pump.
+//
+// `role` = 'suction' or 'return' — must match the edge being traced.
+function resolvePipeSourcesSide(edge, side, itemById, role) {
   const startId = side === 'from' ? edge.from : edge.to;
   const startItem = itemById[startId];
   if (!startItem) return [];
   const found = new Set();
-  if (isSourceFixture(startItem)) found.add(startItem.type);
+  // The starting endpoint counts as a source if it's a matching fixture.
+  if (isSourceFixture(startItem) && fixtureMatchesRole(startItem, role)) {
+    found.add(startItem.type);
+  }
   const visited = new Set([startId]);
   const queue = [startId];
   while (queue.length) {
     const id = queue.shift();
     const item = itemById[id];
     if (!item) continue;
+    // A pump is a hard barrier — it terminates the trace on its current side.
+    // Don't expand neighbors from a pump (except the starting node itself,
+    // which is handled by the edge filter below since we only follow role-
+    // matching edges).
+    if (id !== startId && item.type === 'pump') continue;
     // Don't traverse past a source fixture — it IS a terminal endpoint.
     if (id !== startId && isSourceFixture(item)) continue;
     for (const e of state.edges) {
       if (e === edge) continue;
-      if (!isHydraulicPipe(e.type)) continue;
+      // Only follow edges of the SAME hydraulic role. This naturally prevents
+      // crossing a pump (intake = suction, discharge = return) and prevents
+      // crossing role-changing valves.
+      if (e.type !== role) continue;
       let otherId = null;
       if (e.from === id) otherId = e.to;
       else if (e.to === id) otherId = e.from;
       if (!otherId || visited.has(otherId)) continue;
       visited.add(otherId);
       const otherItem = itemById[otherId];
-      if (otherItem && isSourceFixture(otherItem)) {
+      if (otherItem && isSourceFixture(otherItem) && fixtureMatchesRole(otherItem, role)) {
         found.add(otherItem.type);
         continue; // terminal — don't queue
       }
@@ -1823,14 +1839,26 @@ function resolvePipeSourcesSide(edge, side, itemById) {
   return Array.from(found);
 }
 
+// True if `item`'s fixture role matches the pipe role we're tracing.
+// Suction pipes terminate at suction fixtures (skimmer/drain); return pipes
+// terminate at delivery fixtures (return/jet/bubbler/etc).
+function fixtureMatchesRole(item, role) {
+  if (!item) return false;
+  if (role === 'suction') return SUCTION_FIXTURES.has(item.type);
+  if (role === 'return')  return RETURN_FIXTURES.has(item.type);
+  return false;
+}
+
 // Returns all unique source-fixture types reachable from EITHER end of the
-// pipe via the hydraulic graph. This is the set we'll color the pipe with.
+// pipe via the hydraulic graph, restricted to the pipe's own role. This is
+// the set we'll color the pipe with.
 function resolvePipeSources(edge) {
   if (!edge || !isHydraulicPipe(edge.type)) return [];
   const itemById = {};
   for (const it of state.items) itemById[it.id] = it;
-  const a = resolvePipeSourcesSide(edge, 'from', itemById);
-  const b = resolvePipeSourcesSide(edge, 'to', itemById);
+  const role = edge.type; // 'suction' or 'return'
+  const a = resolvePipeSourcesSide(edge, 'from', itemById, role);
+  const b = resolvePipeSourcesSide(edge, 'to',   itemById, role);
   const set = new Set([...a, ...b]);
   return Array.from(set);
 }
