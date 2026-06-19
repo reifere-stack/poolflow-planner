@@ -4178,6 +4178,537 @@ const addFlowBtnEl = $('addFlowBtn');
 if (addFlowBtnEl) addFlowBtnEl.addEventListener('click', flowsOpenAddDialog);
 
 
+// ==================================================================
+// ============== POOL + SPA DEMO + FLOWS-TAB ACTIONS ===============
+// ==================================================================
+
+// Seed a Pool + Spa layout matching the user's spec:
+//   Pool Skimmer + Pool Main Drain -> Tee -> Valve3(Suction).A
+//   Spa Main Drain ----------------------> Valve3(Suction).B
+//   Suction Valve.trunk -> Pump -> Filter -> Heater -> Valve3(Return).trunk
+//   Valve3(Return).A -> Tee -> 2x Pool Returns
+//   Valve3(Return).B -> Tee -> 2x Spa Returns
+function loadPoolSpaDemo() {
+  pushUndo();
+  state.items = []; state.edges = []; state.dims = []; state.selectedId = null;
+  world.querySelectorAll('.node').forEach(n => n.remove());
+  state.nextId = 1;
+
+  const add = (type, opts) => addItem(type, opts);
+
+  // Bodies & pad
+  const pool = add('pool', { x: 60,   y: 420, label: 'Pool' });
+  const spa  = add('spa',  { x: 80,   y: 740, label: 'Spa', relation: 'pool' });
+  add('pad',                 { x: 1080, y: 360, label: 'Equipment Pad' });
+
+  // Pool suction fixtures
+  const psk = add('skimmer', { x: 120, y: 380, label: 'Pool Skimmer', size: '2.5"' });
+  const pmd = add('drain',   { x: 220, y: 480, label: 'Pool Main Drain', size: '2"' });
+  // Spa suction fixture
+  const smd = add('drain',   { x: 120, y: 760, label: 'Spa Main Drain', size: '2"' });
+
+  // Tee combining the two pool suction sources
+  const poolSucTee = add('tee', { x: 420, y: 440, label: 'Pool Suction Tee' });
+
+  // 3-way valve choosing between Pool side (A) and Spa side (B)
+  const vSuc = add('valve3', { x: 740, y: 560, label: 'Suction Valve', valveState: 'shared' });
+
+  // Equipment chain
+  const pump = add('pump',   { x: 1100, y: 480, label: 'Filter Pump', size: '2.5"' });
+  const flt  = add('filter', { x: 1250, y: 480, label: 'Filter',      size: '2.5"' });
+  const htr  = add('heater', { x: 1400, y: 480, label: 'Heater',      size: '2.5"' });
+
+  // 3-way return valve choosing Pool (A) vs Spa (B)
+  const vRet = add('valve3', { x: 1620, y: 480, label: 'Return Valve', valveState: 'shared' });
+
+  // Pool return tee + 2 return fixtures
+  const poolRetTee = add('tee',    { x: 1820, y: 380, label: 'Pool Return Tee' });
+  const pret1      = add('return', { x: 1960, y: 320, label: 'Pool Return 1', size: '2"' });
+  const pret2      = add('return', { x: 1960, y: 440, label: 'Pool Return 2', size: '2"' });
+
+  // Spa return tee + 2 return fixtures
+  const spaRetTee = add('tee',    { x: 1820, y: 640, label: 'Spa Return Tee' });
+  const sret1     = add('return', { x: 1960, y: 580, label: 'Spa Return 1', size: '2"' });
+  const sret2     = add('return', { x: 1960, y: 700, label: 'Spa Return 2', size: '2"' });
+
+  // Spillover between Spa and Pool (informational)
+  // (kept consistent with the original demo for visual completeness)
+
+  const addE = (from, to, type, size, opts) => {
+    state.edges.push({
+      id: uid(), from: from.id, to: to.id, type, size,
+      label: `${from.label} \u2192 ${to.label}`,
+      active: false, blocked: false,
+      fromPort: (opts && opts.fromPort) || '',
+      toPort:   (opts && opts.toPort)   || '',
+    });
+  };
+
+  // --- Suction side ---
+  // Pool Skimmer + Pool Main Drain -> Pool Suction Tee
+  addE(psk, poolSucTee, 'suction', '2.5"');
+  addE(pmd, poolSucTee, 'suction', '2"');
+  // Pool Suction Tee -> Suction Valve (port A)
+  addE(poolSucTee, vSuc, 'suction', '2.5"', { toPort: 'a' });
+  // Spa Main Drain -> Suction Valve (port B)
+  addE(smd, vSuc, 'suction', '2"', { toPort: 'b' });
+  // Suction Valve trunk -> Pump intake
+  addE(vSuc, pump, 'suction', '2.5"', { fromPort: 'trunk', toPort: 'intake' });
+
+  // --- Pad chain ---
+  addE(pump, flt, 'return', '2.5"', { fromPort: 'discharge' });
+  addE(flt,  htr, 'return', '2.5"');
+  // Heater -> Return Valve trunk
+  addE(htr,  vRet, 'return', '2.5"', { toPort: 'trunk' });
+
+  // --- Return side ---
+  // Return Valve port A -> Pool Return Tee -> 2 pool returns
+  addE(vRet, poolRetTee, 'return', '2.5"', { fromPort: 'a' });
+  addE(poolRetTee, pret1, 'return', '2"');
+  addE(poolRetTee, pret2, 'return', '2"');
+  // Return Valve port B -> Spa Return Tee -> 2 spa returns
+  addE(vRet, spaRetTee, 'return', '2.5"', { fromPort: 'b' });
+  addE(spaRetTee, sret1, 'return', '2"');
+  addE(spaRetTee, sret2, 'return', '2"');
+
+  // Spillover (visual only)
+  addE(spa, pool, 'spillover', '2.5"');
+
+  // Auto-fill any missing valve/pump ports
+  migratePortsOnLoad(state);
+
+  solveFlow(); persist(); redrawAll(); fitToContent();
+  toast('Loaded Pool + Spa demo');
+}
+
+// Expose globally so the Flows page button + a top-bar shortcut can call it
+window.loadPoolSpaDemo = loadPoolSpaDemo;
+
+// ==================================================================
+// ============ FLOWS-TAB ADVANCED EDIT ACTIONS =====================
+// ==================================================================
+
+// --- Action: Merge another flow's source into this point via a Tee.
+//
+// User selects a flow card + an insert point + another flow whose source they
+// want to merge in. We:
+//   1. Place a Tee node near the current step
+//   2. Disconnect the incoming edge into the current step
+//   3. Reconnect: prev -> Tee, otherFlow.source -> Tee, Tee -> currentStep
+//   4. Remove the rest of otherFlow's suction chain if it dead-ends
+function flowsMergeSourceAt(flow, insertBeforeIdx, otherFlow) {
+  if (!flow || !otherFlow) return;
+  pushUndo();
+
+  // The "current step" is allItems[insertBeforeIdx]. The "prev" step (the one
+  // we're inserting between) is allItems[insertBeforeIdx - 1].
+  const currStep = flow.allItems[insertBeforeIdx];
+  const prevStep = flow.allItems[insertBeforeIdx - 1];
+  if (!currStep || !prevStep) { toast('Cannot merge here'); return; }
+
+  // Determine the role of the edge prev -> curr (suction or return).
+  const incoming = state.edges.find(e =>
+    isHydraulicPipe(e.type) &&
+    ((e.from === prevStep.id && e.to === currStep.id) ||
+     (e.from === currStep.id && e.to === prevStep.id))
+  );
+  const role = incoming ? incoming.type : 'suction';
+
+  // Place a tee near the current step.
+  const tx = ((prevStep.x || 0) + (currStep.x || 0)) / 2;
+  const ty = ((prevStep.y || 0) + (currStep.y || 0)) / 2;
+  const tee = addItem('tee', { x: Math.round(tx), y: Math.round(ty), label: 'Tee' });
+
+  // Remove the direct edge prev -> curr; we'll route through the tee.
+  state.edges = state.edges.filter(e => e !== incoming);
+
+  const mkE = (from, to, size, opts) => state.edges.push({
+    id: uid(), from: from.id, to: to.id, type: role, size: size || (incoming && incoming.size) || '',
+    label: `${from.label} \u2192 ${to.label}`,
+    active: false, blocked: false,
+    fromPort: (opts && opts.fromPort) || '',
+    toPort:   (opts && opts.toPort)   || '',
+  });
+
+  mkE(prevStep, tee);
+  mkE(otherFlow.source, tee);
+  mkE(tee, currStep);
+
+  // Strip the other flow's now-orphan intermediate suction path so we don't
+  // leave dangling equipment. Keep its source fixture.
+  const otherSrcId = otherFlow.source.id;
+  const otherIntermediates = otherFlow.suctionPath.slice(1, -1); // exclude source and pump
+  // Only remove intermediates that aren't shared with another flow.
+  const otherFlows = deriveFlows().filter(f => f.id !== flow.id && f.id !== otherFlow.id);
+  const sharedIds = new Set();
+  for (const f of otherFlows) for (const it of f.allItems) sharedIds.add(it.id);
+  for (const it of otherIntermediates) {
+    if (sharedIds.has(it.id)) continue;
+    state.items = state.items.filter(i => i.id !== it.id);
+    state.edges = state.edges.filter(e => e.from !== it.id && e.to !== it.id);
+    const el = world.querySelector(`.node[data-id="${it.id}"]`);
+    if (el) el.remove();
+  }
+
+  _flowsRerenderAll();
+}
+
+// --- Action: Branch this step (attach a new source or destination to an
+//     available port of a junction/valve).
+//
+// Currently we support attaching another fixture to a free port of a valve3
+// or to a tee.
+function flowsBranchStep(flow, stepIdx, fixtureType, newLabel) {
+  const step = flow.allItems[stepIdx];
+  if (!step) return;
+  if (step.type !== 'valve3' && step.type !== 'tee' && step.type !== 'manifold') {
+    toast('Only valves, tees, or manifolds can be branched');
+    return;
+  }
+  pushUndo();
+  const role = SUCTION_FIXTURES.has(fixtureType) ? 'suction'
+             : RETURN_FIXTURES.has(fixtureType)  ? 'return'
+             : null;
+  if (!role) { toast('Pick a fixture type'); return; }
+
+  // Place the new fixture near the step.
+  const nx = (step.x || 0) + 0;
+  const ny = (step.y || 0) + 120;
+  const item = addItem(fixtureType, { x: nx, y: ny, label: newLabel || undefined });
+
+  // Determine an available port if it's a valve3.
+  let connectOpts = {};
+  if (step.type === 'valve3') {
+    const usedPorts = new Set();
+    for (const e of state.edges) {
+      if (e.from === step.id) usedPorts.add(e.fromPort);
+      if (e.to   === step.id) usedPorts.add(e.toPort);
+    }
+    const free = ['a', 'b', 'trunk'].find(p => !usedPorts.has(p));
+    if (free) connectOpts = role === 'suction' ? { toPort: free } : { fromPort: free };
+  }
+
+  if (role === 'suction') {
+    state.edges.push({
+      id: uid(), from: item.id, to: step.id, type: 'suction', size: '',
+      label: `${item.label} \u2192 ${step.label}`,
+      active: false, blocked: false,
+      fromPort: '', toPort: connectOpts.toPort || '',
+    });
+  } else {
+    state.edges.push({
+      id: uid(), from: step.id, to: item.id, type: 'return', size: '',
+      label: `${step.label} \u2192 ${item.label}`,
+      active: false, blocked: false,
+      fromPort: connectOpts.fromPort || '', toPort: '',
+    });
+  }
+  _flowsRerenderAll();
+}
+
+// --- Action: Replicate destination (add a parallel return fixture sharing a
+//     Tee with the existing one).
+function flowsReplicateDestination(flow, fixtureType, newLabel) {
+  if (!flow.destination) { toast('No destination to replicate'); return; }
+  const dest = flow.destination;
+  pushUndo();
+
+  // Find the upstream node for the destination.
+  const inEdge = state.edges.find(e =>
+    isHydraulicPipe(e.type) && (e.to === dest.id || e.from === dest.id)
+  );
+  if (!inEdge) { toast('Destination is not connected'); return; }
+  const upstreamId = inEdge.from === dest.id ? inEdge.to : inEdge.from;
+  const upstream = state.items.find(i => i.id === upstreamId);
+  if (!upstream) return;
+
+  // If the upstream is already a tee, just attach a sibling there.
+  let tee;
+  if (upstream.type === 'tee' || upstream.type === 'manifold') {
+    tee = upstream;
+  } else {
+    // Insert a new tee between upstream and dest.
+    const tx = ((upstream.x || 0) + (dest.x || 0)) / 2;
+    const ty = ((upstream.y || 0) + (dest.y || 0)) / 2;
+    tee = addItem('tee', { x: Math.round(tx), y: Math.round(ty), label: 'Return Tee' });
+    // Remove direct edge upstream -> dest
+    state.edges = state.edges.filter(e => e !== inEdge);
+    state.edges.push({
+      id: uid(), from: upstream.id, to: tee.id, type: 'return', size: inEdge.size || '',
+      label: `${upstream.label} \u2192 ${tee.label}`,
+      active: false, blocked: false,
+      fromPort: inEdge.fromPort || '', toPort: '',
+    });
+    state.edges.push({
+      id: uid(), from: tee.id, to: dest.id, type: 'return', size: inEdge.size || '',
+      label: `${tee.label} \u2192 ${dest.label}`,
+      active: false, blocked: false,
+      fromPort: '', toPort: inEdge.toPort || '',
+    });
+  }
+
+  // Create the new sibling fixture and connect to the tee.
+  const sx = (dest.x || 0);
+  const sy = (dest.y || 0) + 80;
+  const newDest = addItem(fixtureType || dest.type, {
+    x: sx, y: sy,
+    label: newLabel || undefined,
+    size: dest.size || '',
+  });
+  state.edges.push({
+    id: uid(), from: tee.id, to: newDest.id, type: 'return', size: dest.size || '',
+    label: `${tee.label} \u2192 ${newDest.label}`,
+    active: false, blocked: false,
+    fromPort: '', toPort: '',
+  });
+  _flowsRerenderAll();
+}
+
+// ==================================================================
+// =============== EXTEND INSERT PICKER WITH NEW ACTIONS ============
+// ==================================================================
+
+// Replace the old simple insert picker with one that also offers Merge.
+// The new function `flowsOpenInsertPickerV2` is bound to the [+] button via a
+// late wiring step at the bottom.
+function flowsOpenInsertPickerV2(flow, insertBeforeIdx) {
+  const insertable = ['filter', 'heater', 'saltcell', 'booster', 'blower', 'valve2', 'valve3', 'tee', 'manifold', 'customeq'];
+  const items = insertable.map(t => ({ type: t, label: (TOOLS[t] && TOOLS[t].label) || t }));
+  const otherFlows = deriveFlows().filter(f => f.id !== flow.id);
+  modalContent.innerHTML = `
+    <h3>Insert step</h3>
+    <p style="color:var(--muted); font-size:13px;">Add a component, or merge another flow's source into this point.</p>
+    <div style="margin-top:8px;">
+      <div style="font-weight:600; font-size:12px; color:var(--muted); margin-bottom:6px; text-transform:uppercase; letter-spacing:.04em;">Add component</div>
+      <div style="display:grid; grid-template-columns:repeat(2, 1fr); gap:8px;">
+        ${items.map(it => `<button type="button" class="btn" data-insert-type="${it.type}">${escapeHtml(it.label)}</button>`).join('')}
+      </div>
+    </div>
+    ${otherFlows.length ? `
+    <div style="margin-top:14px;">
+      <div style="font-weight:600; font-size:12px; color:var(--muted); margin-bottom:6px; text-transform:uppercase; letter-spacing:.04em;">Merge another flow here</div>
+      <div style="display:flex; flex-direction:column; gap:6px;">
+        ${otherFlows.map(f => `<button type="button" class="btn" data-merge-flow-id="${f.id}">${escapeHtml(_flowStepLabel(f.source))} \u2192 ${escapeHtml(f.destination ? _flowStepLabel(f.destination) : '(open)')}</button>`).join('')}
+      </div>
+    </div>` : ''}
+    <div class="row" style="margin-top:14px; justify-content:flex-end;">
+      <button class="btn" id="flow-insert-cancel">Cancel</button>
+    </div>
+  `;
+  modalBackdrop.classList.add('show');
+  $('flow-insert-cancel').onclick = closeModal;
+  modalContent.querySelectorAll('[data-insert-type]').forEach(btn => {
+    btn.onclick = () => {
+      const type = btn.getAttribute('data-insert-type');
+      flowsInsertStep(flow, type);
+      closeModal();
+    };
+  });
+  modalContent.querySelectorAll('[data-merge-flow-id]').forEach(btn => {
+    btn.onclick = () => {
+      const id = btn.getAttribute('data-merge-flow-id');
+      const other = deriveFlows().find(f => f.id === id);
+      if (!other) { toast('Other flow not found'); return; }
+      flowsMergeSourceAt(flow, insertBeforeIdx, other);
+      closeModal();
+    };
+  });
+}
+
+// Override the old picker via runtime patching of the click handler.
+// We don't redefine flowsOpenInsertPicker (since insertBeforeIdx wasn't tracked
+// in the original); instead we replace the click delegation logic below.
+
+// Re-bind the flowsList click handler to support the new picker (which needs
+// the insert index for the merge action).
+(function rebindFlowsListClicks() {
+  const host = $('flowsList');
+  if (!host) return;
+  // Clone-replace strips previous listeners.
+  const fresh = host.cloneNode(true);
+  host.parentNode.replaceChild(fresh, host);
+  fresh.addEventListener('click', (ev) => {
+    const t = ev.target.closest('[data-act]');
+    if (!t) return;
+    const act = t.getAttribute('data-act');
+    const flowId = t.getAttribute('data-flow-id');
+    const itemId = t.getAttribute('data-item-id');
+    const flows = deriveFlows();
+    const flow = flows.find(f => f.id === flowId);
+    if (!flow) { renderFlows(); return; }
+    if (act === 'edit-flow') {
+      _flowsEditState.editingFlowId = flowId;
+      renderFlows();
+    } else if (act === 'done-flow') {
+      _flowsEditState.editingFlowId = null;
+      renderFlows();
+    } else if (act === 'delete-flow') {
+      flowsDeleteFlow(flow);
+    } else if (act === 'remove-step') {
+      flowsRemoveStep(flow, itemId);
+    } else if (act === 'insert-step') {
+      // Figure out which "+" was clicked: it sits inside a .flow-arrow that
+      // comes between two .flow-step elements. The next .flow-step's data-step-idx
+      // tells us where we're inserting.
+      const arrow = t.closest('.flow-arrow');
+      let insertIdx = 1;
+      if (arrow) {
+        const nextStep = arrow.nextElementSibling;
+        if (nextStep && nextStep.classList.contains('flow-step')) {
+          insertIdx = parseInt(nextStep.getAttribute('data-step-idx'), 10) || 1;
+        }
+      }
+      flowsOpenInsertPickerV2(flow, insertIdx);
+    } else if (act === 'branch-step') {
+      flowsOpenBranchPicker(flow, parseInt(itemId, 10));
+    } else if (act === 'replicate-dest') {
+      flowsOpenReplicatePicker(flow);
+    }
+  });
+})();
+
+// Picker UI for Branch step (called from a step's "Branch" action).
+function flowsOpenBranchPicker(flow, stepIdx) {
+  const step = flow.allItems[stepIdx];
+  if (!step) return;
+  const sucTypes = ['skimmer', 'drain'];
+  const retTypes = ['return', 'jet', 'bubbler', 'deckjet', 'sheer', 'slide', 'feature'];
+  const mkBtns = (arr) => arr.map(t => `<button type="button" class="btn" data-branch-type="${t}">${escapeHtml(TOOLS[t].label)}</button>`).join('');
+  modalContent.innerHTML = `
+    <h3>Branch ${escapeHtml(_flowStepLabel(step))}</h3>
+    <p style="color:var(--muted); font-size:13px;">Attach a new fixture to a spare port of this junction.</p>
+    <div style="margin-top:8px;">
+      <div style="font-weight:600; font-size:12px; color:var(--muted); margin-bottom:6px;">Suction side</div>
+      <div style="display:grid; grid-template-columns:repeat(2,1fr); gap:8px;">${mkBtns(sucTypes)}</div>
+      <div style="font-weight:600; font-size:12px; color:var(--muted); margin:12px 0 6px;">Return side</div>
+      <div style="display:grid; grid-template-columns:repeat(2,1fr); gap:8px;">${mkBtns(retTypes)}</div>
+    </div>
+    <div class="row" style="margin-top:14px; justify-content:flex-end;">
+      <button class="btn" id="flow-branch-cancel">Cancel</button>
+    </div>
+  `;
+  modalBackdrop.classList.add('show');
+  $('flow-branch-cancel').onclick = closeModal;
+  modalContent.querySelectorAll('[data-branch-type]').forEach(btn => {
+    btn.onclick = () => {
+      const t = btn.getAttribute('data-branch-type');
+      flowsBranchStep(flow, stepIdx, t);
+      closeModal();
+    };
+  });
+}
+
+// Picker for "Replicate destination" — same fixture type or another.
+function flowsOpenReplicatePicker(flow) {
+  if (!flow.destination) { toast('No destination to replicate'); return; }
+  const retTypes = ['return', 'jet', 'bubbler', 'deckjet', 'sheer', 'slide', 'feature'];
+  const cur = flow.destination.type;
+  modalContent.innerHTML = `
+    <h3>Add another destination</h3>
+    <p style="color:var(--muted); font-size:13px;">Add a parallel fixture sharing a Tee with ${escapeHtml(_flowStepLabel(flow.destination))}.</p>
+    <div style="display:grid; grid-template-columns:repeat(2,1fr); gap:8px; margin-top:8px;">
+      ${retTypes.map(t => `<button type="button" class="btn ${t===cur?'primary':''}" data-rep-type="${t}">${escapeHtml(TOOLS[t].label)}${t===cur?' (same)':''}</button>`).join('')}
+    </div>
+    <div class="row" style="margin-top:14px; justify-content:flex-end;">
+      <button class="btn" id="flow-rep-cancel">Cancel</button>
+    </div>
+  `;
+  modalBackdrop.classList.add('show');
+  $('flow-rep-cancel').onclick = closeModal;
+  modalContent.querySelectorAll('[data-rep-type]').forEach(btn => {
+    btn.onclick = () => {
+      const t = btn.getAttribute('data-rep-type');
+      flowsReplicateDestination(flow, t);
+      closeModal();
+    };
+  });
+}
+
+// ==================================================================
+// ============ RENDER FLOWS: ADD BRANCH / REPLICATE BUTTONS =======
+// ==================================================================
+
+// Wrap the original renderFlows() so each card in edit mode also gets a
+// "Branch" button on junction/valve steps and a "Add destination" button on
+// the destination row. We do this by post-processing the DOM after the
+// original render.
+const _origRenderFlows = renderFlows;
+renderFlows = function renderFlowsExtended() {
+  _origRenderFlows();
+  const host = $('flowsList');
+  if (!host) return;
+  const flows = deriveFlows();
+  for (const flow of flows) {
+    const card = host.querySelector(`.flow-card[data-flow-id="${flow.id}"]`);
+    if (!card || !card.classList.contains('editing')) continue;
+    // Add a Branch button to each junction/valve step (not endpoints).
+    const stepEls = card.querySelectorAll('.flow-step');
+    stepEls.forEach((stepEl, idx) => {
+      const item = flow.allItems[idx];
+      if (!item) return;
+      const isJunction = item.type === 'valve3' || item.type === 'tee' || item.type === 'manifold';
+      if (!isJunction) return;
+      if (stepEl.querySelector('[data-act="branch-step"]')) return;
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'step-remove';
+      btn.style.color = 'var(--primary)';
+      btn.setAttribute('data-act', 'branch-step');
+      btn.setAttribute('data-flow-id', flow.id);
+      btn.setAttribute('data-item-id', String(idx));
+      btn.setAttribute('aria-label', 'Branch');
+      btn.title = 'Add a branch on this junction';
+      btn.textContent = '\u26A1'; // lightning, or use a + with subscript
+      btn.style.display = 'block';
+      // Insert before the remove button if present
+      const removeBtn = stepEl.querySelector('[data-act="remove-step"]');
+      if (removeBtn) stepEl.insertBefore(btn, removeBtn);
+      else stepEl.appendChild(btn);
+    });
+    // Add a "+ Add destination" mini button below the last step (if there is
+    // a real destination).
+    if (flow.destination) {
+      const chain = card.querySelector('.flow-chain');
+      if (chain && !chain.querySelector('[data-act="replicate-dest"]')) {
+        const wrap = document.createElement('div');
+        wrap.style.marginTop = '8px';
+        wrap.style.textAlign = 'center';
+        wrap.innerHTML = `<button type="button" class="btn" data-act="replicate-dest" data-flow-id="${flow.id}">+ Add another destination</button>`;
+        chain.appendChild(wrap);
+      }
+    }
+  }
+};
+
+// ==================================================================
+// ============== "LOAD POOL + SPA DEMO" BUTTON ====================
+// ==================================================================
+
+(function addPoolSpaDemoButton() {
+  const flowsPage = $('flowsPage');
+  if (!flowsPage) return;
+  const header = flowsPage.querySelector('.flows-header');
+  if (!header) return;
+  if (header.querySelector('#loadPoolSpaBtn')) return;
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.id = 'loadPoolSpaBtn';
+  btn.className = 'btn';
+  btn.style.fontSize = '12px';
+  btn.style.padding = '6px 10px';
+  btn.textContent = 'Load Pool + Spa demo';
+  btn.addEventListener('click', () => {
+    if (!confirm('Replace the current diagram with the Pool + Spa demo?')) return;
+    loadPoolSpaDemo();
+    renderFlows();
+  });
+  // Place to the left of the hint
+  const hint = header.querySelector('.flows-hint');
+  if (hint) header.insertBefore(btn, hint);
+  else header.appendChild(btn);
+})();
+
+
 // Resize
 window.addEventListener('resize', () => { applyTransform(); });
 
