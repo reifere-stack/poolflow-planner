@@ -103,6 +103,11 @@ function restore() {
     // Valves: use direction-based heuristic + geometry (left = A, right = B).
     // Pumps:  incoming = intake (suction), outgoing = discharge (return).
     migratePortsOnLoad(state);
+    // Migration: shrink legacy oversized compact fixtures to new scale-appropriate
+    // defaults. Old defaults were ~32-60px; new defaults are ~18-34px. We only
+    // resize items whose size matches a known LEGACY default (so users who
+    // hand-resized a fixture keep their custom size).
+    migrateCompactSizes(state);
     state.dims = s.dims || [];
     state.nextId = s.nextId || (s.items.length + 1);
     state.view = s.view || { scale:1, tx:0, ty:0 };
@@ -110,6 +115,43 @@ function restore() {
     state.scale = s.scale && s.scale.pxPerFoot ? s.scale : { pxPerFoot: 24 };
     return true;
   } catch { return false; }
+}
+
+// One-time-per-load migration: shrink compact fixtures from old default sizes
+// to new scale-appropriate defaults. Skips any fixture the user has hand-resized
+// (i.e. whose current size doesn't match a known legacy default).
+const LEGACY_COMPACT_SIZES = {
+  // Includes BOTH the original oversized defaults and the brief intermediate
+  // tiny values, so all prior users land on the current scale-appropriate sizes.
+  skimmer:  [[44,44],[26,26]],
+  drain:    [[44,44],[24,24]],
+  return:   [[36,36],[20,20]],
+  jet:      [[32,32],[18,18]],
+  bubbler:  [[40,40],[22,22]],
+  deckjet:  [[44,44],[24,24]],
+  sheer:    [[60,40],[34,22]],
+  slide:    [[60,44],[34,24]],
+  autofill: [[44,44],[24,24]],
+  feature:  [[60,44],[32,24]],
+  light:    [[36,36],[20,20]],
+};
+function migrateCompactSizes(s) {
+  if (!s || !Array.isArray(s.items)) return;
+  for (const it of s.items) {
+    const legacy = LEGACY_COMPACT_SIZES[it.type];
+    if (!legacy) continue;
+    const tool = TOOLS[it.type];
+    if (!tool || !tool.compact) continue;
+    const matchesLegacy = legacy.some(([w, h]) => it.w === w && it.h === h);
+    if (!matchesLegacy) continue;
+    // Recenter on the item's current center so it doesn't visually jump.
+    const cx = it.x + it.w / 2;
+    const cy = it.y + it.h / 2;
+    it.w = tool.w;
+    it.h = tool.h;
+    it.x = Math.round(cx - it.w / 2);
+    it.y = Math.round(cy - it.h / 2);
+  }
 }
 
 // One-time-per-load migration: write fromPort/toPort onto edges touching
