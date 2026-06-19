@@ -194,6 +194,11 @@ function isHydraulicPipe(type) {
   return type === 'suction' || type === 'return';
 }
 
+// Items that source/sink AIR (not water). A blower discharges air;
+// jets/bubblers consume air for their venturi action.
+const AIR_SOURCES = new Set(['blower']);
+const AIR_SINKS   = new Set(['jet', 'bubbler']);
+
 // Returns 'suction' | 'return' | null. Walks outward from one side of `edge`
 // through pass-through items until it hits a classified endpoint.
 function resolveEndRole(edge, side, s, itemById) {
@@ -489,6 +494,12 @@ function onPointerDown(e) {
     };
     nodeEl.classList.add('dragging');
     selectItem(id);
+    // Tapping a part on the canvas should bring up its details so the user
+    // can edit it / connect from it without an extra tab tap. Only switch tabs
+    // if the sheet is already open — otherwise it would feel intrusive while panning.
+    if (sheet.classList.contains('open') || sheet.classList.contains('mid')) {
+      openSheetTab('selected');
+    }
     // long-press to open quick valve toggle / property
     longPressFired = false;
     clearLongPress();
@@ -1005,7 +1016,7 @@ function startConnectMode() {
   state.connectSourceTap = null;
   connectBanner.classList.add('show');
   closeSheet();
-  toast('Connect mode: tap source, then destination');
+  toast('Tap two parts to connect them');
 }
 function cancelConnectMode() {
   state.connectMode = false;
@@ -1144,8 +1155,14 @@ function handleConnectTap(id, tapPt) {
       resolveEndRole(probeEdge, 'from', state, itemByIdProbe);
     const toRolePropagated   = toAssign.pipeType   ||
       resolveEndRole(probeEdge, 'to',   state, itemByIdProbe);
+    // Air lines can land on air-sink fixtures (jets/bubblers) even though
+    // those fixtures are 'return' for water. So allow air ↔ air-sink pairs.
+    const airOk = (
+      (fromRolePropagated === 'air' && AIR_SINKS.has(to.type)) ||
+      (toRolePropagated   === 'air' && AIR_SINKS.has(from.type))
+    );
     if (fromRolePropagated && toRolePropagated &&
-        fromRolePropagated !== toRolePropagated) {
+        fromRolePropagated !== toRolePropagated && !airOk) {
       toast(`Can't connect ${from.label} (${fromRolePropagated}) to ${to.label} (${toRolePropagated})`);
       cancelConnectMode();
       return;
@@ -1154,8 +1171,14 @@ function handleConnectTap(id, tapPt) {
     // Endpoint-implied pipe type wins over the pending pipe type:
     //   pump intake / skimmer / main drain → suction
     //   pump discharge / return / jet / bubbler / feature → return
-    // The destination side wins if both ends imply a type (rare conflict).
-    const impliedType = toAssign.pipeType || fromAssign.pipeType || null;
+    //   blower endpoint → air
+    // Air-source wins over the water-role for jet/bubbler when one end is a blower.
+    let impliedType = null;
+    if (fromAssign.pipeType === 'air' || toAssign.pipeType === 'air') {
+      impliedType = 'air';
+    } else {
+      impliedType = toAssign.pipeType || fromAssign.pipeType || null;
+    }
     const pipeType = impliedType || state.pendingPipe.type;
     state.edges.push({
       id: uid(),
@@ -1632,10 +1655,11 @@ function itemFixtureRole(item) {
 }
 
 // Pipe type implied by either endpoint of a connection, considering both
-// fixture types AND pump ports. Returns 'suction' | 'return' | null.
+// fixture types AND pump ports. Returns 'suction' | 'return' | 'air' | null.
 function impliedPipeTypeForEndpoint(item, port) {
   if (!item) return null;
   if (item.type === 'pump') return pumpPortPipeType(port);
+  if (AIR_SOURCES.has(item.type)) return 'air';
   return itemFixtureRole(item);
 }
 
@@ -1652,6 +1676,8 @@ function assignPortForTap(item, tapPt, role) {
     else       port = role === 'from' ? 'discharge' : 'intake';
     return { port, pipeType: pumpPortPipeType(port) };
   }
+  // Blower endpoint -> air pipe.
+  if (AIR_SOURCES.has(item.type)) return { port: '', pipeType: 'air' };
   // Fixtures get their role-implied pipe type.
   const role2 = itemFixtureRole(item);
   return { port: '', pipeType: role2 };
@@ -1793,7 +1819,7 @@ function solveFlow() {
     if (node.type === 'valve2' && node.valveState === 'closed') {
       edge.blocked = true; issues.push(`${node.label} is closed.`); return;
     }
-    const outs = (adj[node.id] || []).filter(e => e.type !== 'conduit');
+    const outs = (adj[node.id] || []).filter(e => e.type !== 'conduit' && e.type !== 'air');
     if (node.type === 'valve3') {
       outs.forEach((o, i) => valveAllows(node, outs, i) ? traverse(o, root, new Set(seen)) : (o.blocked = true));
       return;
@@ -1839,7 +1865,7 @@ function solveFlow() {
     if (node.type === 'valve2' && node.valveState === 'closed') {
       edge.blocked = true; issues.push(`${node.label} is closed.`); return;
     }
-    const ins = state.edges.filter(e => e.to === node.id && e.type !== 'conduit');
+    const ins = state.edges.filter(e => e.to === node.id && e.type !== 'conduit' && e.type !== 'air');
     if (node.type === 'valve3') {
       ins.forEach((inE) => {
         if (valve3EdgeOpen(node, inE)) traverseBack(inE, new Set(seen));
@@ -1858,8 +1884,8 @@ function solveFlow() {
   }
 
   for (const pump of pumps) {
-    const incoming = state.edges.filter(e => e.to === pump.id && e.type !== 'conduit');
-    const outgoing = state.edges.filter(e => e.from === pump.id && e.type !== 'conduit');
+    const incoming = state.edges.filter(e => e.to === pump.id && e.type !== 'conduit' && e.type !== 'air');
+    const outgoing = state.edges.filter(e => e.from === pump.id && e.type !== 'conduit' && e.type !== 'air');
     if (!incoming.length) issues.push(`Pump ${pump.label} has no suction source.`);
     if (!outgoing.length) issues.push(`Pump ${pump.label} has no return destination.`);
     incoming.forEach(e => traverseBack(e, new Set([pump.id])));
@@ -1882,6 +1908,73 @@ function solveFlow() {
     if (!relOther && !reachesOther && !hasGravitySpill) {
       const where = body.type === 'spa' ? 'pool' : 'spa';
       issues.push(`${body.label} (${body.type}) receives water but has no spillover or return path to a ${where}. Set a spillover destination in the Selected panel.`);
+    }
+  }
+
+  // Air-blower check: any spa that has jets (or bubblers) deserves an air supply.
+  // We tally jets per body (via item.relation or DELIVERY_DEFAULTS) and look
+  // for at least one air-source (blower) that reaches a jet attached to that spa.
+  const jetsBySpa = new Map(); // spaId -> count
+  for (const it of state.items) {
+    if (!AIR_SINKS.has(it.type)) continue;
+    // What spa does this jet feed?
+    let spaId = null;
+    if (it.relation === 'spa') {
+      const anySpa = state.items.find(b => b.type === 'spa');
+      spaId = anySpa?.id || null;
+    } else if (it.relation && getItem(it.relation)?.type === 'spa') {
+      spaId = it.relation;
+    } else if (it.type === 'jet' || it.type === 'bubbler') {
+      // Default: jets/bubblers belong to a spa if there is exactly one.
+      const spas = state.items.filter(b => b.type === 'spa');
+      if (spas.length === 1) spaId = spas[0].id;
+    }
+    if (!spaId) continue;
+    jetsBySpa.set(spaId, (jetsBySpa.get(spaId) || 0) + 1);
+  }
+  if (jetsBySpa.size) {
+    const blowers = state.items.filter(i => i.type === 'blower');
+    // For each spa with jets, ensure at least one blower has an air path
+    // reaching one of those jets (allowing pass-through items in between).
+    const itemByIdAir = {}; state.items.forEach(i => itemByIdAir[i.id] = i);
+    const airReachable = (startId) => {
+      const visited = new Set([startId]);
+      const queue = [startId];
+      while (queue.length) {
+        const id = queue.shift();
+        for (const e of state.edges) {
+          if (e.type !== 'air') continue;
+          let other = null;
+          if (e.from === id) other = e.to;
+          else if (e.to === id) other = e.from;
+          if (!other || visited.has(other)) continue;
+          visited.add(other);
+          queue.push(other);
+        }
+      }
+      return visited;
+    };
+    for (const [spaId, jetCount] of jetsBySpa.entries()) {
+      const spa = getItem(spaId); if (!spa) continue;
+      const spaJetIds = state.items
+        .filter(j => AIR_SINKS.has(j.type) && (
+          j.relation === spaId ||
+          (j.relation === 'spa') ||
+          (!j.relation && (j.type === 'jet' || j.type === 'bubbler'))
+        ))
+        .map(j => j.id);
+      let supplied = false;
+      for (const b of blowers) {
+        const reach = airReachable(b.id);
+        if (spaJetIds.some(jid => reach.has(jid))) { supplied = true; break; }
+      }
+      if (!supplied) {
+        if (!blowers.length) {
+          issues.push(`${spa.label} has ${jetCount} jet${jetCount===1?'':'s'} but no Air Blower on the equipment pad. Spa jets need air for their venturi action — add a blower and run an air line to the jets.`);
+        } else {
+          issues.push(`${spa.label} has ${jetCount} jet${jetCount===1?'':'s'} but no air line from a blower reaches them. Connect the blower to the spa jets with an air pipe.`);
+        }
+      }
     }
   }
 
@@ -2114,9 +2207,11 @@ function renderSelected() {
         <button class="btn danger"  data-action="deleteSelected">Delete</button>
       </div>
       <div class="row" style="margin-top:8px;">
+        <button class="btn" data-action="connectFromHere">Connect from here →</button>
         <button class="btn" data-action="duplicateSelected">Duplicate</button>
         <button class="btn" data-action="measureFrom">Measure from this…</button>
       </div>
+      <p style="color:var(--muted); font-size:12px; margin-top:8px;">Tip: tap a pipe to drop a tee into it (great for 4″ return loops branching to 1.5″ jets). Then edit the new pipe to set the smaller reducer at its far end.</p>
     </div>`;
 }
 
@@ -2234,9 +2329,11 @@ function renderPipes() {
         </select>
       </div>
       <button class="btn primary full" style="margin-top:12px;" data-action="connectMode">
-        Start tap-to-connect
+        Connect two parts
       </button>
-      <p style="color:var(--muted); font-size:12px; margin-top:8px;">Tap two parts in order. Tap on a pipe to drop into it (auto-inserts a tee). Long-press a valve to flip it.</p>
+      <p style="color:var(--muted); font-size:12px; margin-top:8px;">Tap any two parts to wire them. Pipe type (suction / return / air) auto-picks from the endpoints, so you don’t need to think about it. Bends are inserted automatically as 90° or 45°.</p>
+      <p style="color:var(--muted); font-size:12px; margin-top:6px;"><strong>Looped headers (e.g. 4″ → 1.5″ jets):</strong> draw the main 4″ run first, then tap on that pipe at each branch point — a tee is dropped in automatically. Connect each jet to the tee and set the pipe size to 1.5″ in the Edit Pipe panel.</p>
+      <p style="color:var(--muted); font-size:12px; margin-top:6px;">Long-press a valve on the canvas to flip it.</p>
     </div>
 
     <div class="panel">
@@ -2573,10 +2670,8 @@ function bindSheetActions() {
     btn.addEventListener('click', () => {
       const type = btn.dataset.add;
       addItem(type);
-      if (type === 'custom' || type === 'customeq') {
-        // open Selected so user can rename
-        openSheetTab('selected'); openSheet();
-      }
+      // Always jump to Selected so the just-placed item is ready to configure.
+      openSheetTab('selected');
     });
   });
 
@@ -2799,6 +2894,17 @@ function doAction(name, btn) {
       break;
     }
     case 'connectMode': startConnectMode(); break;
+    case 'connectFromHere': {
+      const item = getItem(state.selectedId);
+      if (!item) { toast('Tap a part first'); break; }
+      startConnectMode();
+      // Pre-seed the source so the user only needs one more tap.
+      state.connectSourceId = item.id;
+      state.connectSourceTap = null;
+      const el = nodeEl(item.id); if (el) el.classList.add('connect-source');
+      toast(`From “${item.label}” — now tap destination`);
+      break;
+    }
     case 'setValveState': {
       const targetId = btn.dataset.itemId;
       const next     = btn.dataset.state;

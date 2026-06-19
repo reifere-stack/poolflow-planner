@@ -28,6 +28,7 @@ const ICONS = {
   heater: `<rect x="4" y="5" width="16" height="14" rx="2"/><path d="M9 9c0 1.5-1 2-1 3.5S9 15 9 15M14 9c0 1.5-1 2-1 3.5S14 15 14 15" opacity=".8"/>`,
   saltcell: `<rect x="6" y="4" width="12" height="16" rx="2"/><path d="M9 8h6M9 12h6M9 16h6" opacity=".65"/>`,
   booster: `<circle cx="12" cy="13" r="5"/><path d="M12 13l3-3"/><path d="M12 4v3" /><circle cx="12" cy="13" r="1.4" fill="currentColor" stroke="none"/>`,
+  blower: `<circle cx="10" cy="13" r="5"/><circle cx="10" cy="13" r="1.4" fill="currentColor" stroke="none"/><path d="M10 13l3-3"/><path d="M16 9c1.2 0 2 .8 2 2s-.8 2-2 2M18 7c2 0 3 1.5 3 3s-1 3-3 3M14 13h2" opacity=".7"/>`,
   valve2: `<circle cx="12" cy="12" r="7"/><path d="M5 12h14"/><path d="M12 12l4-3" opacity=".9"/>`,
   valve3: `<circle cx="12" cy="12" r="7"/><path d="M12 5v7M12 12l6 3.5M12 12l-6 3.5"/>`,
   checkvalve: `<circle cx="12" cy="12" r="7"/><path d="M5 12h14"/><path d="M10 8l5 4-5 4" opacity=".9"/>`,

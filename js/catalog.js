@@ -29,6 +29,7 @@ const PALETTE_GROUPS = [
     ['heater',   'Heater',        {w:110, h:70}],
     ['saltcell', 'Salt Cell',     {w:110, h:70}],
     ['booster',  'Booster',       {w:110, h:70}],
+    ['blower',   'Air Blower',    {w:110, h:70}],
     ['manifold', 'Manifold',      {w:120, h:70}],
     ['conduit',  'Conduit',       {w:100, h:60}],
     ['customeq', 'Equipment',     {w:120, h:70, editLabel:true}],
@@ -68,6 +69,7 @@ const RESIZABLE = new Set(['pool','spa','pad']);
 const PIPE_TYPES = {
   suction:   { label:'Suction',     color:'var(--pipe-suction)',   dash:'10 7' },
   return:    { label:'Return',      color:'var(--pipe-return)',    dash:''     },
+  air:       { label:'Air (blower)',color:'var(--pipe-air)',       dash:'3 4'  },
   spillover: { label:'Spillover',   color:'var(--pipe-spillover)', dash:'2 6'  },
   feature:   { label:'Feature',     color:'var(--pipe-feature)',   dash:''     },
   conduit:   { label:'Conduit',     color:'var(--pipe-conduit)',   dash:'4 4'  },
@@ -138,6 +140,11 @@ const EQUIPMENT_MODELS = {
   booster: [
     { id:'polaris-pb4-60', brand:'Polaris', name:'PB4-60 Booster', wIn:18, dIn:9, hIn:11, port:'1.5"', notes:'For pressure-side cleaner' },
   ],
+  blower: [
+    { id:'airsupply-silencer-1hp', brand:'Air Supply', name:'Silencer 1.0 HP Blower', wIn:13, dIn:9, hIn:9, port:'1.5"', notes:'Spa air for jets' },
+    { id:'airsupply-silencer-1_5hp', brand:'Air Supply', name:'Silencer 1.5 HP Blower', wIn:14, dIn:10, hIn:10, port:'1.5"', notes:'Larger spa air' },
+    { id:'hartford-magnablower-1hp', brand:'Hartford', name:'MagnaBlower 1.0 HP', wIn:13, dIn:9, hIn:9, port:'1.5"', notes:'Spa air, with one-way air valve' },
+  ],
 };
 
 // Convenience: lookup model by id
@@ -167,5 +174,5 @@ const BOM_RULES = {
 };
 
 // Items that count as "equipment" needing unions on each side
-const EQUIPMENT_TYPES = new Set(['pump','filter','heater','saltcell','booster','manifold','customeq']);
+const EQUIPMENT_TYPES = new Set(['pump','filter','heater','saltcell','booster','blower','manifold','customeq']);
 
