@@ -4709,6 +4709,474 @@ renderFlows = function renderFlowsExtended() {
 })();
 
 
+// ==================================================================
+// ============== TREE-PER-PUMP FLOWS VIEW (POOLSIDE) ===============
+// ==================================================================
+//
+// Model: each pump owns one "Pool Flow" card. The card is a vertical tree:
+//   - Suction tree (top): leaves are source fixtures (pool/spa/skimmer/drain).
+//                          Branches converge downward into the pump.
+//   - Pump (middle): the single trunk node.
+//   - Return tree (bottom): branches diverge downward to destination fixtures.
+//
+// Tees, manifolds, and 3-way valves are rendered as branch nodes whose children
+// are laid out side-by-side. Booster pumps inside the return tree also branch
+// (their suction comes from a tee on the return side; their discharge feeds a
+// fixture loop). Linear runs collapse: a node with a single child is just
+// stacked vertically.
+// ------------------------------------------------------------------
+
+const _PSBRANCH_TYPES = new Set(['tee', 'manifold', 'valve3']);
+
+function _psItemById() {
+  const m = {};
+  for (const it of state.items) m[it.id] = it;
+  return m;
+}
+
+// Build adjacency for one role ('suction' or 'return'). Each entry stores the
+// other endpoint and the port on each side of the edge.
+function _psAdj(role) {
+  const adj = new Map();
+  for (const e of state.edges) {
+    if (e.type !== role) continue;
+    if (!adj.has(e.from)) adj.set(e.from, []);
+    if (!adj.has(e.to))   adj.set(e.to,   []);
+    adj.get(e.from).push({ otherId: e.to,   portHere: e.fromPort || '', otherPort: e.toPort   || '', edge: e });
+    adj.get(e.to)  .push({ otherId: e.from, portHere: e.toPort   || '', otherPort: e.fromPort || '', edge: e });
+  }
+  return adj;
+}
+
+// Build a tree rooted at `rootId`. For each node we list its children (the
+// neighbors we haven't visited yet). Cycles are broken by the visited set.
+// `direction` is the role we walk ('suction' for upstream, 'return' for
+// downstream). For 3-way valves, the a<->b barrier is respected: we don't
+// recurse from `a` into `b` or vice versa unless one side is `trunk`.
+function _psBuildTree(rootId, direction) {
+  const itemById = _psItemById();
+  const adj = _psAdj(direction);
+  const visited = new Set([rootId]);
+
+  const valve3Ok = (inPort, outPort) => {
+    if (!inPort || !outPort) return true;
+    if (inPort === outPort) return true;
+    if (inPort === 'trunk' || outPort === 'trunk') return true;
+    return false;
+  };
+
+  function build(nodeId, arrivePort) {
+    const node = itemById[nodeId];
+    if (!node) return null;
+    const children = [];
+    const neighbors = adj.get(nodeId) || [];
+    for (const { otherId, portHere, otherPort } of neighbors) {
+      if (visited.has(otherId)) continue;
+      // For valve3, only traverse outward through ports compatible with how
+      // we arrived (only matters when we're walking *through* a valve3, not
+      // when it's our current root).
+      if (node.type === 'valve3' && arrivePort != null) {
+        if (!valve3Ok(arrivePort, portHere)) continue;
+      }
+      visited.add(otherId);
+      const child = build(otherId, otherPort);
+      if (child) children.push({ node: child, port: portHere });
+    }
+    return { item: node, children };
+  }
+
+  return build(rootId, null);
+}
+
+// Build a complete pump card description:
+//   { pump, suctionRoot: tree (root = pump, children = upstream),
+//           returnRoot:  tree (root = pump, children = downstream) }
+// Both trees share the pump as root but we'll render the suction tree
+// upside-down (sources on top, pump on bottom) and the return tree
+// right-side-up (pump on top, destinations on bottom).
+function buildPumpCards() {
+  const pumps = state.items.filter(i => i.type === 'pump');
+  return pumps.map(pump => ({
+    pump,
+    suctionTree: _psBuildTree(pump.id, 'suction'),
+    returnTree:  _psBuildTree(pump.id, 'return'),
+  }));
+}
+
+// Render a tree node and its descendants as HTML for the return side
+// (root-on-top, children below). Returns an HTML string.
+// We render each subtree wrapped in a column. When a node has multiple
+// children, the columns are laid side-by-side with a horizontal connector
+// line linking them at the top, and a single down-arrow from the parent
+// dropping into that connector.
+function _psRenderReturnSubtree(treeNode, flowId) {
+  if (!treeNode) return '';
+  const item = treeNode.item;
+  const kids = treeNode.children || [];
+  let kidsHtml = '';
+  if (kids.length === 1) {
+    kidsHtml = `<div class="tree-arrow-v"></div>${_psRenderReturnSubtree(kids[0].node, flowId)}`;
+  } else if (kids.length > 1) {
+    kidsHtml = `
+      <div class="tree-arrow-v"></div>
+      <div class="tree-fork tree-fork-down">
+        <div class="tree-fork-line"></div>
+        <div class="tree-fork-cols">
+          ${kids.map(c => `
+            <div class="tree-fork-col">
+              <div class="tree-fork-stem"></div>
+              ${_psRenderReturnSubtree(c.node, flowId)}
+            </div>`).join('')}
+        </div>
+      </div>`;
+  }
+  return `<div class="tree-subtree">${_psRenderPill(item, flowId)}${kidsHtml}</div>`;
+}
+
+// Render the suction side: leaves on top, root (pump) at the bottom.
+// The pump pill itself is NOT included — it's rendered once between the two
+// halves. Multiple children of a node are rendered as siblings ABOVE the node
+// with a fork connector flowing downward into the node.
+function _psRenderSuctionSubtree(treeNode, flowId, isRoot) {
+  if (!treeNode) return '';
+  const item = treeNode.item;
+  const kids = treeNode.children || [];
+  let kidsHtml = '';
+  if (kids.length === 1) {
+    kidsHtml = `${_psRenderSuctionSubtree(kids[0].node, flowId, false)}<div class="tree-arrow-v"></div>`;
+  } else if (kids.length > 1) {
+    kidsHtml = `
+      <div class="tree-fork tree-fork-up">
+        <div class="tree-fork-cols">
+          ${kids.map(c => `
+            <div class="tree-fork-col">
+              ${_psRenderSuctionSubtree(c.node, flowId, false)}
+              <div class="tree-fork-stem"></div>
+            </div>`).join('')}
+        </div>
+        <div class="tree-fork-line"></div>
+      </div>
+      <div class="tree-arrow-v"></div>`;
+  }
+  const pillPart = isRoot ? '' : _psRenderPill(item, flowId);
+  return `<div class="tree-subtree">${kidsHtml}${pillPart}</div>`;
+}
+
+function _psPillLabel(item) {
+  const tool = (typeof TOOLS !== 'undefined' && TOOLS[item.type]) || null;
+  const typeLabel = tool ? tool.label : item.type;
+  const lbl = (item.label || '').trim();
+  return lbl && lbl !== typeLabel ? lbl : typeLabel;
+}
+
+function _psRenderPill(item, flowId) {
+  const icon = (typeof iconMarkup === 'function') ? iconMarkup(item.type) : '';
+  const label = _psPillLabel(item);
+  const isJunction = _PSBRANCH_TYPES.has(item.type);
+  const editing = _flowsEditState.editingFlowId === flowId;
+  const removable = editing && !SUCTION_FIXTURES.has(item.type) && !RETURN_FIXTURES.has(item.type) && item.type !== 'pump';
+  const branchable = editing && isJunction;
+  return `
+    <div class="tree-pill ${isJunction ? 'is-branch' : ''}" data-flow-id="${flowId}" data-item-id="${item.id}">
+      <span class="pill-icon">${icon}</span>
+      <span class="pill-label">${escapeHtml(label)}</span>
+      ${branchable ? `<button type="button" class="pill-btn" data-act="branch-step" data-flow-id="${flowId}" data-item-id="${item.id}" title="Add branch">+</button>` : ''}
+      ${removable ? `<button type="button" class="pill-btn pill-btn-danger" data-act="remove-tree-step" data-flow-id="${flowId}" data-item-id="${item.id}" title="Remove">\u2715</button>` : ''}
+    </div>`;
+}
+
+// Build the full card HTML for one pump.
+function _psRenderPumpCard(card) {
+  const flowId = `pump_${card.pump.id}`;
+  const titleBase = card.pump.label || 'Pump';
+  const title = `${escapeHtml(titleBase)} Flow`;
+  const editing = _flowsEditState.editingFlowId === flowId;
+  const suctionHtml = card.suctionTree && card.suctionTree.children.length
+    ? _psRenderSuctionSubtree(card.suctionTree, flowId, true)
+    : `<div class="tree-empty">No suction connections yet</div>`;
+  // Render the return side: pump is the root; we want pump pill rendered
+  // separately, then a fork (if many children) or single arrow into the rest.
+  let returnHtmlFinal = '';
+  if (card.returnTree && card.returnTree.children.length === 1) {
+    returnHtmlFinal = `<div class="tree-arrow-v"></div>${_psRenderReturnSubtree(card.returnTree.children[0].node, flowId)}`;
+  } else if (card.returnTree && card.returnTree.children.length > 1) {
+    returnHtmlFinal = `
+      <div class="tree-arrow-v"></div>
+      <div class="tree-fork tree-fork-down">
+        <div class="tree-fork-line"></div>
+        <div class="tree-fork-cols">
+          ${card.returnTree.children.map(c => `
+            <div class="tree-fork-col">
+              <div class="tree-fork-stem"></div>
+              ${_psRenderReturnSubtree(c.node, flowId)}
+            </div>`).join('')}
+        </div>
+      </div>`;
+  } else {
+    returnHtmlFinal = `<div class="tree-empty">No return connections yet</div>`;
+  }
+  const pumpPill = _psRenderPill(card.pump, flowId);
+  const pumpToReturnArrow = '';
+  return `
+    <div class="flow-card pump-card ${editing ? 'editing' : ''}" data-flow-id="${flowId}">
+      <div class="flow-card-head">
+        <div class="flow-card-title">${title}</div>
+        <div class="flow-card-actions">
+          ${editing
+            ? `<button type="button" data-act="done-flow" data-flow-id="${flowId}" class="primary">Done</button>`
+            : `<button type="button" data-act="edit-flow" data-flow-id="${flowId}">Edit</button>`}
+          <button type="button" data-act="delete-pump-flow" data-flow-id="${flowId}" class="danger">Delete</button>
+        </div>
+      </div>
+      <div class="pump-tree">
+        ${suctionHtml}
+        ${pumpPill}
+        ${pumpToReturnArrow}
+        ${returnHtmlFinal}
+      </div>
+    </div>`;
+}
+
+// Replace renderFlows with the tree-per-pump renderer.
+renderFlows = function renderFlowsTree() {
+  const host = $('flowsList');
+  if (!host) return;
+  const cards = buildPumpCards();
+  if (!cards.length) {
+    host.innerHTML = `
+      <div class="flows-empty">
+        <p><strong>No pumps yet</strong></p>
+        <p>Add a pump on the Diagram tab and connect fixtures to it. Each pump shows here as its own flow.</p>
+      </div>`;
+    return;
+  }
+  host.innerHTML = cards.map(_psRenderPumpCard).join('');
+};
+
+// --- Edit actions (tree-aware) ---
+
+// Remove an intermediate node from the tree by deleting the item, then
+// reconnecting its neighbors. For a node with one upstream + one downstream,
+// we bridge them with a single edge. For nodes with multiple downstream
+// (branch nodes), we reconnect each downstream child directly to the upstream.
+function flowsRemoveTreeStep(itemId) {
+  const item = state.items.find(i => i.id === itemId);
+  if (!item) return;
+  if (item.type === 'pump' || SUCTION_FIXTURES.has(item.type) || RETURN_FIXTURES.has(item.type)) {
+    toast('Cannot remove that node from here');
+    return;
+  }
+  pushUndo();
+  // Find all edges touching this item, grouped by role.
+  const touching = state.edges.filter(e => e.from === itemId || e.to === itemId);
+  // For each role, find the "upstream" side (the side that flows INTO this
+  // node) and the "downstream" sides.
+  const byRole = { suction: [], return: [] };
+  for (const e of touching) if (byRole[e.type]) byRole[e.type].push(e);
+
+  const newBridges = [];
+  for (const role of ['suction', 'return']) {
+    const edges = byRole[role];
+    if (!edges.length) continue;
+    // Bridge each pair (upstream, downstream). Heuristic: if exactly 2 edges,
+    // bridge them; otherwise pair the one with target=item (incoming) to each
+    // edge with source=item (outgoing).
+    const incoming = edges.filter(e => e.to === itemId);
+    const outgoing = edges.filter(e => e.from === itemId);
+    if (incoming.length && outgoing.length) {
+      for (const inE of incoming) {
+        for (const outE of outgoing) {
+          newBridges.push({ from: inE.from, to: outE.to, type: role, size: inE.size || outE.size || '', fromPort: inE.fromPort || '', toPort: outE.toPort || '' });
+        }
+      }
+    } else if (edges.length === 2) {
+      const a = edges[0], b = edges[1];
+      const fromId = a.from === itemId ? a.to : a.from;
+      const toId   = b.from === itemId ? b.to : b.from;
+      newBridges.push({ from: fromId, to: toId, type: role, size: a.size || b.size || '', fromPort: '', toPort: '' });
+    }
+  }
+  // Remove the item and its edges.
+  state.items = state.items.filter(i => i.id !== itemId);
+  state.edges = state.edges.filter(e => e.from !== itemId && e.to !== itemId);
+  state.dims  = state.dims.filter(d => d.a !== itemId && d.b !== itemId);
+  for (const b of newBridges) {
+    const fromIt = state.items.find(i => i.id === b.from);
+    const toIt   = state.items.find(i => i.id === b.to);
+    if (!fromIt || !toIt) continue;
+    state.edges.push({
+      id: uid(), from: b.from, to: b.to, type: b.type, size: b.size || '',
+      label: `${fromIt.label} \u2192 ${toIt.label}`,
+      active: false, blocked: false, fromPort: b.fromPort, toPort: b.toPort,
+    });
+  }
+  const el = world && world.querySelector(`.node[data-id="${itemId}"]`);
+  if (el) el.remove();
+  _flowsRerenderAll();
+}
+
+// Delete a whole pump-card (the pump + every node only reachable from it).
+function flowsDeletePumpCard(pump) {
+  if (!confirm(`Delete the ${pump.label || 'pump'} and everything connected only to it?`)) return;
+  pushUndo();
+  // Items reachable from this pump on either suction or return.
+  const cards = buildPumpCards();
+  const myCard = cards.find(c => c.pump.id === pump.id);
+  if (!myCard) return;
+  const myIds = new Set();
+  const walk = (n) => { if (!n) return; myIds.add(n.item.id); for (const c of (n.children||[])) walk(c.node); };
+  walk(myCard.suctionTree);
+  walk(myCard.returnTree);
+  // Don't delete items also reachable from another pump.
+  const otherIds = new Set();
+  for (const c of cards) {
+    if (c.pump.id === pump.id) continue;
+    walk.call(null, c.suctionTree); // not actually using `this`
+  }
+  // Recompute correctly (the above closure captured single `walk`; do another pass)
+  const otherReachable = new Set();
+  const walk2 = (n, dest) => { if (!n) return; dest.add(n.item.id); for (const c of (n.children||[])) walk2(c.node, dest); };
+  for (const c of cards) {
+    if (c.pump.id === pump.id) continue;
+    walk2(c.suctionTree, otherReachable);
+    walk2(c.returnTree,  otherReachable);
+  }
+  const toDelete = new Set();
+  for (const id of myIds) if (!otherReachable.has(id)) toDelete.add(id);
+  state.items = state.items.filter(i => !toDelete.has(i.id));
+  state.edges = state.edges.filter(e => !toDelete.has(e.from) && !toDelete.has(e.to));
+  state.dims  = state.dims.filter(d => !toDelete.has(d.a) && !toDelete.has(d.b));
+  for (const id of toDelete) {
+    const el = world && world.querySelector(`.node[data-id="${id}"]`);
+    if (el) el.remove();
+  }
+  _flowsEditState.editingFlowId = null;
+  _flowsRerenderAll();
+}
+
+// Wire up the tree-aware click handler. Replaces the older delegations.
+(function rebindTreeClicks() {
+  const host = $('flowsList');
+  if (!host) return;
+  const fresh = host.cloneNode(false);
+  host.parentNode.replaceChild(fresh, host);
+  fresh.addEventListener('click', (ev) => {
+    const t = ev.target.closest('[data-act]');
+    if (!t) return;
+    const act = t.getAttribute('data-act');
+    const flowId = t.getAttribute('data-flow-id');
+    const itemId = t.getAttribute('data-item-id');
+    if (act === 'edit-flow') {
+      _flowsEditState.editingFlowId = flowId;
+      renderFlows();
+    } else if (act === 'done-flow') {
+      _flowsEditState.editingFlowId = null;
+      renderFlows();
+    } else if (act === 'delete-pump-flow') {
+      const pumpId = flowId && flowId.startsWith('pump_') ? flowId.slice(5) : null;
+      const pump = pumpId && state.items.find(i => i.id === pumpId);
+      if (pump) flowsDeletePumpCard(pump);
+    } else if (act === 'remove-tree-step') {
+      flowsRemoveTreeStep(itemId);
+    } else if (act === 'branch-step') {
+      // Use the existing branch picker; it expects a flow object with allItems,
+      // so synthesize a minimal compatible shape.
+      const item = state.items.find(i => i.id === itemId);
+      if (!item) return;
+      const fakeFlow = { id: flowId, source: null, destination: null, pump: null, allItems: [item], suctionPath: [], returnPath: [] };
+      // Map step idx 0 -> this item
+      flowsOpenBranchPicker(fakeFlow, 0);
+    }
+  });
+})();
+
+// Inject Poolside-style CSS for the tree layout.
+(function injectTreeCSS() {
+  const css = `
+    .pump-card { overflow-x:auto; }
+    .pump-card .pump-tree {
+      display:flex; flex-direction:column; align-items:center;
+      padding:8px 4px 4px;
+      min-width:fit-content;
+    }
+    .pump-tree .tree-subtree {
+      display:flex; flex-direction:column; align-items:center;
+    }
+    .pump-tree .tree-pill {
+      display:inline-flex; align-items:center; gap:8px;
+      background:var(--offset); border:1px solid var(--border);
+      border-radius:999px; padding:7px 14px; min-height:32px;
+      font-size:13px; font-weight:600; color:var(--text);
+      box-shadow:0 1px 1px rgba(0,0,0,.03);
+      max-width:220px;
+      position:relative;
+    }
+    .pump-tree .tree-pill .pill-icon {
+      width:18px; height:18px; flex-shrink:0;
+      display:inline-flex; align-items:center; justify-content:center;
+      color:var(--primary);
+    }
+    .pump-tree .tree-pill .pill-icon svg { width:16px; height:16px; }
+    .pump-tree .tree-pill .pill-label {
+      white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+      max-width:140px;
+    }
+    .pump-tree .tree-pill.is-branch {
+      background:var(--surface); border-color:var(--primary);
+    }
+    .pump-tree .tree-pill .pill-btn {
+      appearance:none; -webkit-appearance:none;
+      background:var(--primary); color:#fff; border:0;
+      width:18px; height:18px; border-radius:50%;
+      font-size:12px; line-height:1; font-weight:700;
+      cursor:pointer; display:none; align-items:center; justify-content:center;
+      padding:0;
+    }
+    .pump-tree .tree-pill .pill-btn-danger { background:var(--error); }
+    .flow-card.editing .pump-tree .tree-pill .pill-btn { display:inline-flex; }
+    /* Simple vertical arrow segment between two stacked pills */
+    .pump-tree .tree-arrow-v {
+      width:2px; height:18px; background:var(--border);
+      position:relative;
+    }
+    .pump-tree .tree-arrow-v::after {
+      content:''; position:absolute; left:50%; bottom:-1px;
+      width:6px; height:6px;
+      border-right:2px solid var(--border);
+      border-bottom:2px solid var(--border);
+      transform:translateX(-50%) rotate(45deg);
+    }
+    /* Fork: container for parallel branches under/above a junction */
+    .pump-tree .tree-fork {
+      display:flex; flex-direction:column; align-items:center;
+    }
+    .pump-tree .tree-fork-cols {
+      display:flex; flex-direction:row; gap:24px;
+    }
+    .pump-tree .tree-fork-down .tree-fork-cols { align-items:flex-start; }
+    .pump-tree .tree-fork-up   .tree-fork-cols { align-items:flex-end; }
+    .pump-tree .tree-fork-col {
+      display:flex; flex-direction:column; align-items:center;
+      min-width:0;
+    }
+    .pump-tree .tree-fork-stem {
+      width:2px; height:14px; background:var(--border);
+    }
+    .pump-tree .tree-fork-line {
+      height:2px; background:var(--border);
+      width:calc(100% - 80px);
+      align-self:center;
+    }
+    .pump-tree .tree-empty {
+      font-size:12px; color:var(--muted); padding:6px 0;
+    }
+  `;
+  const style = document.createElement('style');
+  style.textContent = css;
+  document.head.appendChild(style);
+})();
+
+
 // Resize
 window.addEventListener('resize', () => { applyTransform(); });
 
