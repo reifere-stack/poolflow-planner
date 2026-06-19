@@ -6043,11 +6043,16 @@ function _wizFinalize() {
   // Suction sources \u2014 stamped with body assignment.
   // Body-aware label: a Spa-bound "Main Drain" becomes "Spa Main Drain"; a pool-bound
   // "Main Drain" stays "Main Drain" (kept short since pool is the default body).
+  // Strip the wizard's auto numeric suffix when a body prefix already disambiguates.
   const srcItems = _wizState.sources.map((s, i) => {
     const bodyName = s.body || 'pool';
     const body = bodyOf(bodyName);
     let lbl = s.label || '';
-    if (bodyName === 'spa' && !/^Spa\b/i.test(lbl)) lbl = `Spa ${lbl}`;
+    if (bodyName === 'spa' && !/^Spa\b/i.test(lbl)) {
+      // Drop trailing " 2", " 3" etc. \u2014 _uniqLabel will re-add only if needed.
+      lbl = lbl.replace(/\s+\d+$/, '');
+      lbl = `Spa ${lbl}`;
+    }
     const item = addItem(s.type, { x: baseX - 800, y: padY + i * 120, label: _uniqLabel(lbl) });
     if (body) {
       item.bodyId = body.id;
@@ -6095,7 +6100,10 @@ function _wizFinalize() {
     const body = bodyOf(bodyName);
     // Body-aware default label: replace 'Pool ' prefix with body name when relevant.
     let lbl = d.label || '';
-    if (bodyName === 'spa' && /^Pool /.test(lbl)) lbl = lbl.replace(/^Pool /, 'Spa ');
+    if (bodyName === 'spa' && /^Pool /.test(lbl)) {
+      lbl = lbl.replace(/^Pool /, 'Spa ');
+      lbl = lbl.replace(/\s+\d+$/, ''); // drop wizard numbering once body disambiguates
+    }
     const item = addItem(d.type, { x: baseX + 1400, y: padY + i * 120, label: _uniqLabel(lbl) });
     if (body) {
       item.bodyId = body.id;
