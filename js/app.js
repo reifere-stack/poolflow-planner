@@ -135,6 +135,28 @@ const LEGACY_COMPACT_SIZES = {
   feature:  [[60,44],[32,24]],
   light:    [[36,36],[20,20]],
 };
+// Legacy sizes for equipment, valves, tees, custom, bodylink \u2014 anything that
+// had bigger defaults before the diagram-tightening pass. Only items still
+// matching one of these legacy sizes are auto-shrunk; user-resized items keep
+// their custom dimensions.
+const LEGACY_EQUIP_SIZES = {
+  pump:       [[110,70]],
+  filter:     [[110,70]],
+  heater:     [[110,70]],
+  saltcell:   [[110,70]],
+  booster:    [[110,70]],
+  blower:     [[110,70]],
+  manifold:   [[120,70]],
+  conduit:    [[100,60]],
+  customeq:   [[120,70]],
+  valve2:     [[100,70]],
+  valve3:     [[130,100]],
+  checkvalve: [[110,70]],
+  actuated:   [[120,70]],
+  tee:        [[80,60]],
+  custom:     [[80,50]],
+  bodylink:   [[100,50]],
+};
 function migrateCompactSizes(s) {
   if (!s || !Array.isArray(s.items)) return;
   for (const it of s.items) {
@@ -145,6 +167,22 @@ function migrateCompactSizes(s) {
     const matchesLegacy = legacy.some(([w, h]) => it.w === w && it.h === h);
     if (!matchesLegacy) continue;
     // Recenter on the item's current center so it doesn't visually jump.
+    const cx = it.x + it.w / 2;
+    const cy = it.y + it.h / 2;
+    it.w = tool.w;
+    it.h = tool.h;
+    it.x = Math.round(cx - it.w / 2);
+    it.y = Math.round(cy - it.h / 2);
+  }
+  // Also shrink equipment/valves/tees/etc. to their new defaults when they
+  // still match a known legacy size.
+  for (const it of s.items) {
+    const legacy = LEGACY_EQUIP_SIZES[it.type];
+    if (!legacy) continue;
+    const tool = TOOLS[it.type];
+    if (!tool) continue;
+    const matchesLegacy = legacy.some(([w, h]) => it.w === w && it.h === h);
+    if (!matchesLegacy) continue;
     const cx = it.x + it.w / 2;
     const cy = it.y + it.h / 2;
     it.w = tool.w;
@@ -5169,6 +5207,1032 @@ function flowsDeletePumpCard(pump) {
     }
     .pump-tree .tree-empty {
       font-size:12px; color:var(--muted); padding:6px 0;
+    }
+  `;
+  const style = document.createElement('style');
+  style.textContent = css;
+  document.head.appendChild(style);
+})();
+
+
+// ==================================================================
+// ============== FULL FLOW BUILDER ON FLOWS TAB ====================
+// ==================================================================
+//
+// Adds (on top of the tree-per-pump renderer):
+//   1. Click-to-rename pump card title
+//   2. Per-leaf "+ Add another" sibling button under every terminal fixture
+//   3. Loop closure: shows a final "-> Pool" / "-> Spa" pill under each
+//      return-fixture leaf indicating where water returns
+//   4. Guided "Add Flow" wizard when no pump exists (or to add another):
+//      pick name -> sources -> equipment chain -> destinations
+//   5. Junction insert picker: also offers tees/manifolds/valves/equipment
+//      not just leaf fixtures, so you never need the Diagram tab
+// ------------------------------------------------------------------
+
+const _PSPILL_BODY_TYPES = new Set(['pool', 'spa']);
+
+// Helper: find the body item (pool / spa) a fixture belongs to.
+// Pool fixtures default to 'pool'; spa fixtures default to 'spa'.
+// If a fixture's label includes 'Spa' it's a spa fixture; otherwise pool.
+// (Heuristic — good enough since user names them explicitly.)
+function _psFixtureBody(item) {
+  const items = state.items;
+  const pool = items.find(i => i.type === 'pool');
+  const spa  = items.find(i => i.type === 'spa');
+  const lbl = (item.label || '').toLowerCase();
+  if (spa && (lbl.includes('spa') || item.bodyId === (spa && spa.id))) return spa;
+  if (pool) return pool;
+  return null;
+}
+
+// ==================================================================
+// ============== Override _psRenderReturnSubtree ===================
+// ==================================================================
+//
+// We extend the renderer to:
+//  - Append a body-closure pill (-> Pool / -> Spa) under terminal return
+//    fixtures.
+//  - Show a "+ Add sibling" button under any leaf in edit mode.
+
+const _psRenderReturnSubtreeOriginal = _psRenderReturnSubtree;
+_psRenderReturnSubtree = function _psRenderReturnSubtreeExt(treeNode, flowId) {
+  if (!treeNode) return '';
+  const item = treeNode.item;
+  const kids = treeNode.children || [];
+  const editing = _flowsEditState.editingFlowId === flowId;
+
+  // Recursive child rendering (same shape as the original).
+  let kidsHtml = '';
+  if (kids.length === 1) {
+    kidsHtml = `<div class="tree-arrow-v"></div>${_psRenderReturnSubtree(kids[0].node, flowId)}`;
+  } else if (kids.length > 1) {
+    kidsHtml = `
+      <div class="tree-arrow-v"></div>
+      <div class="tree-fork tree-fork-down">
+        <div class="tree-fork-line"></div>
+        <div class="tree-fork-cols">
+          ${kids.map(c => `
+            <div class="tree-fork-col">
+              <div class="tree-fork-stem"></div>
+              ${_psRenderReturnSubtree(c.node, flowId)}
+            </div>`).join('')}
+        </div>
+      </div>`;
+  }
+
+  // If this is a leaf (no kids) and a return fixture, append body closure +
+  // edit-mode "Add sibling" button.
+  let leafExtras = '';
+  if (kids.length === 0 && RETURN_FIXTURES.has(item.type)) {
+    const body = _psFixtureBody(item);
+    if (body) {
+      leafExtras += `<div class="tree-arrow-v"></div>` + _psRenderPill(body, flowId, { isClosure: true, side: 'return' });
+    }
+  }
+  if (kids.length === 0 && editing) {
+    leafExtras += `<button type="button" class="leaf-add-btn" data-act="add-sibling" data-flow-id="${flowId}" data-item-id="${item.id}">+ Add another</button>`;
+  }
+
+  return `<div class="tree-subtree">${_psRenderPill(item, flowId, { side: 'return' })}${kidsHtml}${leafExtras}</div>`;
+};
+
+// Suction side leaf "+" too.
+const _psRenderSuctionSubtreeOriginal = _psRenderSuctionSubtree;
+_psRenderSuctionSubtree = function _psRenderSuctionSubtreeExt(treeNode, flowId, isRoot) {
+  if (!treeNode) return '';
+  const item = treeNode.item;
+  const kids = treeNode.children || [];
+  const editing = _flowsEditState.editingFlowId === flowId;
+
+  let kidsHtml = '';
+  if (kids.length === 1) {
+    kidsHtml = `${_psRenderSuctionSubtree(kids[0].node, flowId, false)}<div class="tree-arrow-v"></div>`;
+  } else if (kids.length > 1) {
+    kidsHtml = `
+      <div class="tree-fork tree-fork-up">
+        <div class="tree-fork-cols">
+          ${kids.map(c => `
+            <div class="tree-fork-col">
+              ${_psRenderSuctionSubtree(c.node, flowId, false)}
+              <div class="tree-fork-stem"></div>
+            </div>`).join('')}
+        </div>
+        <div class="tree-fork-line"></div>
+      </div>
+      <div class="tree-arrow-v"></div>`;
+  }
+
+  let leafExtras = '';
+  if (kids.length === 0 && !isRoot && SUCTION_FIXTURES.has(item.type) && editing) {
+    leafExtras = `<button type="button" class="leaf-add-btn" data-act="add-sibling-up" data-flow-id="${flowId}" data-item-id="${item.id}">+ Add another</button>`;
+  }
+  // For suction side, the body-closure pill goes ABOVE the source fixture
+  // since suction starts from a body.
+  let closurePill = '';
+  if (kids.length === 0 && !isRoot && SUCTION_FIXTURES.has(item.type)) {
+    const body = _psFixtureBody(item);
+    if (body) {
+      closurePill = _psRenderPill(body, flowId, { isClosure: true, side: 'suction' }) + `<div class="tree-arrow-v"></div>`;
+    }
+  }
+
+  const pillPart = isRoot ? '' : _psRenderPill(item, flowId, { side: 'suction' });
+  return `<div class="tree-subtree">${leafExtras}${closurePill}${kidsHtml}${pillPart}</div>`;
+};
+
+// ==================================================================
+// ========== Override _psRenderPill: add closure variant ===========
+// ==================================================================
+const _psRenderPillOriginal = _psRenderPill;
+_psRenderPill = function _psRenderPillExt(item, flowId, opts) {
+  opts = opts || {};
+  const icon = (typeof iconMarkup === 'function') ? iconMarkup(item.type) : '';
+  const label = _psPillLabel(item);
+  const isJunction = _PSBRANCH_TYPES.has(item.type);
+  const editing = _flowsEditState.editingFlowId === flowId;
+  const isPump = item.type === 'pump';
+  const isBody = _PSPILL_BODY_TYPES.has(item.type);
+  const isFixture = SUCTION_FIXTURES.has(item.type) || RETURN_FIXTURES.has(item.type);
+  const removable = editing && !opts.isClosure && !isFixture && !isPump && !isBody;
+  const branchable = editing && isJunction;
+  const renamable  = !opts.isClosure;
+  // side: 'suction' (tree above pump, water flowing DOWN to pump) or
+  //       'return'  (tree below pump, water flowing DOWN away from pump)
+  const side = opts.side || 'return';
+  // Determine which insert handles to show.
+  // We allow inserting on every pill in edit mode except closure pills.
+  // - On suction side: "+ above" inserts upstream of this pill (further from pump),
+  //                    "+ below" inserts downstream (between this pill and the next toward the pump).
+  // - On return side:  "+ above" inserts upstream (between pump and this pill),
+  //                    "+ below" inserts downstream of this pill.
+  // Pumps suppress their own handles \u2014 the card already has dedicated buttons.
+  const showInserts = editing && !opts.isClosure && !isPump;
+  const aboveHandle = showInserts
+    ? `<button type="button" class="pill-insert pill-insert-above" data-act="insert-above" data-side="${side}" data-flow-id="${flowId}" data-item-id="${item.id}" title="Insert above">+</button>`
+    : '';
+  const belowHandle = showInserts
+    ? `<button type="button" class="pill-insert pill-insert-below" data-act="insert-below" data-side="${side}" data-flow-id="${flowId}" data-item-id="${item.id}" title="Insert below">+</button>`
+    : '';
+  const classes = ['tree-pill'];
+  if (isJunction) classes.push('is-branch');
+  if (opts.isClosure) classes.push('is-closure');
+  return `
+    <div class="tree-pill-wrap">
+      ${aboveHandle}
+      <div class="${classes.join(' ')}" data-flow-id="${flowId}" data-item-id="${item.id}" data-pill-kind="${opts.isClosure ? 'closure' : 'main'}">
+        <span class="pill-icon">${icon}</span>
+        <span class="pill-label" ${editing && renamable ? `data-act="rename-pill" data-flow-id="${flowId}" data-item-id="${item.id}"` : ''}>${escapeHtml(label)}</span>
+        ${branchable ? `<button type="button" class="pill-btn" data-act="branch-step" data-flow-id="${flowId}" data-item-id="${item.id}" title="Add branch">+</button>` : ''}
+        ${removable ? `<button type="button" class="pill-btn pill-btn-danger" data-act="remove-tree-step" data-flow-id="${flowId}" data-item-id="${item.id}" title="Remove">\u2715</button>` : ''}
+      </div>
+      ${belowHandle}
+    </div>`;
+};
+
+// ==================================================================
+// ========== Override _psRenderPumpCard: rename + delete ===========
+// ==================================================================
+const _psRenderPumpCardOriginal = _psRenderPumpCard;
+_psRenderPumpCard = function _psRenderPumpCardExt(card) {
+  const flowId = `pump_${card.pump.id}`;
+  const titleBase = card.pump.label || 'Pump';
+  // Strip a trailing " Flow" if user re-saves
+  const title = /flow$/i.test(titleBase.trim()) ? titleBase : `${titleBase} Flow`;
+  const editing = _flowsEditState.editingFlowId === flowId;
+
+  const suctionHtml = card.suctionTree && card.suctionTree.children.length
+    ? _psRenderSuctionSubtree(card.suctionTree, flowId, true)
+    : `<div class="tree-empty">No suction sources yet</div>`;
+
+  let returnHtmlFinal;
+  if (card.returnTree && card.returnTree.children.length === 1) {
+    returnHtmlFinal = `<div class="tree-arrow-v"></div>${_psRenderReturnSubtree(card.returnTree.children[0].node, flowId)}`;
+  } else if (card.returnTree && card.returnTree.children.length > 1) {
+    returnHtmlFinal = `
+      <div class="tree-arrow-v"></div>
+      <div class="tree-fork tree-fork-down">
+        <div class="tree-fork-line"></div>
+        <div class="tree-fork-cols">
+          ${card.returnTree.children.map(c => `
+            <div class="tree-fork-col">
+              <div class="tree-fork-stem"></div>
+              ${_psRenderReturnSubtree(c.node, flowId)}
+            </div>`).join('')}
+        </div>
+      </div>`;
+  } else {
+    returnHtmlFinal = `<div class="tree-empty">No return destinations yet</div>`;
+  }
+
+  const pumpPill = _psRenderPill(card.pump, flowId);
+  const editBtns = editing
+    ? `<button type="button" data-act="rename-card" data-flow-id="${flowId}">Rename</button>
+       <button type="button" data-act="done-flow" data-flow-id="${flowId}" class="primary">Done</button>`
+    : `<button type="button" data-act="edit-flow" data-flow-id="${flowId}">Edit</button>`;
+
+  // In edit mode show extra row of "+" buttons for adding more suction sources
+  // or return destinations at any time.
+  const editingExtras = editing ? `
+    <div class="card-edit-bar">
+      <button type="button" data-act="add-suction" data-flow-id="${flowId}">+ Add suction source</button>
+      <button type="button" data-act="add-equipment" data-flow-id="${flowId}">+ Add equipment</button>
+      <button type="button" data-act="add-return" data-flow-id="${flowId}">+ Add return destination</button>
+    </div>` : '';
+
+  return `
+    <div class="flow-card pump-card ${editing ? 'editing' : ''}" data-flow-id="${flowId}">
+      <div class="flow-card-head">
+        <div class="flow-card-title">${escapeHtml(title)}</div>
+        <div class="flow-card-actions">
+          ${editBtns}
+          <button type="button" data-act="delete-pump-flow" data-flow-id="${flowId}" class="danger">Delete</button>
+        </div>
+      </div>
+      ${editingExtras}
+      <div class="pump-tree">
+        ${suctionHtml}
+        ${pumpPill}
+        ${returnHtmlFinal}
+      </div>
+    </div>`;
+};
+
+// ==================================================================
+// ============== ADD FLOW WIZARD (guided builder) ==================
+// ==================================================================
+
+const _WIZ_SUC_TYPES = [
+  { type: 'skimmer', label: 'Skimmer' },
+  { type: 'drain',   label: 'Main Drain' },
+];
+const _WIZ_EQ_TYPES = [
+  { type: 'filter',   label: 'Filter' },
+  { type: 'heater',   label: 'Heater' },
+  { type: 'saltcell', label: 'Salt Cell' },
+  { type: 'booster',  label: 'Booster Pump' },
+  { type: 'blower',   label: 'Blower' },
+  { type: 'valve2',   label: '2-Way Valve' },
+  { type: 'valve3',   label: '3-Way Valve' },
+  { type: 'tee',      label: 'Tee' },
+  { type: 'manifold', label: 'Manifold' },
+  { type: 'customeq', label: 'Other Equipment' },
+];
+const _WIZ_RET_TYPES = [
+  { type: 'return',  label: 'Pool Return' },
+  { type: 'jet',     label: 'Spa Jet' },
+  { type: 'bubbler', label: 'Bubbler' },
+  { type: 'deckjet', label: 'Deck Jet' },
+  { type: 'sheer',   label: 'Sheer Descent' },
+  { type: 'slide',   label: 'Slide' },
+  { type: 'feature', label: 'Water Feature' },
+];
+
+// Wizard state lives between modal steps.
+const _wizState = {
+  step: 0,
+  pumpLabel: 'Pool Flow',
+  sources: [],      // [{type, label}]
+  equipment: [],    // [{type, label}] in order
+  destinations: [], // [{type, label}]
+};
+
+function _wizReset() {
+  _wizState.step = 0;
+  _wizState.pumpLabel = 'Pool Flow';
+  _wizState.sources = [];
+  _wizState.equipment = [];
+  _wizState.destinations = [];
+}
+
+function openAddFlowWizard() {
+  _wizReset();
+  _wizRender();
+}
+
+function _wizRender() {
+  switch (_wizState.step) {
+    case 0: return _wizRenderStep0();
+    case 1: return _wizRenderStep1();
+    case 2: return _wizRenderStep2();
+    case 3: return _wizRenderStep3();
+    case 4: return _wizFinalize();
+  }
+}
+
+function _wizFooter(backLabel, nextLabel, nextDisabled) {
+  return `
+    <div class="row" style="margin-top:14px; justify-content:space-between; gap:8px;">
+      <button class="btn" id="wiz-cancel">Cancel</button>
+      <div style="display:flex; gap:8px;">
+        ${_wizState.step > 0 ? `<button class="btn" id="wiz-back">${escapeHtml(backLabel || 'Back')}</button>` : ''}
+        <button class="btn primary" id="wiz-next" ${nextDisabled ? 'disabled' : ''}>${escapeHtml(nextLabel || 'Next')}</button>
+      </div>
+    </div>`;
+}
+
+function _wizRenderStep0() {
+  modalContent.innerHTML = `
+    <h3>New Flow \u00b7 Step 1 of 4</h3>
+    <p style="color:var(--muted); font-size:13px;">Name this flow. The pump under it will use this name (e.g. "Pool Flow", "Spa Jets").</p>
+    <div class="field" style="margin-top:8px;">
+      <label>Flow name</label>
+      <input type="text" id="wiz-name" value="${escapeHtml(_wizState.pumpLabel)}" placeholder="e.g. Pool Flow" />
+    </div>
+    ${_wizFooter('Back', 'Next \u2192')}
+  `;
+  modalBackdrop.classList.add('show');
+  $('wiz-cancel').onclick = closeModal;
+  $('wiz-next').onclick = () => {
+    const v = $('wiz-name').value.trim();
+    _wizState.pumpLabel = v || 'Pool Flow';
+    _wizState.step = 1; _wizRender();
+  };
+  setTimeout(() => $('wiz-name') && $('wiz-name').focus(), 50);
+}
+
+function _wizRenderStep1() {
+  const selectedHtml = _wizState.sources.map((s, i) => `
+    <div class="wiz-chip">
+      <span>${escapeHtml(s.label)}</span>
+      <button type="button" data-wiz-remove-source="${i}" aria-label="Remove">\u2715</button>
+    </div>`).join('') || `<div style="color:var(--muted); font-size:12px;">No sources yet \u2014 add at least one below.</div>`;
+
+  modalContent.innerHTML = `
+    <h3>New Flow \u00b7 Step 2 of 4</h3>
+    <p style="color:var(--muted); font-size:13px;">Where does water come <strong>from</strong>? Add one or more suction sources. Multiple sources will share a Tee automatically.</p>
+    <div id="wiz-source-list" class="wiz-chips" style="margin:8px 0;">${selectedHtml}</div>
+    <div style="font-weight:600; font-size:12px; color:var(--muted); margin:8px 0 4px; text-transform:uppercase; letter-spacing:.04em;">Add source</div>
+    <div style="display:grid; grid-template-columns:repeat(2,1fr); gap:8px;">
+      ${_WIZ_SUC_TYPES.map(t => `<button type="button" class="btn" data-wiz-add-source="${t.type}">${escapeHtml(t.label)}</button>`).join('')}
+    </div>
+    ${_wizFooter('\u2190 Back', 'Next \u2192', _wizState.sources.length === 0)}
+  `;
+  $('wiz-cancel').onclick = closeModal;
+  $('wiz-back').onclick  = () => { _wizState.step = 0; _wizRender(); };
+  $('wiz-next').onclick  = () => { _wizState.step = 2; _wizRender(); };
+  modalContent.querySelectorAll('[data-wiz-add-source]').forEach(b => {
+    b.onclick = () => {
+      const type = b.getAttribute('data-wiz-add-source');
+      const def = _WIZ_SUC_TYPES.find(x => x.type === type);
+      const count = _wizState.sources.filter(s => s.type === type).length + 1;
+      const label = count === 1 ? def.label : `${def.label} ${count}`;
+      _wizState.sources.push({ type, label });
+      _wizRender();
+    };
+  });
+  modalContent.querySelectorAll('[data-wiz-remove-source]').forEach(b => {
+    b.onclick = () => {
+      const idx = parseInt(b.getAttribute('data-wiz-remove-source'), 10);
+      _wizState.sources.splice(idx, 1); _wizRender();
+    };
+  });
+}
+
+function _wizRenderStep2() {
+  const eqHtml = _wizState.equipment.map((e, i) => `
+    <div class="wiz-chip">
+      <span>${i + 1}. ${escapeHtml(e.label)}</span>
+      <button type="button" data-wiz-remove-eq="${i}" aria-label="Remove">\u2715</button>
+    </div>`).join('') || `<div style="color:var(--muted); font-size:12px;">No equipment yet. Order matters: water flows in this sequence after the pump.</div>`;
+
+  modalContent.innerHTML = `
+    <h3>New Flow \u00b7 Step 3 of 4</h3>
+    <p style="color:var(--muted); font-size:13px;">Add equipment between the pump and the returns, in flow order (filter \u2192 heater \u2192 etc).</p>
+    <div id="wiz-eq-list" class="wiz-chips" style="margin:8px 0;">${eqHtml}</div>
+    <div style="font-weight:600; font-size:12px; color:var(--muted); margin:8px 0 4px; text-transform:uppercase; letter-spacing:.04em;">Add equipment</div>
+    <div style="display:grid; grid-template-columns:repeat(2,1fr); gap:6px;">
+      ${_WIZ_EQ_TYPES.map(t => `<button type="button" class="btn" data-wiz-add-eq="${t.type}">${escapeHtml(t.label)}</button>`).join('')}
+    </div>
+    ${_wizFooter('\u2190 Back', 'Next \u2192')}
+  `;
+  $('wiz-cancel').onclick = closeModal;
+  $('wiz-back').onclick  = () => { _wizState.step = 1; _wizRender(); };
+  $('wiz-next').onclick  = () => { _wizState.step = 3; _wizRender(); };
+  modalContent.querySelectorAll('[data-wiz-add-eq]').forEach(b => {
+    b.onclick = () => {
+      const type = b.getAttribute('data-wiz-add-eq');
+      const def = _WIZ_EQ_TYPES.find(x => x.type === type);
+      _wizState.equipment.push({ type, label: def.label });
+      _wizRender();
+    };
+  });
+  modalContent.querySelectorAll('[data-wiz-remove-eq]').forEach(b => {
+    b.onclick = () => {
+      const idx = parseInt(b.getAttribute('data-wiz-remove-eq'), 10);
+      _wizState.equipment.splice(idx, 1); _wizRender();
+    };
+  });
+}
+
+function _wizRenderStep3() {
+  const dstHtml = _wizState.destinations.map((d, i) => `
+    <div class="wiz-chip">
+      <span>${escapeHtml(d.label)}</span>
+      <button type="button" data-wiz-remove-dst="${i}" aria-label="Remove">\u2715</button>
+    </div>`).join('') || `<div style="color:var(--muted); font-size:12px;">No destinations yet \u2014 add at least one below.</div>`;
+
+  modalContent.innerHTML = `
+    <h3>New Flow \u00b7 Step 4 of 4</h3>
+    <p style="color:var(--muted); font-size:13px;">Where does water come <strong>out</strong>? Add one or more return destinations. Multiple destinations will share a Tee automatically.</p>
+    <div id="wiz-dst-list" class="wiz-chips" style="margin:8px 0;">${dstHtml}</div>
+    <div style="font-weight:600; font-size:12px; color:var(--muted); margin:8px 0 4px; text-transform:uppercase; letter-spacing:.04em;">Add destination</div>
+    <div style="display:grid; grid-template-columns:repeat(2,1fr); gap:8px;">
+      ${_WIZ_RET_TYPES.map(t => `<button type="button" class="btn" data-wiz-add-dst="${t.type}">${escapeHtml(t.label)}</button>`).join('')}
+    </div>
+    ${_wizFooter('\u2190 Back', 'Create flow', _wizState.destinations.length === 0)}
+  `;
+  $('wiz-cancel').onclick = closeModal;
+  $('wiz-back').onclick  = () => { _wizState.step = 2; _wizRender(); };
+  $('wiz-next').onclick  = () => { _wizState.step = 4; _wizRender(); };
+  modalContent.querySelectorAll('[data-wiz-add-dst]').forEach(b => {
+    b.onclick = () => {
+      const type = b.getAttribute('data-wiz-add-dst');
+      const def = _WIZ_RET_TYPES.find(x => x.type === type);
+      const count = _wizState.destinations.filter(s => s.type === type).length + 1;
+      const label = count === 1 ? def.label : `${def.label} ${count}`;
+      _wizState.destinations.push({ type, label });
+      _wizRender();
+    };
+  });
+  modalContent.querySelectorAll('[data-wiz-remove-dst]').forEach(b => {
+    b.onclick = () => {
+      const idx = parseInt(b.getAttribute('data-wiz-remove-dst'), 10);
+      _wizState.destinations.splice(idx, 1); _wizRender();
+    };
+  });
+}
+
+// Materialize: create real items + edges from the wizard config.
+function _wizFinalize() {
+  pushUndo();
+  const baseX = 200, baseY = 200;
+  const stepX = 160, padY  = 360;
+
+  // Pump
+  const pump = addItem('pump', { x: baseX + (_wizState.equipment.length ? 0 : 0), y: baseY, label: _wizState.pumpLabel.replace(/\s*flow$/i, '').trim() || 'Pump' });
+
+  // Suction sources
+  const srcItems = _wizState.sources.map((s, i) => addItem(s.type, { x: baseX - 800, y: padY + i * 120, label: s.label }));
+  let sucJoiner = null;
+  if (srcItems.length === 1) {
+    sucJoiner = srcItems[0];
+  } else {
+    // Combine via a Tee/manifold
+    sucJoiner = addItem('tee', { x: baseX - 400, y: baseY + 100, label: 'Suction Tee' });
+    for (const s of srcItems) {
+      state.edges.push({ id: uid(), from: s.id, to: sucJoiner.id, type: 'suction', size: '', label: `${s.label} \u2192 ${sucJoiner.label}`, active: false, blocked: false, fromPort: '', toPort: '' });
+    }
+  }
+  state.edges.push({ id: uid(), from: sucJoiner.id, to: pump.id, type: 'suction', size: '', label: `${sucJoiner.label} \u2192 ${pump.label}`, active: false, blocked: false, fromPort: '', toPort: 'intake' });
+
+  // Equipment chain
+  let prev = pump;
+  let prevPort = 'discharge';
+  const eqItems = [];
+  _wizState.equipment.forEach((e, i) => {
+    const eq = addItem(e.type, { x: baseX + 200 + i * stepX, y: baseY, label: e.label });
+    eqItems.push(eq);
+    state.edges.push({
+      id: uid(), from: prev.id, to: eq.id, type: 'return', size: '',
+      label: `${prev.label} \u2192 ${eq.label}`,
+      active: false, blocked: false,
+      fromPort: prevPort, toPort: '',
+    });
+    prev = eq; prevPort = '';
+  });
+
+  // Destinations
+  const dstItems = _wizState.destinations.map((d, i) => addItem(d.type, { x: baseX + 1400, y: padY + i * 120, label: d.label }));
+  let retJoiner = null;
+  if (dstItems.length === 1) {
+    retJoiner = dstItems[0];
+    state.edges.push({ id: uid(), from: prev.id, to: retJoiner.id, type: 'return', size: '', label: `${prev.label} \u2192 ${retJoiner.label}`, active: false, blocked: false, fromPort: prevPort, toPort: '' });
+  } else {
+    const retTee = addItem('tee', { x: baseX + 1100, y: baseY + 100, label: 'Return Tee' });
+    state.edges.push({ id: uid(), from: prev.id, to: retTee.id, type: 'return', size: '', label: `${prev.label} \u2192 ${retTee.label}`, active: false, blocked: false, fromPort: prevPort, toPort: '' });
+    for (const d of dstItems) {
+      state.edges.push({ id: uid(), from: retTee.id, to: d.id, type: 'return', size: '', label: `${retTee.label} \u2192 ${d.label}`, active: false, blocked: false, fromPort: '', toPort: '' });
+    }
+  }
+
+  // Make sure there's a Pool body if we have any pool-y fixtures
+  if (!state.items.some(i => i.type === 'pool')) {
+    addItem('pool', { x: 60, y: 420, label: 'Pool' });
+  }
+
+  migratePortsOnLoad(state);
+  closeModal();
+  solveFlow(); persist(); redrawAll();
+  renderFlows();
+  toast(`Created ${_wizState.pumpLabel}`);
+}
+
+// ==================================================================
+// ========== INSERT/BRANCH PICKER (works for tree-mode) ============
+// ==================================================================
+//
+// When the user taps the "+" on a junction or asks to add a sibling under a
+// leaf, show a unified picker offering: fixtures (sources or destinations),
+// junctions (tee/manifold/valve3/valve2), and equipment.
+
+function flowsOpenTreePicker(role, attachToItem, opts) {
+  opts = opts || {};
+  // role: 'suction' or 'return' \u2014 determines fixture lists.
+  const fixtureList = role === 'suction' ? _WIZ_SUC_TYPES : _WIZ_RET_TYPES;
+  const junctionList = [
+    { type: 'tee',      label: 'Tee' },
+    { type: 'manifold', label: 'Manifold' },
+    { type: 'valve3',   label: '3-Way Valve' },
+    { type: 'valve2',   label: '2-Way Valve' },
+  ];
+  const equipList = _WIZ_EQ_TYPES.filter(t => !['tee','manifold','valve2','valve3'].includes(t.type));
+
+  const titleMain = opts.titleOverride || `Add to ${escapeHtml(_psPillLabel(attachToItem))}`;
+  modalContent.innerHTML = `
+    <h3>${titleMain}</h3>
+    <div style="font-weight:600; font-size:12px; color:var(--muted); margin:8px 0 4px; text-transform:uppercase; letter-spacing:.04em;">Fixture</div>
+    <div style="display:grid; grid-template-columns:repeat(2,1fr); gap:6px;">
+      ${fixtureList.map(t => `<button type="button" class="btn" data-pick-type="${t.type}" data-pick-role="fixture">${escapeHtml(t.label)}</button>`).join('')}
+    </div>
+    <div style="font-weight:600; font-size:12px; color:var(--muted); margin:12px 0 4px; text-transform:uppercase; letter-spacing:.04em;">Junction</div>
+    <div style="display:grid; grid-template-columns:repeat(2,1fr); gap:6px;">
+      ${junctionList.map(t => `<button type="button" class="btn" data-pick-type="${t.type}" data-pick-role="junction">${escapeHtml(t.label)}</button>`).join('')}
+    </div>
+    <div style="font-weight:600; font-size:12px; color:var(--muted); margin:12px 0 4px; text-transform:uppercase; letter-spacing:.04em;">Equipment</div>
+    <div style="display:grid; grid-template-columns:repeat(2,1fr); gap:6px;">
+      ${equipList.map(t => `<button type="button" class="btn" data-pick-type="${t.type}" data-pick-role="equipment">${escapeHtml(t.label)}</button>`).join('')}
+    </div>
+    <div class="row" style="margin-top:14px; justify-content:flex-end;">
+      <button class="btn" id="tree-pick-cancel">Cancel</button>
+    </div>`;
+  modalBackdrop.classList.add('show');
+  $('tree-pick-cancel').onclick = closeModal;
+  modalContent.querySelectorAll('[data-pick-type]').forEach(b => {
+    b.onclick = () => {
+      const type = b.getAttribute('data-pick-type');
+      const def = [..._WIZ_SUC_TYPES, ..._WIZ_RET_TYPES, ..._WIZ_EQ_TYPES, ...junctionList].find(x => x.type === type);
+      const label = def && def.label;
+      if (opts.onPick) opts.onPick(type, label);
+      closeModal();
+    };
+  });
+}
+
+// ==================================================================
+// ============== Tree-aware click handler ==========================
+// ==================================================================
+// Replace the previous handler with one that supports: rename-card,
+// rename-pill, add-sibling, add-sibling-up, add-suction, add-equipment,
+// add-return, plus the existing actions.
+
+(function rebindBuilderClicks() {
+  const host = $('flowsList');
+  if (!host) return;
+  const fresh = host.cloneNode(false);
+  host.parentNode.replaceChild(fresh, host);
+
+  fresh.addEventListener('click', (ev) => {
+    const t = ev.target.closest('[data-act]');
+    if (!t) return;
+    const act = t.getAttribute('data-act');
+    const flowId = t.getAttribute('data-flow-id');
+    const itemId = t.getAttribute('data-item-id');
+    const cards = buildPumpCards();
+    const card = cards.find(c => `pump_${c.pump.id}` === flowId);
+
+    if (act === 'edit-flow') {
+      _flowsEditState.editingFlowId = flowId; renderFlows(); return;
+    }
+    if (act === 'done-flow') {
+      _flowsEditState.editingFlowId = null; renderFlows(); return;
+    }
+    if (act === 'delete-pump-flow') {
+      if (card) flowsDeletePumpCard(card.pump); return;
+    }
+    if (act === 'remove-tree-step') {
+      flowsRemoveTreeStep(itemId); return;
+    }
+    if (act === 'rename-card') {
+      if (!card) return;
+      const newName = prompt('Rename flow:', card.pump.label || 'Pump');
+      if (newName == null) return;
+      const trimmed = newName.trim();
+      if (!trimmed) return;
+      card.pump.label = trimmed.replace(/\s*flow$/i, '').trim() || 'Pump';
+      persist(); renderFlows(); redrawAll();
+      return;
+    }
+    if (act === 'rename-pill') {
+      const item = state.items.find(i => i.id === itemId);
+      if (!item) return;
+      const newName = prompt('Rename:', item.label || item.type);
+      if (newName == null) return;
+      const trimmed = newName.trim();
+      if (!trimmed) return;
+      pushUndo();
+      item.label = trimmed;
+      persist(); renderFlows(); redrawAll();
+      return;
+    }
+    if (act === 'branch-step') {
+      const junction = state.items.find(i => i.id === itemId);
+      if (!junction) return;
+      // Figure out role: is this junction on the suction side or return side?
+      // Heuristic: look at its edges \u2014 if any are 'suction', treat as suction;
+      // else return. (User can mix afterward.)
+      const hasSuc = state.edges.some(e => (e.from === junction.id || e.to === junction.id) && e.type === 'suction');
+      const role = hasSuc ? 'suction' : 'return';
+      flowsOpenTreePicker(role, junction, {
+        onPick: (type, label) => {
+          _addToJunction(junction, type, label, role);
+        }
+      });
+      return;
+    }
+    if (act === 'add-sibling') {
+      // Add a sibling under the same parent as the leaf (return side leaf).
+      const leaf = state.items.find(i => i.id === itemId);
+      if (!leaf) return;
+      flowsOpenTreePicker('return', leaf, {
+        titleOverride: `Add another beside ${escapeHtml(_psPillLabel(leaf))}`,
+        onPick: (type, label) => _addSiblingTo(leaf, type, label, 'return'),
+      });
+      return;
+    }
+    if (act === 'add-sibling-up') {
+      const leaf = state.items.find(i => i.id === itemId);
+      if (!leaf) return;
+      flowsOpenTreePicker('suction', leaf, {
+        titleOverride: `Add another beside ${escapeHtml(_psPillLabel(leaf))}`,
+        onPick: (type, label) => _addSiblingTo(leaf, type, label, 'suction'),
+      });
+      return;
+    }
+    if (act === 'add-suction') {
+      if (!card) return;
+      flowsOpenTreePicker('suction', card.pump, {
+        titleOverride: 'Add suction source',
+        onPick: (type, label) => _addAtPump(card.pump, type, label, 'suction'),
+      });
+      return;
+    }
+    if (act === 'add-return') {
+      if (!card) return;
+      flowsOpenTreePicker('return', card.pump, {
+        titleOverride: 'Add return destination',
+        onPick: (type, label) => _addAtPump(card.pump, type, label, 'return'),
+      });
+      return;
+    }
+    if (act === 'add-equipment') {
+      if (!card) return;
+      flowsOpenTreePicker('return', card.pump, {
+        titleOverride: 'Add equipment after the pump',
+        onPick: (type, label) => _insertEquipmentAfterPump(card.pump, type, label),
+      });
+      return;
+    }
+    if (act === 'insert-above' || act === 'insert-below') {
+      const side = t.getAttribute('data-side') || 'return';
+      const anchor = state.items.find(i => i.id === itemId);
+      if (!anchor) return;
+      const directionLabel = (act === 'insert-above') ? 'above' : 'below';
+      flowsOpenTreePicker(side, anchor, {
+        titleOverride: `Insert ${directionLabel} ${escapeHtml(_psPillLabel(anchor))}`,
+        onPick: (type, label) => _insertRelativeTo(anchor, side, directionLabel, type, label),
+      });
+      return;
+    }
+  });
+})();
+
+// --- Builder helpers ---
+
+function _uniqLabel(baseLabel) {
+  let n = 1;
+  const existing = new Set(state.items.map(i => (i.label || '').toLowerCase()));
+  let candidate = baseLabel;
+  while (existing.has(candidate.toLowerCase())) {
+    n += 1; candidate = `${baseLabel} ${n}`;
+  }
+  return candidate;
+}
+
+// Add a new node connected to `junction`. If junction is a tee/manifold/valve,
+// just hang it off. If it has a free valve3 port, use it.
+function _addToJunction(junction, type, label, role) {
+  pushUndo();
+  const newItem = addItem(type, {
+    x: (junction.x || 0) + 120,
+    y: (junction.y || 0) + 80,
+    label: _uniqLabel(label),
+  });
+  let portOpts = { fromPort: '', toPort: '' };
+  if (junction.type === 'valve3') {
+    const used = new Set();
+    for (const e of state.edges) {
+      if (e.from === junction.id) used.add(e.fromPort);
+      if (e.to   === junction.id) used.add(e.toPort);
+    }
+    const free = ['a', 'b', 'trunk'].find(p => !used.has(p));
+    if (free) {
+      if (role === 'suction') portOpts.toPort = free;
+      else portOpts.fromPort = free;
+    }
+  }
+  if (role === 'suction') {
+    state.edges.push({
+      id: uid(), from: newItem.id, to: junction.id, type: 'suction', size: '',
+      label: `${newItem.label} \u2192 ${junction.label}`,
+      active: false, blocked: false, fromPort: '', toPort: portOpts.toPort,
+    });
+  } else {
+    state.edges.push({
+      id: uid(), from: junction.id, to: newItem.id, type: 'return', size: '',
+      label: `${junction.label} \u2192 ${newItem.label}`,
+      active: false, blocked: false, fromPort: portOpts.fromPort, toPort: '',
+    });
+  }
+  _flowsRerenderAll();
+}
+
+// Add a sibling next to `leaf`. We need to find leaf's parent in the tree
+// (the upstream junction). If parent isn't a junction yet (parent is the
+// pump or a piece of equipment), we insert a Tee between parent and leaf,
+// then attach the new sibling under that Tee.
+function _addSiblingTo(leaf, type, label, role) {
+  pushUndo();
+  // Find the edge connecting leaf in the role direction.
+  const isLeafReturn = role === 'return';
+  const incoming = state.edges.find(e => e.type === role && (
+    (isLeafReturn && e.to === leaf.id) ||
+    (!isLeafReturn && e.from === leaf.id)
+  ));
+  if (!incoming) { toast('Cannot find connection'); return; }
+  const otherId = isLeafReturn ? incoming.from : incoming.to;
+  const parent = state.items.find(i => i.id === otherId);
+  if (!parent) return;
+
+  let junction = parent;
+  if (!_PSBRANCH_TYPES.has(parent.type)) {
+    // Insert a Tee between parent and leaf
+    const tee = addItem('tee', {
+      x: ((parent.x || 0) + (leaf.x || 0)) / 2,
+      y: ((parent.y || 0) + (leaf.y || 0)) / 2,
+      label: 'Tee',
+    });
+    // Remove old edge
+    state.edges = state.edges.filter(e => e !== incoming);
+    if (isLeafReturn) {
+      state.edges.push({ id: uid(), from: parent.id, to: tee.id, type: 'return', size: incoming.size || '', label: `${parent.label} \u2192 ${tee.label}`, active: false, blocked: false, fromPort: incoming.fromPort || '', toPort: '' });
+      state.edges.push({ id: uid(), from: tee.id, to: leaf.id, type: 'return', size: incoming.size || '', label: `${tee.label} \u2192 ${leaf.label}`, active: false, blocked: false, fromPort: '', toPort: incoming.toPort || '' });
+    } else {
+      state.edges.push({ id: uid(), from: leaf.id, to: tee.id, type: 'suction', size: incoming.size || '', label: `${leaf.label} \u2192 ${tee.label}`, active: false, blocked: false, fromPort: '', toPort: '' });
+      state.edges.push({ id: uid(), from: tee.id, to: parent.id, type: 'suction', size: incoming.size || '', label: `${tee.label} \u2192 ${parent.label}`, active: false, blocked: false, fromPort: '', toPort: incoming.toPort || '' });
+    }
+    junction = tee;
+  }
+  _addToJunction(junction, type, label, role);
+}
+
+function _addAtPump(pump, type, label, role) {
+  // Like adding a sibling under the pump's natural input/output.
+  // We treat the pump itself as a junction-ish for this purpose: find an
+  // existing suction or return edge, then insert a Tee if needed.
+  const isReturn = role === 'return';
+  // Find an existing edge of this role into/out of the pump.
+  const sample = state.edges.find(e => e.type === role && (
+    (isReturn && e.from === pump.id) ||
+    (!isReturn && e.to === pump.id)
+  ));
+  if (!sample) {
+    // No existing connection \u2014 create direct.
+    pushUndo();
+    const newItem = addItem(type, {
+      x: (pump.x || 0) + (isReturn ? 1200 : -1200),
+      y: (pump.y || 0) + 100,
+      label: _uniqLabel(label),
+    });
+    if (isReturn) {
+      state.edges.push({ id: uid(), from: pump.id, to: newItem.id, type: 'return', size: '', label: `${pump.label} \u2192 ${newItem.label}`, active: false, blocked: false, fromPort: 'discharge', toPort: '' });
+    } else {
+      state.edges.push({ id: uid(), from: newItem.id, to: pump.id, type: 'suction', size: '', label: `${newItem.label} \u2192 ${pump.label}`, active: false, blocked: false, fromPort: '', toPort: 'intake' });
+    }
+    _flowsRerenderAll();
+    return;
+  }
+  // Treat the *other end* of `sample` as the leaf to add a sibling to.
+  const otherId = isReturn ? sample.to : sample.from;
+  const leaf = state.items.find(i => i.id === otherId);
+  if (!leaf) return;
+  _addSiblingTo(leaf, type, label, role);
+}
+
+
+// ==================================================================
+// ============== INSERT BETWEEN ANY TWO PILLS ======================
+// ==================================================================
+// Splices a new item into the edge that touches `anchor` in the chosen
+// direction. If no such edge exists (anchor is at the very edge of the
+// tree), the new item is hung off as a new branch / leaf.
+//
+// Edge model recap:
+//   return edges  : from = upstream parent, to = downstream child
+//   suction edges : from = upstream source, to = downstream (toward pump)
+//
+// Visual mapping:
+//   return pill : above-on-screen = toward pump (incoming edge, to=anchor)
+//                 below-on-screen = away from pump (outgoing edge, from=anchor)
+//   suction pill: above-on-screen = away from pump (incoming edge, to=anchor)
+//                 below-on-screen = toward pump   (outgoing edge, from=anchor)
+function _insertRelativeTo(anchor, side, direction, type, label) {
+  pushUndo();
+  let target = null;
+  let attachDir = null; // 'upstream' or 'downstream' (only used when no edge to splice)
+  if (side === 'return') {
+    if (direction === 'above') {
+      target = state.edges.find(e => e.type === 'return' && e.to === anchor.id);
+      attachDir = 'upstream';
+    } else {
+      target = state.edges.find(e => e.type === 'return' && e.from === anchor.id);
+      attachDir = 'downstream';
+    }
+  } else {
+    if (direction === 'above') {
+      target = state.edges.find(e => e.type === 'suction' && e.to === anchor.id);
+      attachDir = 'upstream';
+    } else {
+      target = state.edges.find(e => e.type === 'suction' && e.from === anchor.id);
+      attachDir = 'downstream';
+    }
+  }
+
+  const newItem = addItem(type, {
+    x: (anchor.x || 0) + (direction === 'below' ? 100 : -100),
+    y: (anchor.y || 0) + (direction === 'below' ? 100 : -100),
+    label: _uniqLabel(label),
+  });
+
+  if (target) {
+    const oldFrom = target.from, oldTo = target.to;
+    const oldFromPort = target.fromPort || '';
+    const oldToPort   = target.toPort   || '';
+    const edgeType    = target.type;
+    const sz          = target.size || '';
+    state.edges = state.edges.filter(e => e !== target);
+    const fromItem = state.items.find(i => i.id === oldFrom);
+    const toItem   = state.items.find(i => i.id === oldTo);
+    state.edges.push({
+      id: uid(), from: oldFrom, to: newItem.id, type: edgeType, size: sz,
+      label: `${(fromItem && fromItem.label) || ''} \u2192 ${newItem.label}`,
+      active: false, blocked: false,
+      fromPort: oldFromPort, toPort: '',
+    });
+    state.edges.push({
+      id: uid(), from: newItem.id, to: oldTo, type: edgeType, size: sz,
+      label: `${newItem.label} \u2192 ${(toItem && toItem.label) || ''}`,
+      active: false, blocked: false,
+      fromPort: '', toPort: oldToPort,
+    });
+  } else {
+    // No existing edge to splice -> attach as a new branch off `anchor`.
+    const edgeType = side === 'suction' ? 'suction' : 'return';
+    if (attachDir === 'upstream') {
+      // newItem flows INTO anchor
+      state.edges.push({
+        id: uid(), from: newItem.id, to: anchor.id, type: edgeType, size: '',
+        label: `${newItem.label} \u2192 ${anchor.label || ''}`,
+        active: false, blocked: false, fromPort: '', toPort: '',
+      });
+    } else {
+      // anchor flows INTO newItem
+      state.edges.push({
+        id: uid(), from: anchor.id, to: newItem.id, type: edgeType, size: '',
+        label: `${anchor.label || ''} \u2192 ${newItem.label}`,
+        active: false, blocked: false, fromPort: '', toPort: '',
+      });
+    }
+  }
+  migratePortsOnLoad(state);
+  _flowsRerenderAll();
+}
+
+// Insert an equipment piece on the return side right after the pump,
+// before the first downstream node.
+function _insertEquipmentAfterPump(pump, type, label) {
+  pushUndo();
+  // Find the first return edge out of the pump.
+  const outE = state.edges.find(e => e.type === 'return' && e.from === pump.id);
+  const newItem = addItem(type, {
+    x: (pump.x || 0) + 140,
+    y: (pump.y || 0),
+    label: _uniqLabel(label),
+  });
+  if (!outE) {
+    // No downstream yet \u2014 just attach.
+    state.edges.push({ id: uid(), from: pump.id, to: newItem.id, type: 'return', size: '', label: `${pump.label} \u2192 ${newItem.label}`, active: false, blocked: false, fromPort: 'discharge', toPort: '' });
+    _flowsRerenderAll();
+    return;
+  }
+  // Splice: pump -> newItem -> (was outE.to)
+  const downstreamId = outE.to;
+  state.edges = state.edges.filter(e => e !== outE);
+  state.edges.push({ id: uid(), from: pump.id,     to: newItem.id,    type: 'return', size: outE.size || '', label: `${pump.label} \u2192 ${newItem.label}`, active: false, blocked: false, fromPort: 'discharge', toPort: '' });
+  state.edges.push({ id: uid(), from: newItem.id,  to: downstreamId,  type: 'return', size: outE.size || '', label: `${newItem.label} \u2192 ${(state.items.find(i=>i.id===downstreamId)||{}).label||''}`, active: false, blocked: false, fromPort: '', toPort: outE.toPort || '' });
+  _flowsRerenderAll();
+}
+
+// ==================================================================
+// ============== HOOK UP THE "+ Add Flow" BUTTON ===================
+// ==================================================================
+(function rebindAddFlowBtn() {
+  const btn = $('addFlowBtn');
+  if (!btn) return;
+  const fresh = btn.cloneNode(true);
+  btn.parentNode.replaceChild(fresh, btn);
+  fresh.addEventListener('click', () => openAddFlowWizard());
+})();
+
+// ==================================================================
+// ============== ADDITIONAL CSS ====================================
+// ==================================================================
+(function injectBuilderCSS() {
+  const css = `
+    .pump-card .flow-card-title { cursor:default; }
+    .flow-card.editing .flow-card-title { color:var(--text); }
+    .pump-tree .tree-pill.is-closure {
+      background:var(--surface); border-style:dashed; opacity:.85;
+    }
+    .pump-tree .tree-pill .pill-label[data-act="rename-pill"] {
+      cursor:text;
+      border-bottom:1px dashed transparent;
+    }
+    .flow-card.editing .pump-tree .tree-pill .pill-label[data-act="rename-pill"] {
+      border-bottom-color:var(--primary);
+    }
+    .leaf-add-btn {
+      appearance:none; -webkit-appearance:none;
+      margin-top:6px;
+      background:var(--surface); color:var(--primary);
+      border:1px dashed var(--primary);
+      border-radius:999px; padding:4px 10px;
+      font-size:11px; font-weight:600; cursor:pointer;
+    }
+    .tree-pill-wrap {
+      display:flex; flex-direction:column; align-items:center;
+      gap:2px;
+    }
+    .pill-insert {
+      appearance:none; -webkit-appearance:none;
+      width:22px; height:22px; line-height:18px;
+      border-radius:50%;
+      background:var(--surface);
+      color:var(--primary);
+      border:1px dashed var(--primary);
+      font-size:14px; font-weight:700;
+      cursor:pointer;
+      padding:0;
+      display:flex; align-items:center; justify-content:center;
+      opacity:.65;
+      transition:opacity .12s, transform .12s, background .12s;
+    }
+    .pill-insert:hover {
+      opacity:1;
+      background:var(--primary); color:var(--bg);
+      transform:scale(1.08);
+    }
+    .pill-insert-above { margin-bottom:-2px; }
+    .pill-insert-below { margin-top:-2px; }
+    .card-edit-bar {
+      display:flex; flex-wrap:wrap; gap:6px;
+      padding:8px 14px 0;
+    }
+    .card-edit-bar button {
+      appearance:none; -webkit-appearance:none;
+      background:var(--offset); color:var(--text);
+      border:1px solid var(--border); border-radius:999px;
+      padding:6px 12px; font-size:12px; font-weight:600;
+      cursor:pointer;
+    }
+    .wiz-chips {
+      display:flex; flex-wrap:wrap; gap:6px;
+      min-height:32px;
+      padding:6px;
+      background:var(--offset);
+      border-radius:8px;
+    }
+    .wiz-chip {
+      display:inline-flex; align-items:center; gap:6px;
+      background:var(--surface); border:1px solid var(--border);
+      border-radius:999px; padding:4px 10px;
+      font-size:12px; font-weight:600;
+    }
+    .wiz-chip button {
+      appearance:none; -webkit-appearance:none;
+      background:transparent; border:0;
+      color:var(--error); font-size:14px; line-height:1;
+      cursor:pointer; padding:0 0 0 4px;
     }
   `;
   const style = document.createElement('style');
