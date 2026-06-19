@@ -152,6 +152,10 @@ function migratePortsOnLoad(s) {
     if (branchEdges[1]) writePort(branchEdges[1], 'b');
   }
 
+  // --- Propagate suction/return type through pass-through nodes ---
+  // Done BEFORE pumps so pump pass also reaffirms intake/discharge.
+  propagatePipeTypes(s);
+
   // --- Pumps ---
   for (const pump of s.items) {
     if (pump.type !== 'pump') continue;
@@ -170,6 +174,76 @@ function migratePortsOnLoad(s) {
         if (e.fromPort === 'discharge' && e.type !== 'feature' && e.type !== 'gas' && e.type !== 'conduit') e.type = 'return';
       }
     }
+  }
+
+  // Run propagation once more after pump tagging so anything downstream of a
+  // freshly-tagged pump pipe is correct.
+  propagatePipeTypes(s);
+}
+
+// Items that pass a pipe type through (do NOT terminate it):
+const PASS_THROUGH_TYPES = new Set([
+  'tee', 'valve2', 'valve3', 'checkvalve', 'actuated', 'manifold',
+  'filter', 'heater', 'saltcell', 'booster', 'customeq',
+  'bodylink',
+]);
+
+// Pipe types that participate in suction/return propagation (others are
+// special-purpose and left alone).
+function isHydraulicPipe(type) {
+  return type === 'suction' || type === 'return';
+}
+
+// Returns 'suction' | 'return' | null. Walks outward from one side of `edge`
+// through pass-through items until it hits a classified endpoint.
+function resolveEndRole(edge, side, s, itemById) {
+  // side: 'from' or 'to'
+  const startId = side === 'from' ? edge.from : edge.to;
+  const startItem = itemById[startId];
+  if (!startItem) return null;
+  // If start is itself a classified endpoint, use it directly.
+  const startPort = side === 'from' ? edge.fromPort : edge.toPort;
+  const direct = impliedPipeTypeForEndpoint(startItem, startPort);
+  if (direct) return direct;
+  // BFS through pass-through items.
+  const visited = new Set([startId]);
+  const queue = [startId];
+  while (queue.length) {
+    const id = queue.shift();
+    const item = itemById[id];
+    if (!item) continue;
+    if (!PASS_THROUGH_TYPES.has(item.type)) continue;
+    // Find adjacent edges of hydraulic type.
+    for (const e of s.edges) {
+      if (!isHydraulicPipe(e.type)) continue;
+      let otherId = null, otherPort = null;
+      if (e.from === id) { otherId = e.to;   otherPort = e.toPort; }
+      else if (e.to === id) { otherId = e.from; otherPort = e.fromPort; }
+      if (!otherId || visited.has(otherId)) continue;
+      visited.add(otherId);
+      const otherItem = itemById[otherId];
+      const otherRole = impliedPipeTypeForEndpoint(otherItem, otherPort);
+      if (otherRole) return otherRole;
+      queue.push(otherId);
+    }
+  }
+  return null;
+}
+
+function propagatePipeTypes(s) {
+  if (!s || !Array.isArray(s.items) || !Array.isArray(s.edges)) return;
+  const itemById = {};
+  s.items.forEach(it => itemById[it.id] = it);
+  for (const e of s.edges) {
+    if (!isHydraulicPipe(e.type)) continue;
+    const fromRole = resolveEndRole(e, 'from', s, itemById);
+    const toRole   = resolveEndRole(e, 'to',   s, itemById);
+    // Pick non-null role. If both agree, easy. If they disagree, leave as-is
+    // — the design is hydraulically wrong and we don't want to mask it.
+    let chosen = null;
+    if (fromRole && toRole) chosen = (fromRole === toRole) ? fromRole : null;
+    else chosen = fromRole || toRole;
+    if (chosen && chosen !== e.type) e.type = chosen;
   }
 }
 
@@ -1016,9 +1090,10 @@ function handleConnectTap(id, tapPt) {
     const srcTap = state.connectSourceTap;
     const fromAssign = assignPortForTap(from, srcTap, 'from');
     const toAssign   = assignPortForTap(to,   tapPt, 'to');
-    // Pump-implied pipe type wins over the pending pipe type (intake → suction,
-    // discharge → return). The destination side wins over the source side if
-    // both end up at a pump (rare).
+    // Endpoint-implied pipe type wins over the pending pipe type:
+    //   pump intake / skimmer / main drain → suction
+    //   pump discharge / return / jet / bubbler / feature → return
+    // The destination side wins if both ends imply a type (rare conflict).
     const impliedType = toAssign.pipeType || fromAssign.pipeType || null;
     const pipeType = impliedType || state.pendingPipe.type;
     state.edges.push({
@@ -1478,6 +1553,31 @@ function pumpPortPipeType(port) {
 // Given an item and a tap point, return { port, pipeType } where pipeType is the
 // implied pipe type (or null if the item doesn't dictate one).
 // `role` is 'from' (this item is the source side of a new edge) or 'to' (destination).
+// Endpoint role for pipe-type inference.
+//   'suction' = water leaves the pool body here (skimmer, main drain)
+//                or enters the pump (pump.intake) — pipes touching this point
+//                MUST be suction.
+//   'return'  = water enters the pool body here (return, jet, bubbler, etc.)
+//                or leaves the pump (pump.discharge) — pipes here MUST be return.
+//   null      = neutral (pumps, filters, valves, tees, bodies, etc.).
+const SUCTION_FIXTURES = new Set(['skimmer', 'drain']);
+const RETURN_FIXTURES  = new Set(['return', 'jet', 'bubbler', 'deckjet', 'sheer', 'slide', 'feature']);
+
+function itemFixtureRole(item) {
+  if (!item) return null;
+  if (SUCTION_FIXTURES.has(item.type)) return 'suction';
+  if (RETURN_FIXTURES.has(item.type))  return 'return';
+  return null;
+}
+
+// Pipe type implied by either endpoint of a connection, considering both
+// fixture types AND pump ports. Returns 'suction' | 'return' | null.
+function impliedPipeTypeForEndpoint(item, port) {
+  if (!item) return null;
+  if (item.type === 'pump') return pumpPortPipeType(port);
+  return itemFixtureRole(item);
+}
+
 function assignPortForTap(item, tapPt, role) {
   if (!item) return { port: '', pipeType: null };
   if (item.type === 'valve3') {
@@ -1491,7 +1591,9 @@ function assignPortForTap(item, tapPt, role) {
     else       port = role === 'from' ? 'discharge' : 'intake';
     return { port, pipeType: pumpPortPipeType(port) };
   }
-  return { port: '', pipeType: null };
+  // Fixtures get their role-implied pipe type.
+  const role2 = itemFixtureRole(item);
+  return { port: '', pipeType: role2 };
 }
 
 // Returns { trunk, branches, side } for a valve3.
@@ -1612,6 +1714,9 @@ function valveAllows(node, edges, index) {
   return true;
 }
 function solveFlow() {
+  // Normalize pipe types BEFORE solving so the flow logic sees correct
+  // suction/return tagging (downstream checks rely on it).
+  propagatePipeTypes(state);
   state.edges.forEach(e => { e.active = false; e.blocked = false; });
   const issues = [];
   const adj = adjacency();
@@ -2607,12 +2712,27 @@ function doAction(name, btn) {
     case 'applyEdge': {
       const e = state.edges.find(x => x.id === state.editingEdgeId);
       if (!e) break;
+      const t = $('edge-type')?.value;
+      // Validate user-picked pipe type against endpoint roles before mutating.
+      if (t && isHydraulicPipe(t)) {
+        const itemById = {}; state.items.forEach(i => itemById[i.id] = i);
+        const fromRole = resolveEndRole(e, 'from', state, itemById);
+        const toRole   = resolveEndRole(e, 'to',   state, itemById);
+        const conflict = (fromRole && fromRole !== t) || (toRole && toRole !== t);
+        if (conflict) {
+          const why = (fromRole && fromRole !== t) ? fromRole : toRole;
+          toast(`Can't set this pipe to ${t} — it connects to a ${why} fixture`);
+          break;
+        }
+      }
       pushUndo();
-      const t = $('edge-type')?.value; if (t) e.type = t;
-      const s = $('edge-size')?.value; if (s) e.size = s;
+      if (t) e.type = t;
+      const sz = $('edge-size')?.value; if (sz) e.size = sz;
       const r = $('edge-route')?.value; if (r) e.routeStyle = r;
       e.fromSize = $('edge-from-size')?.value || '';
       e.toSize = $('edge-to-size')?.value || '';
+      // Re-propagate in case this edge change unlocks/locks neighbors.
+      propagatePipeTypes(state);
       drawEdges(); solveFlow(); persist(); renderSheet();
       toast('Pipe updated');
       break;
