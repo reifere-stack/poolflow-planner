@@ -3777,6 +3777,407 @@ document.addEventListener('keydown', (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key === 'z') { undo(); e.preventDefault(); }
 });
 
+// ==================================================================
+// ========================= FLOWS PAGE =============================
+// ==================================================================
+//
+// The Flows page renders each suction-fixture → pump → return-fixture
+// chain as an editable vertical card (Poolside-style). It is a live
+// projection of state.items / state.edges — any edit on the Flows page
+// mutates the underlying graph, then re-renders both views.
+//
+// Derivation strategy:
+//   1. From each suction fixture, walk suction edges → enumerate every
+//      simple path that ends at a pump. Each path is a "suction half".
+//   2. From each pump, walk return edges → enumerate every simple path
+//      that ends at a delivery fixture. Each path is a "return half".
+//   3. Cross-join halves through their shared pump: one flow card per
+//      (suction-half, pump, return-half) combination. This matches the
+//      user's choice of "separate flow per branch".
+// ------------------------------------------------------------------
+
+function _flowsItemById() {
+  const m = {};
+  for (const it of state.items) m[it.id] = it;
+  return m;
+}
+
+// Walk every simple path from `startId` along edges whose .type matches
+// `role` ('suction' | 'return'), with valve3 a↔b barrier respected.
+// Emits a path when it reaches a node where `terminalTest(item) === true`.
+// Stops short (no emit) at other source fixtures, cycles, or dead ends.
+function _flowsEnumeratePaths(startId, role, terminalTest) {
+  const itemById = _flowsItemById();
+  const adj = new Map();
+  for (const e of state.edges) {
+    if (e.type !== role) continue;
+    if (!adj.has(e.from)) adj.set(e.from, []);
+    if (!adj.has(e.to))   adj.set(e.to,   []);
+    adj.get(e.from).push({ otherId: e.to,   portHere: e.fromPort || '', otherPort: e.toPort   || '' });
+    adj.get(e.to)  .push({ otherId: e.from, portHere: e.toPort   || '', otherPort: e.fromPort || '' });
+  }
+  const valve3Ok = (inPort, outPort) => {
+    if (!inPort || !outPort) return true;
+    if (inPort === outPort) return true;
+    if (inPort === 'trunk' || outPort === 'trunk') return true;
+    return false;
+  };
+  const paths = [];
+  const seenKeys = new Set();
+  const startItem = itemById[startId];
+  if (!startItem) return paths;
+  const dfs = (nodeId, arrivePort, pathSoFar, visited) => {
+    const node = itemById[nodeId];
+    if (!node) return;
+    if (nodeId !== startId && terminalTest(node)) {
+      const key = pathSoFar.join('>');
+      if (!seenKeys.has(key)) {
+        seenKeys.add(key);
+        paths.push(pathSoFar.slice());
+      }
+      return;
+    }
+    if (nodeId !== startId && isSourceFixture(node) && !terminalTest(node)) return;
+    const neighbors = adj.get(nodeId) || [];
+    for (const { otherId, portHere, otherPort } of neighbors) {
+      if (visited.has(otherId)) continue;
+      if (node.type === 'valve3' && nodeId !== startId) {
+        if (!valve3Ok(arrivePort, portHere)) continue;
+      }
+      visited.add(otherId);
+      pathSoFar.push(otherId);
+      dfs(otherId, otherPort, pathSoFar, visited);
+      pathSoFar.pop();
+      visited.delete(otherId);
+    }
+  };
+  const visited = new Set([startId]);
+  dfs(startId, null, [startId], visited);
+  return paths;
+}
+
+// Build the list of complete flows from state.
+function deriveFlows() {
+  const itemById = _flowsItemById();
+  const isPump = (it) => it && it.type === 'pump';
+  const isDelivery = (it) => it && RETURN_FIXTURES.has(it.type);
+  const flows = [];
+  const suctionByPump = new Map();
+  for (const src of state.items) {
+    if (!SUCTION_FIXTURES.has(src.type)) continue;
+    const paths = _flowsEnumeratePaths(src.id, 'suction', isPump);
+    for (const p of paths) {
+      const items = p.map(id => itemById[id]).filter(Boolean);
+      const pump = items[items.length - 1];
+      if (!pump || pump.type !== 'pump') continue;
+      if (!suctionByPump.has(pump.id)) suctionByPump.set(pump.id, []);
+      suctionByPump.get(pump.id).push({ source: src, path: items });
+    }
+  }
+  for (const [pumpId, halves] of suctionByPump.entries()) {
+    const pump = itemById[pumpId]; if (!pump) continue;
+    const retPaths = _flowsEnumeratePaths(pumpId, 'return', isDelivery);
+    if (!retPaths.length) {
+      for (const half of halves) {
+        flows.push(_buildFlowRecord(half.source, half.path, pump, [pump], null));
+      }
+      continue;
+    }
+    for (const half of halves) {
+      for (const retP of retPaths) {
+        const retItems = retP.map(id => itemById[id]).filter(Boolean);
+        const dest = retItems[retItems.length - 1];
+        if (!isDelivery(dest)) continue;
+        flows.push(_buildFlowRecord(half.source, half.path, pump, retItems, dest));
+      }
+    }
+  }
+  return flows;
+}
+
+function _buildFlowRecord(source, suctionPath, pump, returnPath, destination) {
+  const allItems = suctionPath.slice();
+  for (let i = 1; i < returnPath.length; i++) allItems.push(returnPath[i]);
+  const id = 'flow_' + allItems.map(it => it.id).join('_');
+  return { id, source, suctionPath, pump, returnPath, destination: destination || null, allItems };
+}
+
+// --------------- Renderer ---------------
+
+function _flowStepLabel(item) {
+  const tool = (typeof TOOLS !== 'undefined' && TOOLS[item.type]) || null;
+  const typeLabel = tool ? tool.label : item.type;
+  const lbl = (item.label || '').trim();
+  return lbl && lbl !== typeLabel ? lbl : typeLabel;
+}
+
+const _flowsEditState = { editingFlowId: null };
+
+function renderFlows() {
+  const host = $('flowsList');
+  if (!host) return;
+  const flows = deriveFlows();
+  if (!flows.length) {
+    host.innerHTML = `
+      <div class="flows-empty">
+        <p><strong>No flows yet</strong></p>
+        <p>Add a suction fixture, a pump, and a return fixture on the Diagram, then connect them. They'll show up here.</p>
+      </div>`;
+    return;
+  }
+  const editingId = _flowsEditState.editingFlowId;
+  const html = flows.map(flow => {
+    const isEditing = editingId === flow.id;
+    const titleSrc = flow.source ? _flowStepLabel(flow.source) : '?';
+    const titleDst = flow.destination ? _flowStepLabel(flow.destination) : '(open)';
+    const lastIdx = flow.allItems.length - 1;
+    const stepsHtml = flow.allItems.map((it, idx) => {
+      const icon = (typeof iconMarkup === 'function') ? iconMarkup(it.type) : '';
+      const label = _flowStepLabel(it);
+      const meta = it.size || '';
+      const isEndpoint = (idx === 0) || (idx === lastIdx);
+      const removable = isEditing && !isEndpoint && it.type !== 'pump';
+      return `
+        <div class="flow-step" data-flow-id="${flow.id}" data-item-id="${it.id}" data-step-idx="${idx}">
+          <span class="step-icon">${icon}</span>
+          <span class="step-label">${escapeHtml(label)}</span>
+          ${meta ? `<span class="step-meta">${escapeHtml(meta)}</span>` : ''}
+          ${removable ? `<button type="button" class="step-remove" data-act="remove-step" data-flow-id="${flow.id}" data-item-id="${it.id}" aria-label="Remove">✕</button>` : ''}
+        </div>`;
+    }).join(`
+      <div class="flow-arrow">↓<button type="button" class="flow-insert" data-act="insert-step" data-flow-id="${flow.id}" aria-label="Insert step">+</button></div>`);
+    return `
+      <div class="flow-card ${isEditing ? 'editing' : ''}" data-flow-id="${flow.id}">
+        <div class="flow-card-head">
+          <div class="flow-card-title">${escapeHtml(titleSrc)} → ${escapeHtml(titleDst)}</div>
+          <div class="flow-card-actions">
+            ${isEditing
+              ? `<button type="button" data-act="done-flow" data-flow-id="${flow.id}" class="primary">Done</button>`
+              : `<button type="button" data-act="edit-flow" data-flow-id="${flow.id}">Edit</button>`}
+            <button type="button" data-act="delete-flow" data-flow-id="${flow.id}" class="danger">Delete</button>
+          </div>
+        </div>
+        <div class="flow-chain">${stepsHtml}</div>
+      </div>`;
+  }).join('');
+  host.innerHTML = html;
+}
+
+// --------------- Two-way sync ---------------
+
+function _flowsRerenderAll() {
+  solveFlow();
+  persist();
+  drawEdges();
+  renderSheet();
+  renderFlows();
+}
+
+// Remove an intermediate step from a flow: delete the item + its flanking
+// edges, then bridge prev↔next with a single new edge of the same role.
+function flowsRemoveStep(flow, itemId) {
+  const idx = flow.allItems.findIndex(it => it.id === itemId);
+  if (idx <= 0 || idx >= flow.allItems.length - 1) return;
+  const prev = flow.allItems[idx - 1];
+  const next = flow.allItems[idx + 1];
+  const target = flow.allItems[idx];
+  let role = null;
+  const eIn = state.edges.find(e => isHydraulicPipe(e.type) && ((e.from === prev.id && e.to === target.id) || (e.from === target.id && e.to === prev.id)));
+  if (eIn) role = eIn.type;
+  else {
+    const pumpIdx = flow.allItems.findIndex(it => it.id === flow.pump.id);
+    role = idx <= pumpIdx ? 'suction' : 'return';
+  }
+  pushUndo();
+  state.items = state.items.filter(i => i.id !== target.id);
+  state.edges = state.edges.filter(e => e.from !== target.id && e.to !== target.id);
+  state.dims  = state.dims.filter(d => d.a !== target.id && d.b !== target.id);
+  const bridgeSize = (eIn && eIn.size) || '';
+  state.edges.push({
+    id: uid(), from: prev.id, to: next.id, type: role, size: bridgeSize,
+    label: `${prev.label || prev.type} → ${next.label || next.type}`,
+    active: false, blocked: false, fromPort: '', toPort: '',
+  });
+  const el = world && world.querySelector(`.node[data-id="${target.id}"]`);
+  if (el) el.remove();
+  _flowsRerenderAll();
+}
+
+// Delete an entire flow (preserve pump if shared with other flows).
+function flowsDeleteFlow(flow) {
+  if (!confirm(`Delete this flow (${_flowStepLabel(flow.source)} → ${flow.destination ? _flowStepLabel(flow.destination) : 'pump'})? This removes its fixtures and equipment from the diagram.`)) return;
+  pushUndo();
+  const idsToRemove = new Set(flow.allItems.map(it => it.id));
+  const otherFlows = deriveFlows().filter(f => f.id !== flow.id);
+  const pumpUsedElsewhere = otherFlows.some(f => f.allItems.some(it => it.id === flow.pump.id));
+  if (pumpUsedElsewhere) idsToRemove.delete(flow.pump.id);
+  state.items = state.items.filter(i => !idsToRemove.has(i.id));
+  state.edges = state.edges.filter(e => !idsToRemove.has(e.from) && !idsToRemove.has(e.to));
+  state.dims  = state.dims.filter(d => !idsToRemove.has(d.a) && !idsToRemove.has(d.b));
+  for (const id of idsToRemove) {
+    const el = world && world.querySelector(`.node[data-id="${id}"]`);
+    if (el) el.remove();
+  }
+  _flowsEditState.editingFlowId = null;
+  _flowsRerenderAll();
+}
+
+// Insert a new equipment piece into the suction side just before the pump.
+function flowsOpenInsertPicker(flow) {
+  const insertable = ['filter', 'heater', 'saltcell', 'booster', 'blower', 'valve2', 'valve3', 'tee', 'manifold', 'customeq'];
+  const items = insertable.map(t => ({ type: t, label: (TOOLS[t] && TOOLS[t].label) || t }));
+  modalContent.innerHTML = `
+    <h3>Insert step</h3>
+    <p style="color:var(--muted); font-size:13px;">Pick a component to add to this flow.</p>
+    <div class="row" style="display:grid; grid-template-columns:repeat(2, 1fr); gap:8px; margin-top:8px;">
+      ${items.map(it => `<button type="button" class="btn" data-insert-type="${it.type}">${escapeHtml(it.label)}</button>`).join('')}
+    </div>
+    <div class="row" style="margin-top:14px; justify-content:flex-end;">
+      <button class="btn" id="flow-insert-cancel">Cancel</button>
+    </div>
+  `;
+  modalBackdrop.classList.add('show');
+  $('flow-insert-cancel').onclick = closeModal;
+  modalContent.querySelectorAll('[data-insert-type]').forEach(btn => {
+    btn.onclick = () => {
+      const type = btn.getAttribute('data-insert-type');
+      flowsInsertStep(flow, type);
+      closeModal();
+    };
+  });
+}
+
+function flowsInsertStep(flow, type) {
+  pushUndo();
+  const px = (flow.pump.x || 0) - 140;
+  const py = (flow.pump.y || 0);
+  const item = addItem(type, { x: px, y: py });
+  const sucPath = flow.suctionPath;
+  if (sucPath.length >= 2) {
+    const prev = sucPath[sucPath.length - 2];
+    const pump = flow.pump;
+    state.edges = state.edges.filter(e => !(isHydraulicPipe(e.type) && ((e.from === prev.id && e.to === pump.id) || (e.from === pump.id && e.to === prev.id))));
+    state.edges.push({ id: uid(), from: prev.id, to: item.id, type: 'suction', size: '', label: `${prev.label} → ${item.label}`, active: false, blocked: false, fromPort: '', toPort: '' });
+    state.edges.push({ id: uid(), from: item.id, to: pump.id, type: 'suction', size: '', label: `${item.label} → ${pump.label}`, active: false, blocked: false, fromPort: '', toPort: 'intake' });
+  }
+  _flowsRerenderAll();
+}
+
+// Add a brand-new flow.
+function flowsOpenAddDialog() {
+  const suctions = state.items.filter(i => SUCTION_FIXTURES.has(i.type));
+  const deliveries = state.items.filter(i => RETURN_FIXTURES.has(i.type));
+  const pumps = state.items.filter(i => i.type === 'pump');
+  const optList = (arr, includeCreate, kind) => {
+    const opts = arr.map(it => `<option value="${it.id}">${escapeHtml(_flowStepLabel(it))}</option>`).join('');
+    return includeCreate ? `<option value="__new__">+ New ${kind}…</option>` + opts : opts;
+  };
+  const sucTypes = ['skimmer', 'drain'];
+  const retTypes = ['return', 'jet', 'bubbler', 'deckjet', 'sheer', 'slide', 'feature'];
+  modalContent.innerHTML = `
+    <h3>Add flow</h3>
+    <div class="field"><label>Source (suction)</label>
+      <select id="flow-add-src">${optList(suctions, true, 'suction fixture')}</select>
+    </div>
+    <div class="field" id="flow-add-src-type-wrap" style="display:none;"><label>New source type</label>
+      <select id="flow-add-src-type">${sucTypes.map(t => `<option value="${t}">${escapeHtml(TOOLS[t].label)}</option>`).join('')}</select>
+    </div>
+    <div class="field"><label>Pump</label>
+      <select id="flow-add-pump">${optList(pumps, true, 'pump')}</select>
+    </div>
+    <div class="field"><label>Destination (return)</label>
+      <select id="flow-add-dst">${optList(deliveries, true, 'delivery fixture')}</select>
+    </div>
+    <div class="field" id="flow-add-dst-type-wrap" style="display:none;"><label>New destination type</label>
+      <select id="flow-add-dst-type">${retTypes.map(t => `<option value="${t}">${escapeHtml(TOOLS[t].label)}</option>`).join('')}</select>
+    </div>
+    <div class="row" style="margin-top:14px; justify-content:flex-end; gap:8px;">
+      <button class="btn" id="flow-add-cancel">Cancel</button>
+      <button class="btn primary" id="flow-add-go">Add Flow</button>
+    </div>
+  `;
+  modalBackdrop.classList.add('show');
+  const srcSel = $('flow-add-src'), dstSel = $('flow-add-dst');
+  const srcWrap = $('flow-add-src-type-wrap'), dstWrap = $('flow-add-dst-type-wrap');
+  const syncVis = () => {
+    srcWrap.style.display = (srcSel.value === '__new__') ? 'block' : 'none';
+    dstWrap.style.display = (dstSel.value === '__new__') ? 'block' : 'none';
+  };
+  srcSel.addEventListener('change', syncVis);
+  dstSel.addEventListener('change', syncVis);
+  syncVis();
+  $('flow-add-cancel').onclick = closeModal;
+  $('flow-add-go').onclick = () => {
+    const srcVal = srcSel.value;
+    const pumpVal = $('flow-add-pump').value;
+    const dstVal = dstSel.value;
+    pushUndo();
+    let source, pump, dest;
+    if (srcVal === '__new__') {
+      const t = $('flow-add-src-type').value;
+      source = addItem(t);
+    } else source = state.items.find(i => i.id === srcVal);
+    if (pumpVal === '__new__') pump = addItem('pump');
+    else pump = state.items.find(i => i.id === pumpVal);
+    if (dstVal === '__new__') {
+      const t = $('flow-add-dst-type').value;
+      dest = addItem(t);
+    } else dest = state.items.find(i => i.id === dstVal);
+    if (!source || !pump || !dest) { toast('Could not create flow'); return; }
+    state.edges.push({ id: uid(), from: source.id, to: pump.id, type: 'suction', size: '', label: `${source.label} → ${pump.label}`, active: false, blocked: false, fromPort: '', toPort: 'intake' });
+    state.edges.push({ id: uid(), from: pump.id, to: dest.id, type: 'return', size: '', label: `${pump.label} → ${dest.label}`, active: false, blocked: false, fromPort: 'discharge', toPort: '' });
+    closeModal();
+    _flowsRerenderAll();
+  };
+}
+
+// --------------- Wiring ---------------
+
+function setPage(page) {
+  document.body.classList.toggle('page-flows', page === 'flows');
+  document.querySelectorAll('#pageTabs button').forEach(b => {
+    b.classList.toggle('active', b.getAttribute('data-page') === page);
+  });
+  if (page === 'flows') renderFlows();
+}
+
+document.querySelectorAll('#pageTabs button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const page = btn.getAttribute('data-page');
+    setPage(page);
+  });
+});
+
+const flowsListEl = $('flowsList');
+if (flowsListEl) {
+  flowsListEl.addEventListener('click', (ev) => {
+    const t = ev.target.closest('[data-act]');
+    if (!t) return;
+    const act = t.getAttribute('data-act');
+    const flowId = t.getAttribute('data-flow-id');
+    const itemId = t.getAttribute('data-item-id');
+    const flows = deriveFlows();
+    const flow = flows.find(f => f.id === flowId);
+    if (!flow) { renderFlows(); return; }
+    if (act === 'edit-flow') {
+      _flowsEditState.editingFlowId = flowId;
+      renderFlows();
+    } else if (act === 'done-flow') {
+      _flowsEditState.editingFlowId = null;
+      renderFlows();
+    } else if (act === 'delete-flow') {
+      flowsDeleteFlow(flow);
+    } else if (act === 'remove-step') {
+      flowsRemoveStep(flow, itemId);
+    } else if (act === 'insert-step') {
+      flowsOpenInsertPicker(flow);
+    }
+  });
+}
+const addFlowBtnEl = $('addFlowBtn');
+if (addFlowBtnEl) addFlowBtnEl.addEventListener('click', flowsOpenAddDialog);
+
+
 // Resize
 window.addEventListener('resize', () => { applyTransform(); });
 

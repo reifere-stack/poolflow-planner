@@ -110,6 +110,159 @@
     .status-pill.err .dot { background:var(--error); }
     .status-pill .label { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 
+    /* ===== PAGE TABS (Diagram | Flows) ===== */
+    .page-tabs {
+      display:flex; align-items:stretch;
+      background:var(--surface);
+      border-bottom:1px solid var(--border);
+      padding:0 var(--space-3);
+      flex-shrink:0;
+    }
+    .page-tabs button {
+      appearance:none; -webkit-appearance:none;
+      background:transparent; border:0;
+      color:var(--muted); font-weight:600; font-size:14px;
+      padding:12px 16px; cursor:pointer;
+      border-bottom:2px solid transparent;
+      transition:color .15s, border-color .15s;
+    }
+    .page-tabs button.active {
+      color:var(--primary);
+      border-bottom-color:var(--primary);
+    }
+    .page-tabs button:hover:not(.active) { color:var(--text); }
+
+    /* ===== FLOWS PAGE ===== */
+    .flows-page {
+      display:none;
+      flex:1; overflow-y:auto;
+      padding:16px 16px 120px;
+      background:var(--bg);
+    }
+    body.page-flows .flows-page { display:block; }
+    body.page-flows .canvas-area,
+    body.page-flows .sheet,
+    body.page-flows .hud,
+    body.page-flows #connectBtn { display:none !important; }
+    body.page-flows .add-flow-btn { display:flex; }
+
+    .flows-header {
+      display:flex; align-items:center; justify-content:space-between;
+      margin-bottom:12px;
+    }
+    .flows-header h2 {
+      margin:0; font-size:18px; font-weight:700; color:var(--text);
+    }
+    .flows-header .flows-hint {
+      font-size:12px; color:var(--muted);
+    }
+
+    .flow-card {
+      background:var(--surface);
+      border:1px solid var(--border);
+      border-radius:14px;
+      padding:14px;
+      margin-bottom:14px;
+      box-shadow:0 1px 2px rgba(0,0,0,.04);
+    }
+    .flow-card-head {
+      display:flex; align-items:center; gap:8px;
+      margin-bottom:12px;
+    }
+    .flow-card-title {
+      flex:1; min-width:0;
+      font-weight:700; font-size:15px; color:var(--text);
+      white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+    }
+    .flow-card-actions {
+      display:flex; gap:6px;
+    }
+    .flow-card-actions button {
+      appearance:none; -webkit-appearance:none;
+      background:var(--offset); color:var(--text);
+      border:1px solid var(--border);
+      border-radius:8px;
+      padding:6px 10px; font-size:12px; font-weight:600;
+      cursor:pointer;
+    }
+    .flow-card-actions button.danger { color:var(--error); border-color:var(--error); background:transparent; }
+    .flow-card-actions button.primary { background:var(--primary); color:#fff; border-color:var(--primary); }
+
+    .flow-chain {
+      display:flex; flex-direction:column; align-items:stretch; gap:0;
+    }
+    .flow-step {
+      display:flex; align-items:center; gap:10px;
+      padding:12px 14px;
+      background:var(--offset);
+      border:1px solid var(--border);
+      border-radius:12px;
+      font-size:14px; font-weight:600; color:var(--text);
+      min-height:48px;
+    }
+    .flow-step .step-icon {
+      width:28px; height:28px; flex-shrink:0;
+      display:flex; align-items:center; justify-content:center;
+      border-radius:6px; background:var(--surface);
+      color:var(--primary);
+    }
+    .flow-step .step-icon svg { width:20px; height:20px; }
+    .flow-step .step-label {
+      flex:1; min-width:0;
+      white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+    }
+    .flow-step .step-meta {
+      font-size:11px; color:var(--muted); font-weight:500;
+      white-space:nowrap;
+    }
+    .flow-step .step-remove {
+      display:none;
+      appearance:none; -webkit-appearance:none;
+      background:transparent; border:0;
+      color:var(--error); cursor:pointer;
+      font-size:18px; line-height:1;
+      padding:4px 8px;
+    }
+    .flow-card.editing .flow-step { border-color:var(--primary); }
+    .flow-card.editing .flow-step .step-remove { display:block; }
+
+    .flow-arrow {
+      display:flex; align-items:center; justify-content:center;
+      height:22px; color:var(--muted);
+      font-size:16px; line-height:1;
+      position:relative;
+    }
+    .flow-insert {
+      display:none;
+      position:absolute; top:50%; left:50%;
+      transform:translate(-50%, -50%);
+      width:24px; height:24px; border-radius:50%;
+      background:var(--primary); color:#fff;
+      border:0; font-size:16px; font-weight:700; line-height:1;
+      cursor:pointer;
+      box-shadow:0 1px 3px rgba(0,0,0,.2);
+    }
+    .flow-card.editing .flow-insert { display:flex; align-items:center; justify-content:center; }
+    .flow-card.editing .flow-arrow { height:28px; }
+
+    .flows-empty {
+      text-align:center; padding:40px 20px;
+      color:var(--muted); font-size:14px;
+    }
+    .flows-empty p { margin:4px 0; }
+
+    .add-flow-btn {
+      display:none;
+      position:fixed; right:20px; bottom:20px;
+      align-items:center; gap:6px;
+      padding:14px 20px; border-radius:999px;
+      background:var(--primary); color:#fff;
+      border:0; font-weight:700; font-size:14px;
+      cursor:pointer;
+      box-shadow:0 4px 12px rgba(0,0,0,.18);
+      z-index:50;
+    }
+
     /* ===== CANVAS ===== */
     .canvas-area {
       flex:1; position:relative; overflow:hidden;
@@ -633,6 +786,12 @@
 
 <div class="app">
 
+  <!-- PAGE TABS -->
+  <nav class="page-tabs" id="pageTabs">
+    <button type="button" data-page="diagram" class="active">Diagram</button>
+    <button type="button" data-page="flows">Flows</button>
+  </nav>
+
   <!-- TOP BAR -->
   <header class="topbar">
     <div class="brand">
@@ -684,6 +843,16 @@
     <div class="legend" id="legend" hidden></div>
   </section>
 
+  <!-- FLOWS PAGE -->
+  <section class="flows-page" id="flowsPage">
+    <div class="flows-header">
+      <h2>Flows</h2>
+      <div class="flows-hint">Edit a flow to update the diagram</div>
+    </div>
+    <div id="flowsList"></div>
+  </section>
+  <button type="button" class="add-flow-btn" id="addFlowBtn">+ Add Flow</button>
+
   <!-- BOTTOM SHEET -->
   <aside class="sheet mid" id="sheet">
     <div class="sheet-handle" id="sheetHandle"><div class="bar"></div></div>
@@ -705,9 +874,9 @@
 
 </div>
 
-<script src="js/icons.js?v=bdce4ff"></script>
-<script src="js/catalog.js?v=bdce4ff"></script>
-<script src="js/app.js?v=bdce4ff"></script>
+<script src="js/icons.js?v=flows1"></script>
+<script src="js/catalog.js?v=flows1"></script>
+<script src="js/app.js?v=flows1"></script>
 
 </body>
 </html>
