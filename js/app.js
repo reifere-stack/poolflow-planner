@@ -5258,14 +5258,16 @@ function _psFixtureBody(item) {
   const items = state.items;
   const pool = items.find(i => i.type === 'pool');
   const spa  = items.find(i => i.type === 'spa');
-  // 1) Honor explicit body relation set by the user (item.relation = 'pool' | 'spa').
-  if (item.relation === 'spa' && spa) return spa;
-  if (item.relation === 'pool' && pool) return pool;
-  // 2) Honor explicit bodyId pointer if present.
+  // 1) Honor explicit bodyId pointer if present \u2014 highest priority because
+  //    it can distinguish between multiple bodies of the same type
+  //    (e.g. "Pool" vs "Plunge Pool", or "Spa" vs "Spa 2").
   if (item.bodyId) {
     const byId = items.find(i => i.id === item.bodyId);
     if (byId) return byId;
   }
+  // 2) Honor explicit body relation set by the user (item.relation = 'pool' | 'spa').
+  if (item.relation === 'spa' && spa) return spa;
+  if (item.relation === 'pool' && pool) return pool;
   // 3) Fall back to label heuristic + type defaults.
   const lbl = (item.label || '').toLowerCase();
   if (spa && lbl.includes('spa')) return spa;
@@ -5523,7 +5525,7 @@ _psRenderPill = function _psRenderPillExt(item, flowId, opts) {
   // mode \u2014 lets the user say "this fixture goes to Spa" without leaving
   // the Flows tab.
   const cycleAttrs = (editing && opts.isClosure && opts.leafId)
-    ? ` data-act="cycle-body" data-flow-id="${flowId}" data-leaf-id="${opts.leafId}" role="button" title="Tap to switch between Pool and Spa"`
+    ? ` data-act="cycle-body" data-flow-id="${flowId}" data-leaf-id="${opts.leafId}" role="button" title="Tap to choose a body of water"`
     : '';
   if (editing && opts.isClosure && opts.leafId) classes.push('is-clickable');
   const swapHint = (editing && opts.isClosure && opts.leafId)
@@ -6049,7 +6051,7 @@ function flowsOpenTreePicker(role, attachToItem, opts) {
     if (act === 'cycle-body') {
       const leafId = t.getAttribute('data-leaf-id');
       const leaf = state.items.find(i => i.id === leafId);
-      if (leaf) _psCycleFixtureBody(leaf);
+      if (leaf) _psOpenBodyPicker(leaf);
       return;
     }
     if (act === 'insert-above' || act === 'insert-below') {
@@ -6453,6 +6455,106 @@ function _psEnsureBody(type) {
   return body;
 }
 
+// Generate a unique label for a new body of `type`. First one of a type gets
+// the bare label ("Pool" / "Spa"). Subsequent ones get numbered: "Pool 2",
+// "Pool 3", etc. \u2014 so duplicates are always visually distinguishable.
+function _psNextBodyLabel(type, baseHint) {
+  const base = baseHint || (type === 'pool' ? 'Pool' : 'Spa');
+  const existing = state.items.filter(i => i.type === type);
+  // If none exist, the base label is free.
+  const hasBase = existing.some(i => (i.label || '').toLowerCase() === base.toLowerCase());
+  if (!hasBase) return base;
+  // Find the smallest n >= 2 such that "<base> n" is not in use.
+  let n = 2;
+  while (existing.some(i => (i.label || '').toLowerCase() === `${base} ${n}`.toLowerCase())) n++;
+  return `${base} ${n}`;
+}
+
+// Create a new pool/spa body with a unique label. Positions it next to an
+// existing body if one exists, otherwise drops it into a sensible spot.
+function _psCreateBody(type, customLabel) {
+  const label = customLabel && String(customLabel).trim()
+    ? String(customLabel).trim()
+    : _psNextBodyLabel(type);
+  const anchor = state.items.find(i => i.type === type)
+             || state.items.find(i => i.type === (type === 'pool' ? 'spa' : 'pool'));
+  let x, y;
+  if (anchor) {
+    x = anchor.x + anchor.w + 40;
+    y = anchor.y;
+  } else {
+    x = 60; y = 420;
+  }
+  return addItem(type, { x, y, label });
+}
+
+// Open a picker letting the user point a fixture/leaf at any existing body of
+// water \u2014 or create a new pool/spa with a unique label. This replaces the
+// old two-state cycle and supports multi-body setups (e.g. main pool + plunge
+// pool, hot spa + cold plunge, etc.).
+function _psOpenBodyPicker(leaf) {
+  if (!leaf) return;
+  if (typeof modalContent === 'undefined' || !modalContent) return;
+  const current = _psFixtureBody(leaf);
+  const bodies = _psAllBodies();
+  const rowsHtml = bodies.map(b => {
+    const isCurrent = current && b.id === current.id;
+    const typeBadge = b.type === 'spa' ? 'Spa' : 'Pool';
+    return `<button type="button" class="btn" data-body-pick="${b.id}" style="text-align:left; display:flex; align-items:center; justify-content:space-between; gap:10px;">
+      <span><span style="font-weight:700;">${escapeHtml(b.label || typeBadge)}</span><span style="color:var(--muted); font-weight:500; font-size:12px;"> \u2014 ${typeBadge}</span></span>
+      ${isCurrent ? '<span style="color:var(--primary); font-weight:600; font-size:12px;">\u2022 current</span>' : ''}
+    </button>`;
+  }).join('');
+  modalContent.innerHTML = `
+    <h3>Where does this return go?</h3>
+    <p style="color:var(--muted); font-size:13px; margin-top:6px;">Pick any body of water in your design, or add a new one.</p>
+    <div style="display:flex; flex-direction:column; gap:8px; margin-top:12px;">
+      ${rowsHtml || '<div style="color:var(--muted); font-size:13px;">No bodies of water yet.</div>'}
+    </div>
+    <div style="display:flex; flex-direction:column; gap:6px; margin-top:14px; padding-top:12px; border-top:1px solid var(--border);">
+      <button type="button" class="btn" data-body-new="pool" style="text-align:left;">+ Add another Pool</button>
+      <button type="button" class="btn" data-body-new="spa" style="text-align:left;">+ Add another Spa</button>
+    </div>
+    <div class="row" style="margin-top:14px; justify-content:flex-end;">
+      <button class="btn" id="body-pick-cancel">Cancel</button>
+    </div>`;
+  modalBackdrop.classList.add('show');
+  $('body-pick-cancel').onclick = closeModal;
+  modalContent.querySelectorAll('[data-body-pick]').forEach(b => {
+    b.onclick = () => {
+      const id = b.getAttribute('data-body-pick');
+      const body = state.items.find(i => i.id === id);
+      if (!body) { closeModal(); return; }
+      pushUndo();
+      leaf.bodyId = body.id;
+      leaf.relation = body.type;
+      leaf.relationLocked = true;
+      leaf.relationAuto = false;
+      persist();
+      _flowsRerenderAll();
+      closeModal();
+    };
+  });
+  modalContent.querySelectorAll('[data-body-new]').forEach(b => {
+    b.onclick = () => {
+      const type = b.getAttribute('data-body-new');
+      const suggested = _psNextBodyLabel(type);
+      const input = window.prompt(`Label for the new ${type === 'spa' ? 'spa' : 'pool'}:`, suggested);
+      if (input === null) return; // user cancelled prompt
+      const label = (String(input).trim() || suggested);
+      pushUndo();
+      const newBody = _psCreateBody(type, label);
+      leaf.bodyId = newBody.id;
+      leaf.relation = newBody.type;
+      leaf.relationLocked = true;
+      leaf.relationAuto = false;
+      persist();
+      _flowsRerenderAll();
+      closeModal();
+    };
+  });
+}
+
 function _psSetSpillover(fromBody, toBody) {
   if (!fromBody) return;
   pushUndo();
@@ -6474,47 +6576,63 @@ function _psSetSpillover(fromBody, toBody) {
   _flowsRerenderAll();
 }
 
-// Open a small picker letting the user pick the target body (or None).
+// Open a picker letting the user pick the target body (or None).
+// Lists every existing body of water by id, plus options to create a new
+// pool/spa with a unique label \u2014 mirrors the fixture body picker.
 function _psOpenSpilloverPicker(fromBody) {
   if (typeof modalContent === 'undefined' || !modalContent) return;
-  const candidates = [];
-  ['pool', 'spa'].forEach(t => {
-    if (fromBody && fromBody.type === t) return;
-    const existing = state.items.find(i => i.type === t);
-    candidates.push({
-      type: t,
-      label: existing ? existing.label : (t === 'pool' ? 'Pool' : 'Spa'),
-      isNew: !existing,
-      id: existing ? existing.id : null,
-    });
-  });
   const current = _psGetSpilloverTarget(fromBody);
+  const candidates = _psAllBodies().filter(b => !fromBody || b.id !== fromBody.id);
+  const rowsHtml = candidates.map(b => {
+    const typeBadge = b.type === 'spa' ? 'Spa' : 'Pool';
+    const isCurrent = current && current.id === b.id;
+    return `<button type="button" class="btn" data-spill-pick-id="${b.id}" style="text-align:left; display:flex; align-items:center; justify-content:space-between; gap:10px;">
+      <span><span style="font-weight:700;">${escapeHtml(b.label || typeBadge)}</span><span style="color:var(--muted); font-weight:500; font-size:12px;"> \u2014 ${typeBadge}</span></span>
+      ${isCurrent ? '<span style="color:var(--primary); font-weight:600; font-size:12px;">\u2022 current</span>' : ''}
+    </button>`;
+  }).join('');
   modalContent.innerHTML = `
     <h3>${escapeHtml(fromBody.label || 'Body')} spills into\u2026</h3>
     <p style="color:var(--muted); font-size:13px; margin-top:6px;">Gravity spillover \u2014 water cascades from this body into the chosen body when the level rises above the spillover.</p>
     <div style="display:flex; flex-direction:column; gap:8px; margin-top:12px;">
-      ${candidates.map(c => `
-        <button type="button" class="btn" data-spill-pick="${c.type}" style="text-align:left;">
-          <span style="font-weight:700;">${escapeHtml(c.label)}</span>${c.isNew ? '<span style="color:var(--muted); font-weight:500; font-size:12px;"> (will be added)</span>' : ''}${current && current.type === c.type ? '<span style="color:var(--primary); font-weight:600; font-size:12px;"> \u2022 current</span>' : ''}
-        </button>`).join('')}
+      ${rowsHtml || '<div style="color:var(--muted); font-size:13px;">No other bodies of water yet \u2014 add one below.</div>'}
       <button type="button" class="btn" data-spill-pick="none" style="text-align:left;">
         <span style="font-weight:700;">No spillover</span>${!current ? '<span style="color:var(--primary); font-weight:600; font-size:12px;"> \u2022 current</span>' : '<span style="color:var(--muted); font-weight:500; font-size:12px;"> (removes existing link)</span>'}
       </button>
+    </div>
+    <div style="display:flex; flex-direction:column; gap:6px; margin-top:14px; padding-top:12px; border-top:1px solid var(--border);">
+      <button type="button" class="btn" data-spill-new="pool" style="text-align:left;">+ Add another Pool</button>
+      <button type="button" class="btn" data-spill-new="spa" style="text-align:left;">+ Add another Spa</button>
     </div>
     <div class="row" style="margin-top:14px; justify-content:flex-end;">
       <button class="btn" id="spill-cancel">Cancel</button>
     </div>`;
   modalBackdrop.classList.add('show');
   $('spill-cancel').onclick = closeModal;
+  modalContent.querySelectorAll('[data-spill-pick-id]').forEach(b => {
+    b.onclick = () => {
+      const id = b.getAttribute('data-spill-pick-id');
+      const target = state.items.find(i => i.id === id);
+      if (target) _psSetSpillover(fromBody, target);
+      closeModal();
+    };
+  });
   modalContent.querySelectorAll('[data-spill-pick]').forEach(b => {
     b.onclick = () => {
       const pick = b.getAttribute('data-spill-pick');
-      if (pick === 'none') {
-        _psSetSpillover(fromBody, null);
-      } else {
-        const target = _psEnsureBody(pick);
-        _psSetSpillover(fromBody, target);
-      }
+      if (pick === 'none') _psSetSpillover(fromBody, null);
+      closeModal();
+    };
+  });
+  modalContent.querySelectorAll('[data-spill-new]').forEach(b => {
+    b.onclick = () => {
+      const type = b.getAttribute('data-spill-new');
+      const suggested = _psNextBodyLabel(type);
+      const input = window.prompt(`Label for the new ${type === 'spa' ? 'spa' : 'pool'}:`, suggested);
+      if (input === null) return;
+      const label = (String(input).trim() || suggested);
+      const newBody = _psCreateBody(type, label);
+      _psSetSpillover(fromBody, newBody);
       closeModal();
     };
   });
