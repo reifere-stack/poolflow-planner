@@ -803,11 +803,15 @@ document.addEventListener('gesturestart', e => e.preventDefault());
 function getItem(id) { return state.items.find(i => i.id === id); }
 function nodeEl(id) { return world.querySelector(`.node[data-id="${id}"]`); }
 
-// Fixture types that can imply a body of water by proximity.
+// Fixture types eligible for proximity-based body association.
+// Membership in this map = "this type can be auto-bound to a body of water by
+// placement on the Diagram tab." Body type is NEVER implied by fixture type \u2014
+// only by which body the fixture is sitting on / closest to.
+// `null` means: type is in the catalog but should not be auto-related at all.
 const FIXTURE_DEFAULT_BODY = {
-  jet: 'spa', bubbler: 'spa',
-  return: 'pool', skimmer: 'pool', drain: 'pool', deckjet: 'pool',
-  sheer: 'pool', slide: 'pool', autofill: 'pool', feature: 'pool',
+  jet: true, bubbler: true,
+  return: true, skimmer: true, drain: true, deckjet: true,
+  sheer: true, slide: true, autofill: true, feature: true,
   light: null, conduit: null, custom: null,
 };
 
@@ -5250,32 +5254,26 @@ function flowsDeletePumpCard(pump) {
 
 const _PSPILL_BODY_TYPES = new Set(['pool', 'spa']);
 
-// Helper: find the body item (pool / spa) a fixture belongs to.
-// Pool fixtures default to 'pool'; spa fixtures default to 'spa'.
-// If a fixture's label includes 'Spa' it's a spa fixture; otherwise pool.
-// (Heuristic — good enough since user names them explicitly.)
+// Resolve the body of water (pool / spa) a fixture is associated with.
+// Priority order:
+//   1. Explicit bodyId pointer (set via the Flows-tab body picker) \u2014 highest
+//      priority because it can distinguish between multiple bodies of the same
+//      type (e.g. "Pool" vs "Plunge Pool", or "Spa" vs "Spa 2").
+//   2. Explicit body relation type ('pool' | 'spa') \u2014 set by proximity
+//      inference on the Diagram tab, or by the user.
+// If neither is set, the fixture is unbound and we return null \u2014 the renderer
+// will show a placeholder closure pill that opens the body picker on tap.
+// (Body type is NEVER inferred from fixture type or label text.)
 function _psFixtureBody(item) {
   const items = state.items;
   const pool = items.find(i => i.type === 'pool');
   const spa  = items.find(i => i.type === 'spa');
-  // 1) Honor explicit bodyId pointer if present \u2014 highest priority because
-  //    it can distinguish between multiple bodies of the same type
-  //    (e.g. "Pool" vs "Plunge Pool", or "Spa" vs "Spa 2").
   if (item.bodyId) {
     const byId = items.find(i => i.id === item.bodyId);
     if (byId) return byId;
   }
-  // 2) Honor explicit body relation set by the user (item.relation = 'pool' | 'spa').
   if (item.relation === 'spa' && spa) return spa;
   if (item.relation === 'pool' && pool) return pool;
-  // 3) Fall back to label heuristic + type defaults.
-  const lbl = (item.label || '').toLowerCase();
-  if (spa && lbl.includes('spa')) return spa;
-  const def = FIXTURE_DEFAULT_BODY[item.type];
-  if (def === 'spa' && spa) return spa;
-  if (def === 'pool' && pool) return pool;
-  if (pool) return pool;
-  if (spa)  return spa;
   return null;
 }
 
@@ -5399,6 +5397,17 @@ _psRenderReturnSubtree = function _psRenderReturnSubtreeExt(treeNode, flowId) {
     const body = _psFixtureBody(item);
     if (body) {
       leafExtras += `<div class="tree-arrow-v"></div>` + _psRenderPill(body, flowId, { isClosure: true, side: 'return', leafId: item.id });
+    } else if (editing && (item.type in FIXTURE_DEFAULT_BODY) && FIXTURE_DEFAULT_BODY[item.type]) {
+      // Unbound return fixture in edit mode \u2014 show a placeholder closure pill
+      // so the user can tap to assign a body of water. Without this, fixtures
+      // placed away from any pool/spa on the Diagram tab would have no entry
+      // point to the body picker.
+      leafExtras += `<div class="tree-arrow-v"></div>
+        <div class="tree-pill is-closure is-clickable tree-pill-unbound" data-act="cycle-body" data-flow-id="${flowId}" data-leaf-id="${item.id}" role="button" title="Tap to choose a body of water">
+          <span class="pill-icon">\u2754</span>
+          <span class="pill-label">pick body\u2026</span>
+          <span class="pill-swap-hint" aria-hidden="true">\u21C4</span>
+        </div>`;
     }
   }
   if (kids.length === 0 && editing) {
@@ -5478,6 +5487,13 @@ _psRenderSuctionSubtree = function _psRenderSuctionSubtreeExt(treeNode, flowId, 
     const body = _psFixtureBody(item);
     if (body) {
       closurePill = _psRenderPill(body, flowId, { isClosure: true, side: 'suction', leafId: item.id }) + `<div class="tree-arrow-v"></div>`;
+    } else if (editing && (item.type in FIXTURE_DEFAULT_BODY) && FIXTURE_DEFAULT_BODY[item.type]) {
+      // Unbound suction fixture \u2014 placeholder pill so the user can assign a body.
+      closurePill = `<div class="tree-pill is-closure is-clickable tree-pill-unbound" data-act="cycle-body" data-flow-id="${flowId}" data-leaf-id="${item.id}" role="button" title="Tap to choose a body of water">
+          <span class="pill-icon">\u2754</span>
+          <span class="pill-label">pick body\u2026</span>
+          <span class="pill-swap-hint" aria-hidden="true">\u21C4</span>
+        </div><div class="tree-arrow-v"></div>`;
     }
   }
 
@@ -6812,6 +6828,15 @@ renderFlows = function renderFlowsWithSpill() {
     }
     .spillover-panel-empty {
       font-size:12px; color:var(--muted);
+    }
+    .tree-pill-unbound {
+      border:1.5px dashed #d97706 !important;
+      background:rgba(217,119,6,0.08) !important;
+      color:#92400e !important;
+      font-style:italic;
+    }
+    .tree-pill-unbound:hover {
+      background:rgba(217,119,6,0.16) !important;
     }
   `;
   const style = document.createElement('style');
