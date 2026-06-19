@@ -23,6 +23,12 @@
       --pipe-suction:#1f6feb; --pipe-return:#e23b56; --pipe-spillover:#7c4dff;
       --pipe-feature:#e07b00; --pipe-conduit:#9aa0a6; --pipe-gas:#d19900; --pipe-drain:#3a4a5c;
       --pipe-air:#0ea5b7;
+      /* Source-traced pipe colors — used in Trace Mode to color pipes by what
+         fixture they originate from (suction) or terminate at (return). */
+      --src-skimmer:#22c55e;  --src-drain:#1a1a1a;  --src-return:#2563eb;
+      --src-jet:#dc2626;      --src-bubbler:#06b6d4; --src-deckjet:#a855f7;
+      --src-sheer:#0d9488;    --src-slide:#f97316;  --src-feature:#ec4899;
+      --src-autofill:#7dd3fc; --src-light:#fde047;  --src-mixed:#6b7280;
       --shadow:0 6px 22px rgba(0,0,0,.08);
       --r:14px; --r-sm:10px;
       --sheet-bg:rgba(255,255,255,0.96);
@@ -37,6 +43,11 @@
       --gold:#efc65d; --success:#79b95b; --error:#e57373; --error-bg:#3a2222;
       --shadow:0 10px 30px rgba(0,0,0,.4);
       --sheet-bg:rgba(22,26,32,0.95);
+      /* Slightly brighter source colors for dark mode legibility */
+      --src-skimmer:#4ade80;  --src-drain:#e5e7eb;  --src-return:#60a5fa;
+      --src-jet:#f87171;      --src-bubbler:#22d3ee; --src-deckjet:#c084fc;
+      --src-sheer:#2dd4bf;    --src-slide:#fb923c;  --src-feature:#f472b6;
+      --src-autofill:#bae6fd; --src-light:#fde047;  --src-mixed:#9ca3af;
     }
     * { box-sizing:border-box; -webkit-tap-highlight-color: transparent; }
     html, body {
@@ -82,6 +93,8 @@
       transition: background .15s;
     }
     .icon-btn:active { background:var(--border); }
+    .icon-btn.on { background:var(--primary); color:#fff; border-color:var(--primary); }
+    .icon-btn.on:active { background:var(--primary2); }
     .icon-btn.primary { background:var(--primary); color:#fff; }
     .icon-btn.primary:active { background:var(--primary2); }
     .icon-btn svg { width:22px; height:22px; }
@@ -502,6 +515,24 @@
     .legend .item { display:flex; align-items:center; gap:6px; }
     .legend .swatch { width:18px; height:6px; border-radius:3px; }
 
+    /* Canvas trace-mode HUD legend (positioned absolutely over canvas, top-left under topbar) */
+    #legend {
+      position:absolute; left:10px; top:10px;
+      display:flex; flex-direction:column; gap:4px;
+      background:var(--sheet-bg); -webkit-backdrop-filter:blur(10px); backdrop-filter:blur(10px);
+      border:1px solid var(--border); border-radius:10px;
+      padding:8px 10px;
+      font-size:11px; font-weight:600;
+      max-width:160px; z-index:18;
+      box-shadow:var(--shadow);
+      grid-template-columns:none;
+      pointer-events:none;
+    }
+    #legend[hidden] { display:none; }
+    #legend .legend-title { font-size:10px; text-transform:uppercase; letter-spacing:.5px; color:var(--muted); margin-bottom:2px; }
+    #legend .item { display:flex; align-items:center; gap:6px; }
+    #legend .swatch { width:16px; height:5px; border-radius:2px; flex-shrink:0; }
+
     .takeoff-list, .issues-list { display:flex; flex-direction:column; gap:6px; }
     .takeoff-list .row-item, .issues-list .row-item {
       padding:8px 10px; background:var(--surface); border:1px solid var(--border); border-radius:10px;
@@ -609,6 +640,9 @@
     <button class="icon-btn" id="undoBtn" title="Undo" aria-label="Undo">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14L4 9l5-5"/><path d="M4 9h11a5 5 0 0 1 5 5v0a5 5 0 0 1-5 5H9"/></svg>
     </button>
+    <button class="icon-btn" id="traceBtn" title="Trace mode — color pipes by source/destination" aria-label="Trace mode">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="2" fill="#22c55e" stroke="none"/><circle cx="18" cy="6" r="2" fill="#2563eb" stroke="none"/><circle cx="6" cy="18" r="2" fill="#dc2626" stroke="none"/><circle cx="18" cy="18" r="2" fill="#1a1a1a" stroke="none"/><path d="M6 8v8M18 8v8M8 6h8M8 18h8"/></svg>
+    </button>
     <button class="icon-btn" id="connectBtn" title="Connect pipes" aria-label="Connect">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 14a5 5 0 0 1 0-7l1-1a5 5 0 0 1 7 7l-1 1"/><path d="M14 10a5 5 0 0 1 0 7l-1 1a5 5 0 0 1-7-7l1-1"/></svg>
     </button>
@@ -643,6 +677,7 @@
       </button>
     </div>
     <div class="toast" id="toast"></div>
+    <div class="legend" id="legend" hidden></div>
   </section>
 
   <!-- BOTTOM SHEET -->

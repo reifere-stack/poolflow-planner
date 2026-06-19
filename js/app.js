@@ -33,7 +33,20 @@ const state = {
   lastSolve: null,
   undoStack: [],
   editingEdgeId: null,
+  traceMode: (function(){
+    try { const v = localStorage.getItem('poolflow-trace-mode'); return v === null ? true : v === '1'; }
+    catch { return true; }
+  })(),
 };
+
+function setTraceMode(on) {
+  state.traceMode = !!on;
+  try { localStorage.setItem('poolflow-trace-mode', on ? '1' : '0'); } catch {}
+  const btn = $('traceBtn');
+  if (btn) btn.classList.toggle('on', state.traceMode);
+  drawEdges();
+  renderLegend();
+}
 
 // ---------- Real-world conversion ----------
 function pxPerFoot() { return state.scale?.pxPerFoot || 24; }
@@ -1358,7 +1371,38 @@ function drawEdges() {
     const d = polylineRoundedPath(pts, 10);
     // Invisible thick stroke for hit-testing (tap on a pipe to add a tee)
     html += `<path d="${d}" class="pipe-hit" data-edge-id="${e.id}"></path>`;
-    html += `<path d="${d}" class="${classes.join(' ')}" stroke="${t.color}" stroke-width="${sw}" stroke-dasharray="${t.dash}" marker-end="url(#arr-${e.type})" pointer-events="none"></path>`;
+    // ----- Trace Mode: color pipe by source fixture(s). Falls back to type color. -----
+    let strokeColor = t.color;
+    let styleAttr = '';
+    let extraPaths = '';
+    if (state.traceMode && isHydraulicPipe(e.type)) {
+      const sources = resolvePipeSources(e).filter(s => SOURCE_COLORS[s]);
+      if (sources.length === 1) {
+        strokeColor = SOURCE_COLORS[sources[0]].color;
+      } else if (sources.length >= 2) {
+        // Multi-source: render base in the first color, then overlay one
+        // stripe path per additional source with offset dash patterns so
+        // each source's color appears as repeating dashes along the pipe.
+        strokeColor = SOURCE_COLORS[sources[0]].color;
+        const N = sources.length;
+        const stripeLen = 14;
+        const dashOn = stripeLen;
+        const dashOff = (N - 1) * stripeLen;
+        // inline style overrides .pipe.active's CSS dasharray
+        styleAttr = ` style="stroke-dasharray:${dashOn} ${dashOff};stroke-dashoffset:0;"`;
+        for (let i = 1; i < N; i++) {
+          const c = SOURCE_COLORS[sources[i]].color;
+          const off = -i * stripeLen;
+          const stripeStyle = `stroke-dasharray:${dashOn} ${dashOff};stroke-dashoffset:${off};`;
+          // Drop 'active' class on stripes so the dash-animation keyframe
+          // doesn't desync the offset overlays.
+          const stripeClasses = classes.filter(cn => cn !== 'active').join(' ');
+          extraPaths += `<path d="${d}" class="${stripeClasses}" stroke="${c}" stroke-width="${sw}" style="${stripeStyle}" pointer-events="none"></path>`;
+        }
+      }
+    }
+    html += `<path d="${d}" class="${classes.join(' ')}" stroke="${strokeColor}" stroke-width="${sw}" stroke-dasharray="${t.dash}"${styleAttr} marker-end="url(#arr-${e.type})" pointer-events="none"></path>`;
+    html += extraPaths;
     // Label at midpoint of polyline
     const totalLen = polylineLengthPx(pts);
     let target = totalLen / 2, acc = 0, lx = pts[0].x, ly = pts[0].y;
@@ -1423,6 +1467,33 @@ function drawEdges() {
     }
   }
   edgeSvg.innerHTML = html;
+  renderLegend();
+}
+
+// Populate the floating canvas legend with only the source-fixture colors
+// actually present on screen. Auto-hides when Trace Mode is off or empty.
+function renderLegend() {
+  const el = $('legend');
+  if (!el) return;
+  if (!state.traceMode) { el.hidden = true; el.innerHTML = ''; return; }
+  const present = new Set();
+  for (const e of state.edges) {
+    if (!isHydraulicPipe(e.type)) continue;
+    for (const s of resolvePipeSources(e)) {
+      if (SOURCE_COLORS[s]) present.add(s);
+    }
+  }
+  if (present.size === 0) { el.hidden = true; el.innerHTML = ''; return; }
+  el.hidden = false;
+  // Stable display order matching SOURCE_COLORS declaration order.
+  const order = Object.keys(SOURCE_COLORS);
+  let html = '<div class="legend-title">Pipe sources</div>';
+  for (const key of order) {
+    if (!present.has(key)) continue;
+    const { color, label } = SOURCE_COLORS[key];
+    html += `<div class="item"><span class="swatch" style="background:${color}"></span><span>${escapeHtml(label)}</span></div>`;
+  }
+  el.innerHTML = html;
 }
 
 // ---------- Spillover (water-body to water-body) ----------
@@ -1646,6 +1717,81 @@ function pumpPortPipeType(port) {
 //   null      = neutral (pumps, filters, valves, tees, bodies, etc.).
 const SUCTION_FIXTURES = new Set(['skimmer', 'drain']);
 const RETURN_FIXTURES  = new Set(['return', 'jet', 'bubbler', 'deckjet', 'sheer', 'slide', 'feature']);
+
+// ---------- Source-traced pipe coloring ----------
+// Map fixture type -> { color (CSS var), label }. Each fixture type the pipe
+// can originate from / terminate at gets its own color. drawEdges() consults
+// this map to color pipes in Trace Mode.
+const SOURCE_COLORS = {
+  skimmer:  { color: 'var(--src-skimmer)',  label: 'Skimmer' },
+  drain:    { color: 'var(--src-drain)',    label: 'Main Drain' },
+  return:   { color: 'var(--src-return)',   label: 'Pool Return' },
+  jet:      { color: 'var(--src-jet)',      label: 'Spa Jet' },
+  bubbler:  { color: 'var(--src-bubbler)',  label: 'Bubbler' },
+  deckjet:  { color: 'var(--src-deckjet)',  label: 'Deck Jet' },
+  sheer:    { color: 'var(--src-sheer)',    label: 'Sheer Descent' },
+  slide:    { color: 'var(--src-slide)',    label: 'Slide' },
+  feature:  { color: 'var(--src-feature)',  label: 'Feature' },
+  autofill: { color: 'var(--src-autofill)', label: 'Autofill' },
+  light:    { color: 'var(--src-light)',    label: 'Light' },
+};
+const MIXED_COLOR = 'var(--src-mixed)';
+
+// A "source fixture" for trace-coloring is any leaf fixture a pipe touches
+// (skimmer/drain on suction side, return/jet/etc on delivery side).
+function isSourceFixture(item) {
+  if (!item) return false;
+  return SUCTION_FIXTURES.has(item.type) || RETURN_FIXTURES.has(item.type);
+}
+
+// BFS-trace from one side of `edge` through pass-through items (pumps,
+// valves, tees, filters, heaters, etc.) and collect every source-fixture
+// type reachable from that side via hydraulic pipes (suction OR return).
+// Returns an array of fixture-type strings (e.g. ['skimmer','drain']).
+function resolvePipeSourcesSide(edge, side, itemById) {
+  const startId = side === 'from' ? edge.from : edge.to;
+  const startItem = itemById[startId];
+  if (!startItem) return [];
+  const found = new Set();
+  if (isSourceFixture(startItem)) found.add(startItem.type);
+  const visited = new Set([startId]);
+  const queue = [startId];
+  while (queue.length) {
+    const id = queue.shift();
+    const item = itemById[id];
+    if (!item) continue;
+    // Don't traverse past a source fixture — it IS a terminal endpoint.
+    if (id !== startId && isSourceFixture(item)) continue;
+    for (const e of state.edges) {
+      if (e === edge) continue;
+      if (!isHydraulicPipe(e.type)) continue;
+      let otherId = null;
+      if (e.from === id) otherId = e.to;
+      else if (e.to === id) otherId = e.from;
+      if (!otherId || visited.has(otherId)) continue;
+      visited.add(otherId);
+      const otherItem = itemById[otherId];
+      if (otherItem && isSourceFixture(otherItem)) {
+        found.add(otherItem.type);
+        continue; // terminal — don't queue
+      }
+      queue.push(otherId);
+    }
+  }
+  return Array.from(found);
+}
+
+// Returns all unique source-fixture types reachable from EITHER end of the
+// pipe via the hydraulic graph. This is the set we'll color the pipe with.
+function resolvePipeSources(edge) {
+  if (!edge || !isHydraulicPipe(edge.type)) return [];
+  const itemById = {};
+  for (const it of state.items) itemById[it.id] = it;
+  const a = resolvePipeSourcesSide(edge, 'from', itemById);
+  const b = resolvePipeSourcesSide(edge, 'to', itemById);
+  const set = new Set([...a, ...b]);
+  return Array.from(set);
+}
 
 function itemFixtureRole(item) {
   if (!item) return null;
@@ -1892,22 +2038,92 @@ function solveFlow() {
     outgoing.forEach(o => traverse(o, pump.label, new Set([pump.id])));
   }
 
-  // Spillover check — a body receiving water must have a way back to the source body
-  // either via piped return, an explicit spillsInto, or relation hint.
-  // "Receiving water" includes flow that terminates at a fixture in that body
-  // (e.g. spa jets count as water arriving at the spa).
+  // Spillover safety check (N-body cascade aware) — if water enters a body
+  // from any equipment-pad source, there must be a physical return path back
+  // out, either:
+  //   (a) a gravity spillover edge from this body to another body, OR
+  //   (b) a configured `spillsInto` destination, OR
+  //   (c) a suction line from this body back to a pump, OR
+  //   (d) a downstream cascade — this body spills to another body that itself
+  //       eventually drains via (a)/(b)/(c). E.g. spa→pond→pool where only the
+  //       pool has a suction line is valid because water cascades all the way
+  //       down to the body that has the suction return.
+  // Without ANY of these, the receiving body would overflow and the upstream
+  // body would drain. (Industry rule — Jandy/Pentair schematics.)
+  const BODY_TYPES = new Set(['pool','spa']);
+  const allBodies = state.items.filter(i => BODY_TYPES.has(i.type));
+  const itemMap = {}; state.items.forEach(i => itemMap[i.id] = i);
   const bodyReceiving = new Set(results.map(r => r.type));
-  for (const body of state.items.filter(i => i.type === 'pool' || i.type === 'spa')) {
+
+  // Helper: does this body have a direct drain that exits the cascade entirely
+  // (i.e. a suction line back to a pump)? Spillovers to OTHER bodies don't count
+  // here — they're handled by the cascade traversal below.
+  // NOTE: spillover edges are gravity-fed and don't need to be 'active' in the
+  // pump-driven flow traversal — they're physical topology declared by the user.
+  function bodyHasDirectDrain(body) {
+    // (c) suction line out of this body that reaches a pump
+    const suctionStarts = state.items.filter(i =>
+      (i.type === 'skimmer' || i.type === 'drain') &&
+      (i.relation === body.id || i.relation === body.type ||
+        (!i.relation && state.items.filter(b => b.type === body.type).length === 1))
+    );
+    if (suctionStarts.length) {
+      const visited = new Set();
+      const queue = suctionStarts.map(s => s.id);
+      queue.forEach(id => visited.add(id));
+      while (queue.length) {
+        const id = queue.shift();
+        const node = itemMap[id];
+        if (node && node.type === 'pump') return true;
+        for (const e of state.edges) {
+          if (e.type !== 'suction' || !e.active || e.blocked) continue;
+          const next = e.from === id ? e.to : (e.to === id ? e.from : null);
+          if (next && !visited.has(next)) { visited.add(next); queue.push(next); }
+        }
+      }
+    }
+    return false;
+  }
+
+  // Trace the spillover cascade DOWNSTREAM from this body. Returns true if some
+  // body in the cascade (including this one) has a suction return to a pump.
+  // The cascade traversal also covers "this body itself drains to a pump".
+  function cascadeDrains(startBody, visited = new Set()) {
+    if (visited.has(startBody.id)) return false; // cycle — bail (and a cascade loop with no suction is invalid)
+    visited.add(startBody.id);
+    if (bodyHasDirectDrain(startBody)) return true;
+    const downstream = [];
+    state.edges.forEach(e => {
+      if (e.from === startBody.id && e.type === 'spillover' && !e.blocked) {
+        const t = itemMap[e.to]; if (t && BODY_TYPES.has(t.type)) downstream.push(t);
+      }
+    });
+    if (startBody.spillsInto && itemMap[startBody.spillsInto] && BODY_TYPES.has(itemMap[startBody.spillsInto].type)) {
+      downstream.push(itemMap[startBody.spillsInto]);
+    }
+    for (const next of downstream) {
+      if (cascadeDrains(next, visited)) return true;
+    }
+    return false;
+  }
+
+  for (const body of allBodies) {
     const inToBody = state.edges.filter(e => e.to === body.id && ['return','spillover','feature'].includes(e.type) && e.active && !e.blocked);
     const viaFixture = bodyReceiving.has(body.type);
     if (!inToBody.length && !viaFixture) continue;
-    const pipedOut = state.edges.filter(e => e.from === body.id && (e.type === 'spillover' || e.type === 'return') && e.active && !e.blocked);
-    const reachesOther = pipedOut.some(e => { const t = getItem(e.to); return t && t.type !== body.type && (t.type === 'pool' || t.type === 'spa'); });
-    const hasGravitySpill = !!(body.spillsInto && getItem(body.spillsInto));
-    const relOther = body.relation && body.relation !== body.type;
-    if (!relOther && !reachesOther && !hasGravitySpill) {
-      const where = body.type === 'spa' ? 'pool' : 'spa';
-      issues.push(`${body.label} (${body.type}) receives water but has no spillover or return path to a ${where}. Set a spillover destination in the Selected panel.`);
+    if (!cascadeDrains(body)) {
+      let downstreamLabels = [];
+      state.edges.forEach(e => {
+        if (e.from === body.id && e.type === 'spillover' && !e.blocked) {
+          const t = itemMap[e.to]; if (t && BODY_TYPES.has(t.type)) downstreamLabels.push(t.label);
+        }
+      });
+      if (body.spillsInto && itemMap[body.spillsInto]) downstreamLabels.push(itemMap[body.spillsInto].label);
+      const detail = downstreamLabels.length
+        ? ` Cascade ends at ${downstreamLabels.join(' / ')} which has no spillover or suction return.`
+        : ` Add a spillover to another body, or a skimmer/drain suction line back to the pump.`;
+      const other = body.type === 'spa' ? 'pool' : 'spa';
+      issues.push(`${body.label} receives water but has nowhere for it to go.${detail} Without this, ${body.label} will overflow and the source ${other} will drain.`);
     }
   }
 
@@ -2142,13 +2358,14 @@ function renderSelected() {
             ${PIPE_SIZES.map(s => `<option ${item.size===s?'selected':''}>${s}</option>`).join('')}
           </select>
         </div>
+        ${isBody ? '' : `
         <div class="field"><label>Body relation${item.relationAuto && !item.relationLocked ? ' \u00b7 auto' : ''}</label>
           <select id="f-relation">
             <option value="">None</option>
             <option ${item.relation==='pool'?'selected':''} value="pool">Flows to pool</option>
             <option ${item.relation==='spa'?'selected':''} value="spa">Flows to spa</option>
           </select>
-        </div>
+        </div>`}
       </div>
       ${isValve ? (item.type === 'valve3' ? (() => {
         const info = valveBranchInfo(item);
@@ -2699,11 +2916,14 @@ function doAction(name, btn) {
       pushUndo();
       item.label = $('f-label')?.value || item.label;
       item.size  = $('f-size')?.value || '';
-      const newRel = $('f-relation')?.value || '';
-      item.relation = newRel;
-      // User picked something explicit — lock it (or clear lock if they reset to none)
-      item.relationLocked = !!newRel;
-      item.relationAuto = false;
+      // Only update body relation if the field is present (it's hidden for body items themselves)
+      if ($('f-relation')) {
+        const newRel = $('f-relation').value || '';
+        item.relation = newRel;
+        // User picked something explicit — lock it (or clear lock if they reset to none)
+        item.relationLocked = !!newRel;
+        item.relationAuto = false;
+      }
       if ($('f-valve')) item.valveState = $('f-valve').value || '';
       if ($('f-spillsInto')) {
         item.spillsInto   = $('f-spillsInto').value || '';
@@ -3393,6 +3613,7 @@ $('connectBtn').addEventListener('click', () => {
 });
 $('connectCancel').addEventListener('click', cancelConnectMode);
 $('undoBtn').addEventListener('click', undo);
+$('traceBtn').addEventListener('click', () => setTraceMode(!state.traceMode));
 
 $('zoomIn').addEventListener('click', () => setZoom(state.view.scale * 1.25));
 $('zoomOut').addEventListener('click', () => setZoom(state.view.scale / 1.25));
@@ -3411,6 +3632,8 @@ if (!restore()) {
 }
 renderSheet();
 solveFlow();
+// Reflect persisted Trace Mode preference on the toggle button + draw legend.
+setTraceMode(state.traceMode);
 
 // Keyboard
 document.addEventListener('keydown', (e) => {
