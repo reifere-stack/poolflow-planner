@@ -3954,6 +3954,20 @@ function _flowStepLabel(item) {
 }
 
 const _flowsEditState = { editingFlowId: null };
+const _psZoomLevels = {}; // flowId -> 'normal' | 'zoom-out' | 'zoom-out-xl'
+const _PS_ZOOM_ORDER = ['normal', 'zoom-out', 'zoom-out-xl'];
+const _PS_ZOOM_LABEL = { 'normal': '\u2194 Fit', 'zoom-out': '\u2194 Fit-', 'zoom-out-xl': '\u2194 100%' };
+function _psZoomClass(flowId) {
+  const z = _psZoomLevels[flowId] || 'normal';
+  return z === 'normal' ? '' : z;
+}
+function _psCycleZoom(flowId) {
+  const cur = _psZoomLevels[flowId] || 'normal';
+  const idx = _PS_ZOOM_ORDER.indexOf(cur);
+  const next = _PS_ZOOM_ORDER[(idx + 1) % _PS_ZOOM_ORDER.length];
+  if (next === 'normal') delete _psZoomLevels[flowId];
+  else _psZoomLevels[flowId] = next;
+}
 
 function renderFlows() {
   const host = $('flowsList');
@@ -5230,6 +5244,69 @@ function flowsDeletePumpCard(pump) {
       color:#fff;
     }
     .pump-tree .ghost-branch:focus { outline:2px solid var(--primary, #4c6ef5); outline-offset:2px; }
+
+    /* ===== iPhone / narrow viewport compaction ===== */
+    /* On small screens the tree must fit in roughly 360px without horizontal
+       overflow. We reduce every horizontal contributor: pill padding, label
+       max-width, fork gap, ghost-branch padding. */
+    @media (max-width: 480px) {
+      .pump-card { padding:6px 4px; }
+      .pump-card .pump-tree { padding:6px 2px 2px; }
+      .pump-tree .tree-pill {
+        padding:5px 9px; gap:5px; font-size:12px; min-height:28px;
+        max-width:none;
+      }
+      .pump-tree .tree-pill .pill-icon { width:14px; height:14px; }
+      .pump-tree .tree-pill .pill-icon svg { width:13px; height:13px; }
+      .pump-tree .tree-pill .pill-label { max-width:88px; font-size:12px; }
+      .pump-tree .tree-pill .pill-btn { width:16px; height:16px; font-size:11px; }
+      .pump-tree .tree-pill.is-closure .pill-label { max-width:76px; }
+      .pump-tree .tree-fork-cols { gap:8px; }
+      .pump-tree .tree-arrow-v { height:12px; }
+      .pump-tree .tree-arrow-v::after { width:5px; height:5px; }
+      .pump-tree .ghost-branch { padding:4px 9px; min-height:26px; font-size:11px; }
+      .pump-tree .tree-fork-stem { height:10px; }
+      /* Pill-insert handles (the small +/- above/below for inserting steps)
+         get extra-tight too so they don't push the tree wider. */
+      .pump-tree .pill-insert { width:18px; height:18px; font-size:12px; }
+      .pump-tree .pill-insert-above, .pump-tree .pill-insert-below { margin:1px 0; }
+      /* Spillover sub-pill */
+      .spill-link-pill { font-size:10px; padding:2px 7px; }
+      /* The unbound "pick body..." placeholder */
+      .tree-pill-unbound .pill-label { font-size:11px; }
+    }
+    /* Extra-narrow (older / smaller iPhones) */
+    @media (max-width: 380px) {
+      .pump-tree .tree-pill .pill-label { max-width:72px; }
+      .pump-tree .tree-fork-cols { gap:6px; }
+      .pump-tree .tree-pill { padding:4px 8px; font-size:11px; }
+    }
+
+    /* Tree zoom-out: a per-card scale toggle for when the design is still
+       wider than the viewport even after compaction. Triggered by a button on
+       the flow card. */
+    .pump-tree.zoom-out {
+      transform:scale(0.78);
+      transform-origin:top center;
+      margin-bottom:-20%; /* compensate scaled-down whitespace */
+    }
+    .pump-tree.zoom-out-xl {
+      transform:scale(0.6);
+      transform-origin:top center;
+      margin-bottom:-40%;
+    }
+    .flow-card-zoom-btn {
+      appearance:none; -webkit-appearance:none;
+      background:var(--offset); color:var(--text);
+      border:1px solid var(--border);
+      border-radius:8px;
+      padding:5px 8px; font-size:11px; font-weight:600;
+      cursor:pointer; white-space:nowrap;
+      display:inline-flex; align-items:center; gap:4px;
+    }
+    .flow-card-zoom-btn.active {
+      background:var(--primary); color:#fff; border-color:var(--primary);
+    }
   `;
   const style = document.createElement('style');
   style.textContent = css;
@@ -5617,11 +5694,12 @@ _psRenderPumpCard = function _psRenderPumpCardExt(card) {
         <div class="flow-card-title">${escapeHtml(title)}</div>
         <div class="flow-card-actions">
           ${editBtns}
+          <button type="button" data-act="toggle-zoom" data-flow-id="${flowId}" class="flow-card-zoom-btn" title="Zoom out to fit on screen">${_PS_ZOOM_LABEL[_psZoomLevels[flowId] || 'normal']}</button>
           <button type="button" data-act="delete-pump-flow" data-flow-id="${flowId}" class="danger">Delete</button>
         </div>
       </div>
       ${editingExtras}
-      <div class="pump-tree">
+      <div class="pump-tree ${_psZoomClass(flowId)}">
         ${suctionHtml}
         ${pumpPill}
         ${returnHtmlFinal}
@@ -5980,6 +6058,9 @@ function flowsOpenTreePicker(role, attachToItem, opts) {
     }
     if (act === 'delete-pump-flow') {
       if (card) flowsDeletePumpCard(card.pump); return;
+    }
+    if (act === 'toggle-zoom') {
+      _psCycleZoom(flowId); renderFlows(); return;
     }
     if (act === 'remove-tree-step') {
       flowsRemoveTreeStep(itemId); return;
