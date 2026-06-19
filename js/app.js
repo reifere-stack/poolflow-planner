@@ -230,6 +230,14 @@ function resolveEndRole(edge, side, s, itemById) {
   return null;
 }
 
+// Swap an edge's endpoints (including their port assignments) in place so the
+// animated arrow points along the water-flow direction.
+function reverseEdge(e) {
+  const f = e.from, fp = e.fromPort;
+  e.from = e.to;       e.fromPort = e.toPort;
+  e.to   = f;          e.toPort   = fp;
+}
+
 function propagatePipeTypes(s) {
   if (!s || !Array.isArray(s.items) || !Array.isArray(s.edges)) return;
   const itemById = {};
@@ -244,6 +252,27 @@ function propagatePipeTypes(s) {
     if (fromRole && toRole) chosen = (fromRole === toRole) ? fromRole : null;
     else chosen = fromRole || toRole;
     if (chosen && chosen !== e.type) e.type = chosen;
+
+    // Normalize flow direction:
+    //   suction edges: water flows from fixture/sink toward the pump
+    //                  intake → 'to' end should be on the pump side.
+    //   return  edges: water flows from pump discharge toward fixture
+    //                  → 'from' end should be on the pump side.
+    // We detect "pump side" by checking if either endpoint is a pump directly,
+    // OR by which end is closer (in pass-through BFS) to a pump.
+    if (e.type === 'suction' || e.type === 'return') {
+      const fromItem = itemById[e.from];
+      const toItem   = itemById[e.to];
+      const fromIsPump = fromItem && fromItem.type === 'pump';
+      const toIsPump   = toItem   && toItem.type   === 'pump';
+      if (e.type === 'suction') {
+        // Pump should be on the 'to' side. If pump is on 'from', flip.
+        if (fromIsPump && !toIsPump) reverseEdge(e);
+      } else { // 'return'
+        // Pump should be on the 'from' side. If pump is on 'to', flip.
+        if (toIsPump && !fromIsPump) reverseEdge(e);
+      }
+    }
   }
 }
 
@@ -828,6 +857,14 @@ function pumpInnerMarkup(item) {
 function nodeInnerMarkup(item) {
   if (item.type === 'valve3') return valve3InnerMarkup(item);
   if (item.type === 'pump')   return pumpInnerMarkup(item);
+  const tool = TOOLS[item.type] || {};
+  if (tool.compact) {
+    // Compact fixtures — icon only, label shown as a tooltip on hover / tap-select.
+    return `
+      <div class="icon" title="${escapeHtml(item.label)}">${iconMarkup(item.type)}</div>
+      <div class="compact-label">${escapeHtml(item.label)}</div>
+    `;
+  }
   return `
     <div class="icon">${iconMarkup(item.type)}</div>
     <div class="title">${escapeHtml(item.label)}</div>
@@ -842,6 +879,7 @@ function renderItem(item) {
   el.className = 'node ' + (NODE_CLASS[item.type] || '');
   if (item.type === 'valve3') el.classList.add('valve3-node');
   if (item.type === 'pump')   el.classList.add('pump-node');
+  if (tool.compact) el.classList.add('compact-node');
   if (RESIZABLE.has(item.type)) el.classList.add('resizable');
   if ((item.type==='valve2' && item.valveState==='closed') ||
       (item.type==='valve3' && item.valveState==='')) {
@@ -879,9 +917,11 @@ function escapeHtml(s) {
 function refreshItem(item) {
   const el = nodeEl(item.id);
   if (!el) { renderItem(item); return; }
+  const tool = TOOLS[item.type] || {};
   el.className = 'node ' + (NODE_CLASS[item.type] || '');
   if (item.type === 'valve3') el.classList.add('valve3-node');
   if (item.type === 'pump')   el.classList.add('pump-node');
+  if (tool.compact) el.classList.add('compact-node');
   if (RESIZABLE.has(item.type)) el.classList.add('resizable');
   if ((item.type==='valve2' && item.valveState==='closed')) el.classList.add('closed-state');
   if (state.selectedId === item.id) el.classList.add('selected');
@@ -1086,10 +1126,31 @@ function handleConnectTap(id, tapPt) {
   // Create edge
   const from = getItem(state.connectSourceId), to = getItem(id);
   if (from && to) {
-    pushUndo();
     const srcTap = state.connectSourceTap;
     const fromAssign = assignPortForTap(from, srcTap, 'from');
     const toAssign   = assignPortForTap(to,   tapPt, 'to');
+    // Reject connections between conflicting endpoint roles before we
+    // create the edge — e.g. return fixture (jet) → pump intake should
+    // never become a suction line. We also walk through pass-through items
+    // so a chain like 'jet → valve → pump intake' is caught even though
+    // the valve doesn't imply a type itself.
+    const probeEdge = {
+      from: from.id, to: to.id,
+      fromPort: fromAssign.port || '', toPort: toAssign.port || '',
+      type: 'suction', // dummy; resolveEndRole ignores this when hydraulic
+    };
+    const itemByIdProbe = {}; state.items.forEach(i => itemByIdProbe[i.id] = i);
+    const fromRolePropagated = fromAssign.pipeType ||
+      resolveEndRole(probeEdge, 'from', state, itemByIdProbe);
+    const toRolePropagated   = toAssign.pipeType   ||
+      resolveEndRole(probeEdge, 'to',   state, itemByIdProbe);
+    if (fromRolePropagated && toRolePropagated &&
+        fromRolePropagated !== toRolePropagated) {
+      toast(`Can't connect ${from.label} (${fromRolePropagated}) to ${to.label} (${toRolePropagated})`);
+      cancelConnectMode();
+      return;
+    }
+    pushUndo();
     // Endpoint-implied pipe type wins over the pending pipe type:
     //   pump intake / skimmer / main drain → suction
     //   pump discharge / return / jet / bubbler / feature → return

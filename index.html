@@ -157,6 +157,37 @@
     .node.large .title { font-size:14px; }
     .node.large .icon { width:36px; height:36px; }
 
+    /* Compact fixtures: icon-only chip; label hidden until selected/hovered. */
+    .node.compact-node {
+      min-width:0; min-height:0;
+      padding:3px;
+      gap:0;
+      border-radius:8px;
+      background:#fff;
+    }
+    .node.compact-node .icon {
+      width:100%; height:100%;
+      display:flex; align-items:center; justify-content:center;
+    }
+    .node.compact-node .icon svg { width:80%; height:80%; }
+    .node.compact-node .compact-label {
+      position:absolute;
+      top:calc(100% + 2px); left:50%; transform:translateX(-50%);
+      font-size:9px; font-weight:600; line-height:1;
+      color:var(--muted);
+      white-space:nowrap;
+      pointer-events:none;
+      opacity:0;
+      transition:opacity .12s ease;
+      background:rgba(255,255,255,.85);
+      padding:1px 4px; border-radius:4px;
+      max-width:120px; overflow:hidden; text-overflow:ellipsis;
+    }
+    .node.compact-node.selected .compact-label,
+    .node.compact-node:hover .compact-label {
+      opacity:1;
+    }
+
     .node.selected {
       border-color: var(--primary);
       box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 30%, transparent), 0 4px 14px rgba(0,0,0,.16);
