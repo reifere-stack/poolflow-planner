@@ -4865,8 +4865,35 @@ function buildPumpCards() {
 // children, the columns are laid side-by-side with a horizontal connector
 // line linking them at the top, and a single down-arrow from the parent
 // dropping into that connector.
+// Poolside-tech rendering: every tee is strictly 2-way. When the underlying
+// model has a junction with N≥3 children, we render it as a binary tree by
+// inserting synthetic intermediate "T Split" pills. The first child becomes
+// branch A of the real junction; branch B is a synthetic Tee whose two
+// children are the next real child + (recursively) the rest. Synthetic tees
+// are display-only — they don't exist in state, so they show no buttons.
+function _psBinarize(treeNode, depth) {
+  if (!treeNode) return treeNode;
+  depth = depth || 0;
+  const kids = (treeNode.children || []).map(c => ({ node: _psBinarize(c.node, 0), port: c.port }));
+  if (kids.length <= 2) return { item: treeNode.item, children: kids };
+  // Build the nested split chain for kids[1..N-1]
+  const baseItem = treeNode.item;
+  const buildChain = (rest, n) => {
+    if (rest.length === 2) return { item: { id: `${baseItem.id}__split${n}`, type: 'tee', label: n === 1 ? 'T Split' : `T Split ${n}`, __synthetic: true }, children: rest };
+    return {
+      item: { id: `${baseItem.id}__split${n}`, type: 'tee', label: n === 1 ? 'T Split' : `T Split ${n}`, __synthetic: true },
+      children: [rest[0], { node: buildChain(rest.slice(1), n + 1), port: '' }],
+    };
+  };
+  return {
+    item: baseItem,
+    children: [kids[0], { node: buildChain(kids.slice(1), 1), port: '' }],
+  };
+}
+
 function _psRenderReturnSubtree(treeNode, flowId) {
   if (!treeNode) return '';
+  treeNode = _psBinarize(treeNode);
   const item = treeNode.item;
   const kids = treeNode.children || [];
   let kidsHtml = '';
@@ -4895,6 +4922,7 @@ function _psRenderReturnSubtree(treeNode, flowId) {
 // with a fork connector flowing downward into the node.
 function _psRenderSuctionSubtree(treeNode, flowId, isRoot) {
   if (!treeNode) return '';
+  treeNode = _psBinarize(treeNode);
   const item = treeNode.item;
   const kids = treeNode.children || [];
   let kidsHtml = '';
@@ -5416,6 +5444,7 @@ function _psGhostBranchCol(flowId, junctionId, side) {
 const _psRenderReturnSubtreeOriginal = _psRenderReturnSubtree;
 _psRenderReturnSubtree = function _psRenderReturnSubtreeExt(treeNode, flowId) {
   if (!treeNode) return '';
+  treeNode = _psBinarize(treeNode);
   const item = treeNode.item;
   const kids = treeNode.children || [];
   const editing = _flowsEditState.editingFlowId === flowId;
@@ -5498,6 +5527,7 @@ _psRenderReturnSubtree = function _psRenderReturnSubtreeExt(treeNode, flowId) {
 const _psRenderSuctionSubtreeOriginal = _psRenderSuctionSubtree;
 _psRenderSuctionSubtree = function _psRenderSuctionSubtreeExt(treeNode, flowId, isRoot) {
   if (!treeNode) return '';
+  treeNode = _psBinarize(treeNode);
   const item = treeNode.item;
   const kids = treeNode.children || [];
   const editing = _flowsEditState.editingFlowId === flowId;
@@ -5591,9 +5621,10 @@ _psRenderPill = function _psRenderPillExt(item, flowId, opts) {
   const isPump = item.type === 'pump';
   const isBody = _PSPILL_BODY_TYPES.has(item.type);
   const isFixture = SUCTION_FIXTURES.has(item.type) || RETURN_FIXTURES.has(item.type);
-  const removable = editing && !opts.isClosure && !isFixture && !isPump && !isBody;
-  const branchable = editing && isJunction;
-  const renamable  = !opts.isClosure;
+  const isSynthetic = !!item.__synthetic;
+  const removable = editing && !opts.isClosure && !isFixture && !isPump && !isBody && !isSynthetic;
+  const branchable = editing && isJunction && !isSynthetic;
+  const renamable  = !opts.isClosure && !isSynthetic;
   // side: 'suction' (tree above pump, water flowing DOWN to pump) or
   //       'return'  (tree below pump, water flowing DOWN away from pump)
   const side = opts.side || 'return';
@@ -5604,7 +5635,7 @@ _psRenderPill = function _psRenderPillExt(item, flowId, opts) {
   // - On return side:  "+ above" inserts upstream (between pump and this pill),
   //                    "+ below" inserts downstream of this pill.
   // Pumps suppress their own handles \u2014 the card already has dedicated buttons.
-  const showInserts = editing && !opts.isClosure && !isPump;
+  const showInserts = editing && !opts.isClosure && !isPump && !isSynthetic;
   const aboveHandle = showInserts
     ? `<button type="button" class="pill-insert pill-insert-above" data-act="insert-above" data-side="${side}" data-flow-id="${flowId}" data-item-id="${item.id}" title="Insert above">+</button>`
     : '';
