@@ -5240,10 +5240,53 @@ function _psFixtureBody(item) {
   const items = state.items;
   const pool = items.find(i => i.type === 'pool');
   const spa  = items.find(i => i.type === 'spa');
+  // 1) Honor explicit body relation set by the user (item.relation = 'pool' | 'spa').
+  if (item.relation === 'spa' && spa) return spa;
+  if (item.relation === 'pool' && pool) return pool;
+  // 2) Honor explicit bodyId pointer if present.
+  if (item.bodyId) {
+    const byId = items.find(i => i.id === item.bodyId);
+    if (byId) return byId;
+  }
+  // 3) Fall back to label heuristic + type defaults.
   const lbl = (item.label || '').toLowerCase();
-  if (spa && (lbl.includes('spa') || item.bodyId === (spa && spa.id))) return spa;
+  if (spa && lbl.includes('spa')) return spa;
+  const def = FIXTURE_DEFAULT_BODY[item.type];
+  if (def === 'spa' && spa) return spa;
+  if (def === 'pool' && pool) return pool;
   if (pool) return pool;
+  if (spa)  return spa;
   return null;
+}
+
+// Cycle a fixture's body assignment among the available pool/spa bodies.
+// Creates a Spa body on-the-fly if the user picks Spa but none exists yet.
+function _psCycleFixtureBody(item) {
+  pushUndo();
+  const items = state.items;
+  const pool = items.find(i => i.type === 'pool');
+  let spa  = items.find(i => i.type === 'spa');
+  const current = _psFixtureBody(item);
+  // Build cycle order from available bodies, preferring pool then spa.
+  const order = [];
+  if (pool) order.push('pool');
+  if (spa)  order.push('spa');
+  // If only one body exists, offer the other one too (it'll be auto-created).
+  if (!pool) order.push('pool');
+  if (!spa)  order.push('spa');
+  const curKey = current ? current.type : null;
+  let idx = curKey ? order.indexOf(curKey) : -1;
+  const next = order[(idx + 1) % order.length];
+  if (next === 'spa' && !spa) {
+    spa = addItem('spa', { x: (pool ? pool.x + pool.w + 40 : 200), y: (pool ? pool.y : 420), label: 'Spa' });
+  } else if (next === 'pool' && !pool) {
+    addItem('pool', { x: 60, y: 420, label: 'Pool' });
+  }
+  item.relation = next;
+  item.relationLocked = true;
+  item.relationAuto = false;
+  persist();
+  _flowsRerenderAll();
 }
 
 // ==================================================================
@@ -5287,7 +5330,7 @@ _psRenderReturnSubtree = function _psRenderReturnSubtreeExt(treeNode, flowId) {
   if (kids.length === 0 && RETURN_FIXTURES.has(item.type)) {
     const body = _psFixtureBody(item);
     if (body) {
-      leafExtras += `<div class="tree-arrow-v"></div>` + _psRenderPill(body, flowId, { isClosure: true, side: 'return' });
+      leafExtras += `<div class="tree-arrow-v"></div>` + _psRenderPill(body, flowId, { isClosure: true, side: 'return', leafId: item.id });
     }
   }
   if (kids.length === 0 && editing) {
@@ -5333,7 +5376,7 @@ _psRenderSuctionSubtree = function _psRenderSuctionSubtreeExt(treeNode, flowId, 
   if (kids.length === 0 && !isRoot && SUCTION_FIXTURES.has(item.type)) {
     const body = _psFixtureBody(item);
     if (body) {
-      closurePill = _psRenderPill(body, flowId, { isClosure: true, side: 'suction' }) + `<div class="tree-arrow-v"></div>`;
+      closurePill = _psRenderPill(body, flowId, { isClosure: true, side: 'suction', leafId: item.id }) + `<div class="tree-arrow-v"></div>`;
     }
   }
 
@@ -5377,12 +5420,23 @@ _psRenderPill = function _psRenderPillExt(item, flowId, opts) {
   const classes = ['tree-pill'];
   if (isJunction) classes.push('is-branch');
   if (opts.isClosure) classes.push('is-closure');
+  // Closure pills (Pool/Spa under a fixture leaf) are tap-to-cycle in edit
+  // mode \u2014 lets the user say "this fixture goes to Spa" without leaving
+  // the Flows tab.
+  const cycleAttrs = (editing && opts.isClosure && opts.leafId)
+    ? ` data-act="cycle-body" data-flow-id="${flowId}" data-leaf-id="${opts.leafId}" role="button" title="Tap to switch between Pool and Spa"`
+    : '';
+  if (editing && opts.isClosure && opts.leafId) classes.push('is-clickable');
+  const swapHint = (editing && opts.isClosure && opts.leafId)
+    ? `<span class="pill-swap-hint" aria-hidden="true">\u21C4</span>`
+    : '';
   return `
     <div class="tree-pill-wrap">
       ${aboveHandle}
-      <div class="${classes.join(' ')}" data-flow-id="${flowId}" data-item-id="${item.id}" data-pill-kind="${opts.isClosure ? 'closure' : 'main'}">
+      <div class="${classes.join(' ')}" data-flow-id="${flowId}" data-item-id="${item.id}" data-pill-kind="${opts.isClosure ? 'closure' : 'main'}"${cycleAttrs}>
         <span class="pill-icon">${icon}</span>
         <span class="pill-label" ${editing && renamable ? `data-act="rename-pill" data-flow-id="${flowId}" data-item-id="${item.id}"` : ''}>${escapeHtml(label)}</span>
+        ${swapHint}
         ${branchable ? `<button type="button" class="pill-btn" data-act="branch-step" data-flow-id="${flowId}" data-item-id="${item.id}" title="Add branch">+</button>` : ''}
         ${removable ? `<button type="button" class="pill-btn pill-btn-danger" data-act="remove-tree-step" data-flow-id="${flowId}" data-item-id="${item.id}" title="Remove">\u2715</button>` : ''}
       </div>
@@ -5893,6 +5947,12 @@ function flowsOpenTreePicker(role, attachToItem, opts) {
       });
       return;
     }
+    if (act === 'cycle-body') {
+      const leafId = t.getAttribute('data-leaf-id');
+      const leaf = state.items.find(i => i.id === leafId);
+      if (leaf) _psCycleFixtureBody(leaf);
+      return;
+    }
     if (act === 'insert-above' || act === 'insert-below') {
       const side = t.getAttribute('data-side') || 'return';
       const anchor = state.items.find(i => i.id === itemId);
@@ -6163,6 +6223,17 @@ function _insertEquipmentAfterPump(pump, type, label) {
     .flow-card.editing .flow-card-title { color:var(--text); }
     .pump-tree .tree-pill.is-closure {
       background:var(--surface); border-style:dashed; opacity:.85;
+    }
+    .pump-tree .tree-pill.is-closure.is-clickable {
+      cursor:pointer; opacity:1;
+      border-color:var(--primary);
+    }
+    .pump-tree .tree-pill.is-closure.is-clickable:hover {
+      background:var(--offset);
+    }
+    .pump-tree .tree-pill .pill-swap-hint {
+      color:var(--primary); font-weight:700; font-size:13px;
+      margin-left:2px;
     }
     .pump-tree .tree-pill .pill-label[data-act="rename-pill"] {
       cursor:text;
