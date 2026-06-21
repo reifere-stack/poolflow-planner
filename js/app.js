@@ -6099,69 +6099,105 @@ function _wizRenderStep3() {
 // Materialize: create real items + edges from the wizard config.
 function _wizFinalize() {
   pushUndo();
-  const baseX = 200, baseY = 200;
-  const stepX = 160, padY  = 360;
 
-  // Pump label: use the user-typed flow name as the pump label so it reads naturally
-  // in the tree ("Pool Flow Pump" / "Spa Jets Pump"). Avoid stripping "flow" \u2014
-  // that produced confusing pump pills like "Pool" that looked like a body.
-  const rawName = (_wizState.pumpLabel || '').trim();
-  const pumpLabel = rawName ? (/(pump)$/i.test(rawName) ? rawName : `${rawName} Pump`) : 'Pump';
-  const pump = addItem('pump', { x: baseX + (_wizState.equipment.length ? 0 : 0), y: baseY, label: pumpLabel });
+  // ---------- LAYOUT PLAN ----------
+  // Goal: in the Diagram view, suction sources sit on their body's edge,
+  // equipment lines up on a pad below the bodies, and returns sit on their
+  // body's edge. Pipes converge cleanly via junctions placed next to the pump.
 
-  // Ensure Pool and Spa bodies exist (only the ones referenced by sources/destinations).
-  // We re-use an existing pool/spa by type rather than creating duplicates.
   const wantPool = _wizState.sources.some(s => (s.body||'pool') === 'pool') || _wizState.destinations.some(d => (d.body||'pool') === 'pool');
   const wantSpa  = _wizState.sources.some(s => s.body === 'spa') || _wizState.destinations.some(d => d.body === 'spa');
   let poolBody = state.items.find(i => i.type === 'pool');
   let spaBody  = state.items.find(i => i.type === 'spa');
-  if (wantPool && !poolBody) poolBody = addItem('pool', { x: 60, y: 420, label: 'Pool' });
-  if (wantSpa  && !spaBody)  spaBody  = addItem('spa',  { x: 320, y: 220, label: 'Spa', relation: 'pool' });
+  if (wantPool && !poolBody) poolBody = addItem('pool', { x: 80,  y: 380, label: 'Pool', w: 300, h: 170 });
+  if (wantSpa  && !spaBody) {
+    const spaX = poolBody ? (poolBody.x + (poolBody.w || 300) + 40) : 80;
+    const spaY = poolBody ? poolBody.y : 380;
+    spaBody = addItem('spa', { x: spaX, y: spaY, w: 160, h: 120, label: 'Spa', relation: 'pool' });
+  }
   const bodyOf = (b) => (b === 'spa' ? spaBody : poolBody);
 
-  // Suction sources \u2014 stamped with body assignment.
-  // Body-aware label: a Spa-bound "Main Drain" becomes "Spa Main Drain"; a pool-bound
-  // "Main Drain" stays "Main Drain" (kept short since pool is the default body).
-  // Strip the wizard's auto numeric suffix when a body prefix already disambiguates.
-  const srcItems = _wizState.sources.map((s, i) => {
-    const bodyName = s.body || 'pool';
-    const body = bodyOf(bodyName);
-    let lbl = s.label || '';
-    if (bodyName === 'spa' && !/^Spa\b/i.test(lbl)) {
-      // Drop trailing " 2", " 3" etc. \u2014 _uniqLabel will re-add only if needed.
-      lbl = lbl.replace(/\s+\d+$/, '');
-      lbl = `Spa ${lbl}`;
-    }
-    const item = addItem(s.type, { x: baseX - 800, y: padY + i * 120, label: _uniqLabel(lbl) });
-    if (body) {
-      item.bodyId = body.id;
-      item.relation = body.type;
-      item.relationLocked = true;
-      item.relationAuto = false;
-    }
-    return item;
-  });
+  // Equipment row: positioned BELOW the bodies (or to the right of the existing
+  // equipment pad if present).
+  const existingPad = state.items.find(i => i.type === 'pad');
+  let padX, padY;
+  if (existingPad) {
+    padX = existingPad.x + 20;
+    padY = existingPad.y + 30;
+  } else {
+    const bottomBody = [poolBody, spaBody].filter(Boolean).reduce((acc, b) =>
+      (acc && (acc.y + (acc.h || 170)) > (b.y + (b.h || 170))) ? acc : b, null);
+    padY = bottomBody ? (bottomBody.y + (bottomBody.h || 170) + 120) : 620;
+    padX = poolBody ? poolBody.x + 20 : 120;
+  }
 
-  // Determine suction joiner type
+  const stepX = 110;
+  let cursorX = padX;
+
+  const rawName = (_wizState.pumpLabel || '').trim();
+  const pumpLabel = rawName ? (/(pump)$/i.test(rawName) ? rawName : `${rawName} Pump`) : 'Pump';
+  const pump = addItem('pump', { x: cursorX, y: padY, label: pumpLabel });
+  cursorX += stepX;
+
+  // Distribute fixtures evenly across a body's top/bottom edge.
+  function perimeterSlot(body, i, total, side) {
+    if (!body) return { x: padX + i * 40, y: padY - 120 };
+    const bw = body.w || 300, bh = body.h || 170;
+    const slots = Math.max(total, 1);
+    const startX = body.x + 12;
+    const span   = bw - 24;
+    const x = startX + (span * (i + 0.5)) / slots;
+    const y = side === 'top' ? (body.y - 8) : (body.y + bh - 8);
+    return { x: Math.round(x), y: Math.round(y) };
+  }
+
+  // ---- Suction sources \u2014 placed on BOTTOM edge of their body ----
+  const sourcesByBody = { pool: [], spa: [] };
+  _wizState.sources.forEach((s, idx) => sourcesByBody[s.body || 'pool'].push({ s, idx }));
+
+  const srcItems = new Array(_wizState.sources.length);
+  for (const bodyName of ['pool', 'spa']) {
+    const group = sourcesByBody[bodyName];
+    const body = bodyOf(bodyName);
+    group.forEach(({ s, idx }, i) => {
+      let lbl = s.label || '';
+      if (bodyName === 'spa' && !/^Spa\b/i.test(lbl)) {
+        lbl = lbl.replace(/\s+\d+$/, '');
+        lbl = `Spa ${lbl}`;
+      }
+      const pos = perimeterSlot(body, i, group.length, 'bottom');
+      const item = addItem(s.type, { x: pos.x, y: pos.y, label: _uniqLabel(lbl) });
+      if (body) {
+        item.bodyId = body.id;
+        item.relation = body.type;
+        item.relationLocked = true;
+        item.relationAuto = false;
+      }
+      srcItems[idx] = item;
+    });
+  }
+
+  // ---- Suction joiner (between sources and pump) ----
   let sucJoiner = null;
   if (srcItems.length === 1) {
     sucJoiner = srcItems[0];
   } else {
     const jt = _wizState.sucJunction || 'tee';
     const jLabel = _WIZ_JUNCTION_LABELS[jt] || 'Suction Tee';
-    sucJoiner = addItem(jt, { x: baseX - 400, y: baseY + 100, label: jLabel, valveState: jt === 'valve3' ? 'shared' : '' });
+    sucJoiner = addItem(jt, { x: pump.x - 70, y: pump.y - 70, label: jLabel, valveState: jt === 'valve3' ? 'shared' : '' });
     for (const s of srcItems) {
       state.edges.push({ id: uid(), from: s.id, to: sucJoiner.id, type: 'suction', size: '', label: `${s.label} \u2192 ${sucJoiner.label}`, active: false, blocked: false, fromPort: '', toPort: '' });
     }
   }
   state.edges.push({ id: uid(), from: sucJoiner.id, to: pump.id, type: 'suction', size: '', label: `${sucJoiner.label} \u2192 ${pump.label}`, active: false, blocked: false, fromPort: '', toPort: 'intake' });
 
-  // Equipment chain
+  // ---- Equipment chain (linear along the equipment row) ----
   let prev = pump;
   let prevPort = 'discharge';
   const eqItems = [];
-  _wizState.equipment.forEach((e, i) => {
-    const eq = addItem(e.type, { x: baseX + 200 + i * stepX, y: baseY, label: e.label, valveState: e.type === 'valve3' ? 'shared' : '' });
+  _wizState.equipment.forEach((e) => {
+    const eq = addItem(e.type, { x: cursorX, y: padY, label: e.label, valveState: e.type === 'valve3' ? 'shared' : '' });
+    cursorX += stepX;
     eqItems.push(eq);
     state.edges.push({
       id: uid(), from: prev.id, to: eq.id, type: 'return', size: '',
@@ -6172,26 +6208,34 @@ function _wizFinalize() {
     prev = eq; prevPort = '';
   });
 
-  // Destinations \u2014 stamped with body assignment.
-  // Rewrite labels so a Spa-bound "Pool Return" becomes "Spa Return".
-  const dstItems = _wizState.destinations.map((d, i) => {
-    const bodyName = d.body || (d.type === 'jet' ? 'spa' : 'pool');
-    const body = bodyOf(bodyName);
-    // Body-aware default label: replace 'Pool ' prefix with body name when relevant.
-    let lbl = d.label || '';
-    if (bodyName === 'spa' && /^Pool /.test(lbl)) {
-      lbl = lbl.replace(/^Pool /, 'Spa ');
-      lbl = lbl.replace(/\s+\d+$/, ''); // drop wizard numbering once body disambiguates
-    }
-    const item = addItem(d.type, { x: baseX + 1400, y: padY + i * 120, label: _uniqLabel(lbl) });
-    if (body) {
-      item.bodyId = body.id;
-      item.relation = body.type;
-      item.relationLocked = true;
-      item.relationAuto = false;
-    }
-    return item;
+  // ---- Destinations \u2014 placed on TOP edge of their body ----
+  const destsByBody = { pool: [], spa: [] };
+  _wizState.destinations.forEach((d, idx) => {
+    const b = d.body || (d.type === 'jet' ? 'spa' : 'pool');
+    destsByBody[b].push({ d, idx });
   });
+
+  const dstItems = new Array(_wizState.destinations.length);
+  for (const bodyName of ['pool', 'spa']) {
+    const group = destsByBody[bodyName];
+    const body = bodyOf(bodyName);
+    group.forEach(({ d, idx }, i) => {
+      let lbl = d.label || '';
+      if (bodyName === 'spa' && /^Pool /.test(lbl)) {
+        lbl = lbl.replace(/^Pool /, 'Spa ');
+        lbl = lbl.replace(/\s+\d+$/, '');
+      }
+      const pos = perimeterSlot(body, i, group.length, 'top');
+      const item = addItem(d.type, { x: pos.x, y: pos.y, label: _uniqLabel(lbl) });
+      if (body) {
+        item.bodyId = body.id;
+        item.relation = body.type;
+        item.relationLocked = true;
+        item.relationAuto = false;
+      }
+      dstItems[idx] = item;
+    });
+  }
 
   // If the last equipment item is itself a junction type, use it as the return joiner
   // (avoids creating two splitters in series when the user explicitly added a 3-Way Valve
@@ -6210,7 +6254,8 @@ function _wizFinalize() {
   } else {
     const jt = _wizState.retJunction || 'tee';
     const jLabel = _WIZ_RET_JUNCTION_LABELS[jt] || 'Return Tee';
-    const retJun = addItem(jt, { x: baseX + 1100, y: baseY + 100, label: jLabel, valveState: jt === 'valve3' ? 'shared' : '' });
+    // Return joiner sits just past the last equipment, en route to destinations.
+    const retJun = addItem(jt, { x: cursorX, y: padY - 70, label: jLabel, valveState: jt === 'valve3' ? 'shared' : '' });
     state.edges.push({ id: uid(), from: prev.id, to: retJun.id, type: 'return', size: '', label: `${prev.label} \u2192 ${retJun.label}`, active: false, blocked: false, fromPort: prevPort, toPort: '' });
     for (const d of dstItems) {
       state.edges.push({ id: uid(), from: retJun.id, to: d.id, type: 'return', size: '', label: `${retJun.label} \u2192 ${d.label}`, active: false, blocked: false, fromPort: '', toPort: '' });
