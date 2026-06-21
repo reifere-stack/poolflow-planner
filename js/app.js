@@ -6128,7 +6128,7 @@ function _wizFinalize() {
     const bottomBody = [poolBody, spaBody].filter(Boolean).reduce((acc, b) =>
       (acc && (acc.y + (acc.h || 170)) > (b.y + (b.h || 170))) ? acc : b, null);
     padY = bottomBody ? (bottomBody.y + (bottomBody.h || 170) + 120) : 620;
-    padX = poolBody ? poolBody.x + 20 : 120;
+    padX = poolBody ? poolBody.x + 120 : 220;
   }
 
   const stepX = 110;
@@ -6139,15 +6139,21 @@ function _wizFinalize() {
   const pump = addItem('pump', { x: cursorX, y: padY, label: pumpLabel });
   cursorX += stepX;
 
-  // Distribute fixtures evenly across a body's top/bottom edge.
-  function perimeterSlot(body, i, total, side) {
+  // Distribute fixtures evenly across a body's top/bottom edge. Fixtures sit
+  // OUTSIDE the body so they visibly touch the edge without overlapping the body fill.
+  // Approximate fixture size is 28x28 for sources, 22x22 for destinations.
+  function perimeterSlot(body, i, total, side, fixtureW, fixtureH) {
+    const fw = fixtureW || 28, fh = fixtureH || 28;
     if (!body) return { x: padX + i * 40, y: padY - 120 };
     const bw = body.w || 300, bh = body.h || 170;
     const slots = Math.max(total, 1);
     const startX = body.x + 12;
     const span   = bw - 24;
-    const x = startX + (span * (i + 0.5)) / slots;
-    const y = side === 'top' ? (body.y - 8) : (body.y + bh - 8);
+    const cx = startX + (span * (i + 0.5)) / slots;
+    const x = cx - fw / 2;
+    // Place fixture so the body edge passes through its center: half outside, half inside.
+    // Actually better: sit fully outside with a tiny overlap so it visually touches.
+    const y = side === 'top' ? (body.y - fh + 4) : (body.y + bh - 4);
     return { x: Math.round(x), y: Math.round(y) };
   }
 
@@ -6184,7 +6190,9 @@ function _wizFinalize() {
   } else {
     const jt = _wizState.sucJunction || 'tee';
     const jLabel = _WIZ_JUNCTION_LABELS[jt] || 'Suction Tee';
-    sucJoiner = addItem(jt, { x: pump.x - 70, y: pump.y - 70, label: jLabel, valveState: jt === 'valve3' ? 'shared' : '' });
+    // Place suction joiner just to the LEFT of the pump on the same equipment row
+    // so the converging pipes stay near the equipment line.
+    sucJoiner = addItem(jt, { x: pump.x - 90, y: pump.y - 8, label: jLabel, valveState: jt === 'valve3' ? 'shared' : '' });
     for (const s of srcItems) {
       state.edges.push({ id: uid(), from: s.id, to: sucJoiner.id, type: 'suction', size: '', label: `${s.label} \u2192 ${sucJoiner.label}`, active: false, blocked: false, fromPort: '', toPort: '' });
     }
@@ -6255,7 +6263,8 @@ function _wizFinalize() {
     const jt = _wizState.retJunction || 'tee';
     const jLabel = _WIZ_RET_JUNCTION_LABELS[jt] || 'Return Tee';
     // Return joiner sits just past the last equipment, en route to destinations.
-    const retJun = addItem(jt, { x: cursorX, y: padY - 70, label: jLabel, valveState: jt === 'valve3' ? 'shared' : '' });
+    // Return joiner sits to the right of the last equipment on the same row.
+    const retJun = addItem(jt, { x: cursorX, y: padY - 8, label: jLabel, valveState: jt === 'valve3' ? 'shared' : '' });
     state.edges.push({ id: uid(), from: prev.id, to: retJun.id, type: 'return', size: '', label: `${prev.label} \u2192 ${retJun.label}`, active: false, blocked: false, fromPort: prevPort, toPort: '' });
     for (const d of dstItems) {
       state.edges.push({ id: uid(), from: retJun.id, to: d.id, type: 'return', size: '', label: `${retJun.label} \u2192 ${d.label}`, active: false, blocked: false, fromPort: '', toPort: '' });
