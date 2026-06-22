@@ -7198,10 +7198,18 @@ function _psOpenBodyPicker(leaf) {
       const body = state.items.find(i => i.id === id);
       if (!body) { closeModal(); return; }
       pushUndo();
+      // If the leaf is moving from one body to another, also remove it from the
+      // old body's peer list (handled implicitly because _snapFixtureToBody only
+      // distributes the new body's fixtures).
       leaf.bodyId = body.id;
       leaf.relation = body.type;
       leaf.relationLocked = true;
       leaf.relationAuto = false;
+      // Snap onto the new body's perimeter so the leaf visibly touches it.
+      if (typeof _snapFixtureToBody === 'function' &&
+          (SUCTION_FIXTURES.has(leaf.type) || RETURN_FIXTURES.has(leaf.type))) {
+        _snapFixtureToBody(leaf);
+      }
       persist();
       _flowsRerenderAll();
       closeModal();
@@ -7220,6 +7228,10 @@ function _psOpenBodyPicker(leaf) {
       leaf.relation = newBody.type;
       leaf.relationLocked = true;
       leaf.relationAuto = false;
+      if (typeof _snapFixtureToBody === 'function' &&
+          (SUCTION_FIXTURES.has(leaf.type) || RETURN_FIXTURES.has(leaf.type))) {
+        _snapFixtureToBody(leaf);
+      }
       persist();
       _flowsRerenderAll();
       closeModal();
