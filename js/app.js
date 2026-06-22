@@ -2382,6 +2382,107 @@ function solveFlow() {
     }
   }
 
+  // Body mass-balance check — the INVERSE of the spillover safety check.
+  // For each body, if water is being SUCKED OUT (active suction line via a
+  // skimmer/drain attached to this body) but NOTHING is putting water back IN
+  // (no active return into the body, no return fixture attached to the body
+  // with an active feed, no inbound spillover from a body that itself has
+  // supply), then this body will drain dry. This catches the classic
+  // "valve routed wrong" mistake: pump pulls from pond, dumps to pool —
+  // pond goes empty.
+  //
+  // A fixture is considered "on" a body when:
+  //   • fixture.bodyId === body.id, OR
+  //   • fixture.relation === body.id, OR
+  //   • fixture.relation === body.type AND there's exactly one body of that type.
+  function fixtureOnBody(it, body) {
+    if (it.bodyId === body.id) return true;
+    if (it.relation === body.id) return true;
+    if (it.relation === body.type && state.items.filter(b => b.type === body.type).length === 1) return true;
+    return false;
+  }
+  // Return-side fixture types that deliver water back to a body.
+  const RETURN_FIXTURE_TYPES = new Set(['return','jet','bubbler','deckjet','sheer','slide','feature','autofill']);
+  const SUCTION_FIXTURE_TYPES = new Set(['skimmer','drain']);
+
+  // Active inbound spillover from another body (gravity-fed, doesn't need
+  // edge.active because spillovers aren't pump-driven).
+  function hasInboundSpilloverSupply(body, visited = new Set()) {
+    if (visited.has(body.id)) return false;
+    visited.add(body.id);
+    for (const e of state.edges) {
+      if (e.type !== 'spillover' || e.blocked) continue;
+      if (e.to !== body.id) continue;
+      const src = itemMap[e.from];
+      if (!src || !BODY_TYPES.has(src.type)) continue;
+      // The source body must itself have some supply (a return fixture with
+      // an active feed, OR an inbound spillover from yet another supplied body).
+      if (bodyHasActiveReturnSupply(src)) return true;
+      if (hasInboundSpilloverSupply(src, visited)) return true;
+    }
+    // Also honor configured spillsInto pointing AT this body.
+    for (const src of allBodies) {
+      if (src.id === body.id) continue;
+      if (src.spillsInto === body.id) {
+        if (bodyHasActiveReturnSupply(src)) return true;
+        if (hasInboundSpilloverSupply(src, visited)) return true;
+      }
+    }
+    return false;
+  }
+  // Does this body have any active return-side water coming in (direct return
+  // edge into the body, OR a return fixture attached to it whose feed edge is
+  // active)?
+  function bodyHasActiveReturnSupply(body) {
+    // (a) Direct return/feature edges into the body itself.
+    for (const e of state.edges) {
+      if (!e.active || e.blocked) continue;
+      if (e.to !== body.id) continue;
+      if (e.type === 'return' || e.type === 'feature') return true;
+    }
+    // (b) Return-type fixtures attached to this body with an active inbound feed.
+    for (const it of state.items) {
+      if (!RETURN_FIXTURE_TYPES.has(it.type)) continue;
+      if (!fixtureOnBody(it, body)) continue;
+      const fed = state.edges.some(e => e.to === it.id && e.active && !e.blocked && (e.type === 'return' || e.type === 'feature'));
+      if (fed) return true;
+    }
+    return false;
+  }
+
+  for (const body of allBodies) {
+    // Count active suction sources draining this body.
+    const drainingSources = state.items.filter(it =>
+      SUCTION_FIXTURE_TYPES.has(it.type) &&
+      fixtureOnBody(it, body) &&
+      state.edges.some(e => e.from === it.id && e.active && !e.blocked && e.type === 'suction')
+    );
+    if (!drainingSources.length) continue;
+    // Is anything actively putting water back?
+    if (bodyHasActiveReturnSupply(body)) continue;
+    if (hasInboundSpilloverSupply(body)) continue;
+    // Diagnose WHY there's no supply, to write a helpful message.
+    const drainLabels = drainingSources.map(d => d.label).join(', ');
+    // See if there's a return fixture on this body whose feed is blocked.
+    const blockedReturn = state.items.find(it =>
+      RETURN_FIXTURE_TYPES.has(it.type) &&
+      fixtureOnBody(it, body) &&
+      state.edges.some(e => e.to === it.id && e.blocked && (e.type === 'return' || e.type === 'feature'))
+    );
+    let hint;
+    if (blockedReturn) {
+      hint = ` ${blockedReturn.label} is on this body but its return line is blocked by a closed valve.`;
+    } else {
+      const anyReturnOnBody = state.items.find(it => RETURN_FIXTURE_TYPES.has(it.type) && fixtureOnBody(it, body));
+      if (anyReturnOnBody) {
+        hint = ` ${anyReturnOnBody.label} is on this body but isn't receiving water from the pump — check valve positions on the return side.`;
+      } else {
+        hint = ` Add a return (or jet/bubbler/sheer) on ${body.label}, or route the pump's return to it.`;
+      }
+    }
+    issues.push(`${body.label} is being drained by ${drainLabels} but has no return — water level will drop.${hint}`);
+  }
+
   // Air-blower check: any spa that has jets (or bubblers) deserves an air supply.
   // We tally jets per body (via item.relation or DELIVERY_DEFAULTS) and look
   // for at least one air-source (blower) that reaches a jet attached to that spa.
