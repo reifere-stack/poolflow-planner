@@ -209,43 +209,73 @@ function migratePortsOnLoad(s) {
       (e.from === valve.id || e.to === valve.id) &&
       e.type !== 'conduit' && e.type !== 'spillover'
     );
-    // Skip if any edge already has a valid port set.
-    const alreadyPorted = touching.some(e =>
-      (e.from === valve.id && (e.fromPort === 'trunk' || e.fromPort === 'a' || e.fromPort === 'b')) ||
-      (e.to   === valve.id && (e.toPort   === 'trunk' || e.toPort   === 'a' || e.toPort   === 'b'))
-    );
-    if (alreadyPorted) continue;
-    const ins  = touching.filter(e => e.to   === valve.id);
-    const outs = touching.filter(e => e.from === valve.id);
-    // Identify trunk edge + branch edges using the old direction heuristic.
-    let trunkEdge = null, branchEdges = [];
-    if (outs.length >= 2 && ins.length <= 1) { trunkEdge = ins[0]  || null; branchEdges = outs.slice(0, 2); }
-    else if (ins.length >= 2 && outs.length <= 1) { trunkEdge = outs[0] || null; branchEdges = ins.slice(0, 2); }
-    else if (outs.length >= 2) { trunkEdge = ins[0]  || null; branchEdges = outs.slice(0, 2); }
-    else if (ins.length >= 2)  { trunkEdge = outs[0] || null; branchEdges = ins.slice(0, 2);  }
-    else {
-      // 0-1 edges total: assign trunk to whatever single edge is there.
-      if (touching.length === 1) trunkEdge = touching[0];
+    // Repair INCREMENTALLY — never skip a valve just because one edge is
+    // already ported. Earlier code did `if (alreadyPorted) continue;` which
+    // left newly-added edges (e.g. a spa drain wired up via the Flows tab
+    // after the pool's suction tee + pump were already wired) without
+    // trunk/A/B assignments. Result: the valve's `pos1`/`pos2` couldn't block
+    // them because `valve3EdgeOpen` treats unrecognized edges as always-open
+    // trunk passthroughs (so the user could only ever block one branch).
+    const readP = (e) => (e.from === valve.id ? e.fromPort : e.toPort) || '';
+    const writeP = (e, p) => {
+      if (!e) return;
+      if (e.from === valve.id) e.fromPort = p;
+      else if (e.to === valve.id) e.toPort = p;
+    };
+    // Bucket existing assignments and find what's missing.
+    const assigned = { trunk: [], a: [], b: [] };
+    const unassigned = [];
+    for (const e of touching) {
+      const p = readP(e);
+      if (p === 'trunk' || p === 'a' || p === 'b') assigned[p].push(e);
+      else unassigned.push(e);
     }
-    // Sort branches: left-most (smaller x) becomes A, other becomes B.
-    const otherEnd = (e) => e.from === valve.id ? itemById[e.to] : itemById[e.from];
-    if (branchEdges.length === 2) {
-      const a = otherEnd(branchEdges[0]);
-      const b = otherEnd(branchEdges[1]);
-      if (a && b) {
-        const ka = (a.y || 0) * 10000 + (a.x || 0);
-        const kb = (b.y || 0) * 10000 + (b.x || 0);
-        if (ka > kb) branchEdges = [branchEdges[1], branchEdges[0]];
+    if (!unassigned.length) continue;
+    // Pass 1: trunk preference — the edge touching a pump is the trunk.
+    const isPumpEdge = (e) => {
+      const otherId = e.from === valve.id ? e.to : e.from;
+      const other = itemById[otherId];
+      return other && other.type === 'pump';
+    };
+    for (const e of unassigned.slice()) {
+      if (assigned.trunk.length === 0 && isPumpEdge(e)) {
+        writeP(e, 'trunk');
+        assigned.trunk.push(e);
+        unassigned.splice(unassigned.indexOf(e), 1);
       }
     }
-    const writePort = (e, port) => {
-      if (!e) return;
-      if (e.from === valve.id) e.fromPort = port;
-      else if (e.to === valve.id) e.toPort = port;
-    };
-    writePort(trunkEdge, 'trunk');
-    if (branchEdges[0]) writePort(branchEdges[0], 'a');
-    if (branchEdges[1]) writePort(branchEdges[1], 'b');
+    // Pass 2: if trunk still empty, use direction heuristic — the lone edge
+    // pointing the opposite direction from the branches is the trunk.
+    if (assigned.trunk.length === 0) {
+      const ins  = touching.filter(e => e.to   === valve.id);
+      const outs = touching.filter(e => e.from === valve.id);
+      let candidate = null;
+      if (outs.length === 1 && ins.length >= 2) candidate = outs[0];
+      else if (ins.length === 1 && outs.length >= 2) candidate = ins[0];
+      if (candidate && unassigned.includes(candidate)) {
+        writeP(candidate, 'trunk');
+        assigned.trunk.push(candidate);
+        unassigned.splice(unassigned.indexOf(candidate), 1);
+      }
+    }
+    // Pass 3: fill open slots in order trunk → a → b. Sort the remaining
+    // edges by the OTHER end's (y, x) so top-left becomes A and bottom-right
+    // becomes B — matches the visual layout / labels.
+    const otherEnd = (e) => itemById[e.from === valve.id ? e.to : e.from];
+    unassigned.sort((e1, e2) => {
+      const a = otherEnd(e1), b = otherEnd(e2);
+      if (!a || !b) return 0;
+      return ((a.y||0)*10000 + (a.x||0)) - ((b.y||0)*10000 + (b.x||0));
+    });
+    for (const e of unassigned) {
+      let target;
+      if (assigned.trunk.length === 0) target = 'trunk';
+      else if (assigned.a.length === 0) target = 'a';
+      else if (assigned.b.length === 0) target = 'b';
+      else target = 'b'; // overflow — park on b; user can re-edit
+      writeP(e, target);
+      assigned[target].push(e);
+    }
   }
 
   // --- Propagate suction/return type through pass-through nodes ---
@@ -1830,6 +1860,90 @@ function valvePortMap(valve) {
   return out;
 }
 
+// Heal port assignments on a single valve3 — used after edge edits and before
+// solveFlow runs. If a valve has unassigned edges touching it (e.g. one branch
+// was added via the Flows tab without picking a port), this pass fills the
+// missing trunk/a/b slots using the same logic as migratePortsOnLoad.
+// Without this, `valve3EdgeOpen` treats unrecognized edges as always-open
+// trunk passthroughs — the user can only ever block one branch.
+function repairValvePortsForOne(valve) {
+  if (!valve || valve.type !== 'valve3') return false;
+  const touching = state.edges.filter(e =>
+    (e.from === valve.id || e.to === valve.id) &&
+    e.type !== 'conduit' && e.type !== 'spillover'
+  );
+  const readP = (e) => (e.from === valve.id ? e.fromPort : e.toPort) || '';
+  const writeP = (e, p) => {
+    if (e.from === valve.id) e.fromPort = p;
+    else if (e.to === valve.id) e.toPort = p;
+  };
+  const assigned = { trunk: [], a: [], b: [] };
+  const unassigned = [];
+  for (const e of touching) {
+    const p = readP(e);
+    if (p === 'trunk' || p === 'a' || p === 'b') assigned[p].push(e);
+    else unassigned.push(e);
+  }
+  if (!unassigned.length) return false;
+  let changed = false;
+  // Pass 1: trunk = the edge touching a pump.
+  for (const e of unassigned.slice()) {
+    if (assigned.trunk.length === 0) {
+      const otherId = e.from === valve.id ? e.to : e.from;
+      const other = getItem(otherId);
+      if (other && other.type === 'pump') {
+        writeP(e, 'trunk');
+        assigned.trunk.push(e);
+        unassigned.splice(unassigned.indexOf(e), 1);
+        changed = true;
+      }
+    }
+  }
+  // Pass 2: direction heuristic (lone in vs lone out) for trunk.
+  if (assigned.trunk.length === 0) {
+    const ins  = touching.filter(e => e.to   === valve.id);
+    const outs = touching.filter(e => e.from === valve.id);
+    let candidate = null;
+    if (outs.length === 1 && ins.length >= 2) candidate = outs[0];
+    else if (ins.length === 1 && outs.length >= 2) candidate = ins[0];
+    if (candidate && unassigned.includes(candidate)) {
+      writeP(candidate, 'trunk');
+      assigned.trunk.push(candidate);
+      unassigned.splice(unassigned.indexOf(candidate), 1);
+      changed = true;
+    }
+  }
+  // Pass 3: fill trunk → a → b. Sort remaining by other-end (y, x) so
+  // top-left becomes A and bottom-right becomes B (matches visual layout).
+  const otherEnd = (e) => getItem(e.from === valve.id ? e.to : e.from);
+  unassigned.sort((e1, e2) => {
+    const a = otherEnd(e1), b = otherEnd(e2);
+    if (!a || !b) return 0;
+    return ((a.y||0)*10000 + (a.x||0)) - ((b.y||0)*10000 + (b.x||0));
+  });
+  for (const e of unassigned) {
+    let target;
+    if (assigned.trunk.length === 0) target = 'trunk';
+    else if (assigned.a.length === 0) target = 'a';
+    else if (assigned.b.length === 0) target = 'b';
+    else target = 'b';
+    writeP(e, target);
+    assigned[target].push(e);
+    changed = true;
+  }
+  return changed;
+}
+// Heal every valve3 in the current state.
+function repairAllValvePorts() {
+  let any = false;
+  for (const it of state.items) {
+    if (it.type === 'valve3') {
+      if (repairValvePortsForOne(it)) any = true;
+    }
+  }
+  return any;
+}
+
 // Pick the first available port. Honors `preferred` if it's free.
 function nextFreeValvePort(valve, preferred) {
   const pm = valvePortMap(valve);
@@ -2202,6 +2316,10 @@ function valveAllows(node, edges, index) {
   return true;
 }
 function solveFlow() {
+  // Heal any valve3 that has unassigned edges — without this, edges added via
+  // the Flows tab after the valve already had one assigned port stay
+  // unrecognized and become un-blockable. (See repairValvePortsForOne.)
+  repairAllValvePorts();
   // Normalize pipe types BEFORE solving so the flow logic sees correct
   // suction/return tagging (downstream checks rely on it).
   propagatePipeTypes(state);
