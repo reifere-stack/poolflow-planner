@@ -1900,27 +1900,51 @@ function repairValvePortsForOne(valve) {
     if (p === 'trunk' || p === 'a' || p === 'b') assigned[p].push(e);
     else unassigned.push(e);
   }
-  if (!unassigned.length) return false;
   let changed = false;
 
-  // PASS 1 — topology: if the valve has 2-in-1-out or 1-in-2-out and the lone
-  // side is still unassigned, lock it in as the trunk. Matches the Flows-tab
-  // rule "the part that has one input is the trunk and the tee part is a and b."
-  // This handles return-side valves and chained valves correctly: the lone
-  // direction is always the common (trunk) path.
-  if (assigned.trunk.length === 0) {
+  // PASS 1 — topology: if the valve has N-in-1-out or 1-in-N-out, the lone-side
+  // edge MUST be the trunk. Matches the Flows-tab rule "the part that has one
+  // input is the trunk and the tee part is a and b." This handles return-side
+  // valves and chained valves correctly.
+  //
+  // CRITICAL: this overrides a wrong existing trunk too — e.g. when the user
+  // chains a new valve off port-A of an upstream valve, the new valve's
+  // incoming edge is born with toPort='a' (mirroring the upstream port). The
+  // lone-side rule corrects that so the chained valve gets its trunk on the
+  // incoming edge instead of port A.
+  {
     const ins  = touching.filter(e => e.to   === valve.id);
     const outs = touching.filter(e => e.from === valve.id);
     let candidate = null;
     if (outs.length === 1 && ins.length >= 2) candidate = outs[0];
     else if (ins.length === 1 && outs.length >= 2) candidate = ins[0];
-    if (candidate && unassigned.includes(candidate)) {
-      writeP(candidate, 'trunk');
-      assigned.trunk.push(candidate);
-      unassigned.splice(unassigned.indexOf(candidate), 1);
-      changed = true;
+    if (candidate) {
+      const curP = readP(candidate);
+      if (curP !== 'trunk') {
+        // Demote whatever currently sits on trunk (if anything) so we can
+        // place the lone-side edge there. The demoted edge goes back into
+        // the unassigned pool for PASS 2 geometry placement.
+        for (const e of assigned.trunk) {
+          writeP(e, '');
+          unassigned.push(e);
+        }
+        assigned.trunk = [];
+        // Remove candidate from whatever bucket it was in.
+        if (curP === 'a' || curP === 'b') {
+          const idx = assigned[curP].indexOf(candidate);
+          if (idx >= 0) assigned[curP].splice(idx, 1);
+        } else {
+          const idx = unassigned.indexOf(candidate);
+          if (idx >= 0) unassigned.splice(idx, 1);
+        }
+        writeP(candidate, 'trunk');
+        assigned.trunk.push(candidate);
+        changed = true;
+      }
     }
   }
+
+  if (!unassigned.length) return changed;
 
   // PASS 2 — geometry: assign each remaining unassigned edge to the closest
   // FREE port using the valve icon's fixed orientation (trunk = bottom, A =
@@ -2380,6 +2404,20 @@ function solveFlow() {
   propagatePipeTypes(state);
   state.edges.forEach(e => { e.active = false; e.blocked = false; });
   const issues = [];
+
+  // Validate valve3 port-count: a real 3-way only has 3 ports (trunk/A/B).
+  // If a valve has more than 3 non-conduit edges, fixtures will silently fall
+  // off the Flows tab. Tell the user to add a Tee/Manifold to fan out.
+  for (const it of state.items) {
+    if (it.type !== 'valve3') continue;
+    const touching = state.edges.filter(e =>
+      (e.from === it.id || e.to === it.id) &&
+      e.type !== 'conduit' && e.type !== 'spillover' && e.type !== 'air'
+    );
+    if (touching.length > 3) {
+      issues.push(`${it.label} has ${touching.length} pipes connected, but a 3-way valve only has 3 ports (trunk + A + B). Add a Tee or Manifold after the valve to fan out more fixtures.`);
+    }
+  }
   const adj = adjacency();
   const pumps = state.items.filter(i => i.type === 'pump');
   const results = [];
