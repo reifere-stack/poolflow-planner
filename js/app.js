@@ -6192,6 +6192,27 @@ function _bindFixtureToBody(fixture, body) {
   fixture.relationAuto = false;
   _snapFixtureToBody(fixture);
 }
+// When a fixture is freshly added from the Flows tab, decide which body it
+// belongs to. If exactly one body exists, snap to it silently. If multiple
+// bodies exist, open the body picker so the user explicitly chooses (otherwise
+// the fixture floats in space \u2014 the original bug).
+function _assignBodyForNewFixture(fixture, role, nearItem) {
+  const bodies = state.items.filter(i => i.type === 'pool' || i.type === 'spa');
+  if (!bodies.length) return;
+  if (bodies.length === 1) {
+    _bindFixtureToBody(fixture, bodies[0]);
+    return;
+  }
+  // Multiple bodies \u2014 attach to a sensible default immediately so the fixture
+  // doesn't float, then open the picker so the user can change.
+  const def = _pickDefaultBodyFor(role, nearItem) || bodies[0];
+  _bindFixtureToBody(fixture, def);
+  // Defer the picker so the closeModal() from the picker that opened it has time
+  // to settle the DOM.
+  setTimeout(() => {
+    if (typeof _psOpenBodyPicker === 'function') _psOpenBodyPicker(fixture);
+  }, 50);
+}
 
 function _bodyFixtures(body) {
   if (!body) return [];
@@ -6677,12 +6698,10 @@ function _addToJunction(junction, type, label, role) {
     label: _uniqLabel(label),
   });
   // If the new item is a suction source or return destination, bind it to a body
-  // and snap onto that body's perimeter (so it visually touches Pool/Spa).
+  // and snap onto that body's perimeter (so it visually touches Pool/Spa). With
+  // multiple bodies the picker opens so the user explicitly chooses.
   const isFixture = SUCTION_FIXTURES.has(type) || RETURN_FIXTURES.has(type);
-  if (isFixture) {
-    const body = _pickDefaultBodyFor(role, junction);
-    if (body) _bindFixtureToBody(newItem, body);
-  }
+  if (isFixture) _assignBodyForNewFixture(newItem, role, junction);
   let portOpts = { fromPort: '', toPort: '' };
   if (junction.type === 'valve3') {
     const used = new Set();
@@ -6778,10 +6797,7 @@ function _addAtPump(pump, type, label, role) {
     }
     // Bind to body + snap to perimeter when adding a fixture.
     const isFixture = SUCTION_FIXTURES.has(type) || RETURN_FIXTURES.has(type);
-    if (isFixture) {
-      const body = _pickDefaultBodyFor(role, pump);
-      if (body) _bindFixtureToBody(newItem, body);
-    }
+    if (isFixture) _assignBodyForNewFixture(newItem, role, pump);
     _flowsRerenderAll();
     return;
   }
@@ -6928,9 +6944,8 @@ function _insertRelativeTo(anchor, side, direction, type, label) {
   // If the inserted item is a fixture, bind to a body + snap to perimeter.
   const isFixture = SUCTION_FIXTURES.has(type) || RETURN_FIXTURES.has(type);
   if (isFixture) {
-    const role = side === 'suction' ? 'suction' : 'return';
-    const body = _pickDefaultBodyFor(role, anchor);
-    if (body) _bindFixtureToBody(newItem, body);
+    const r = side === 'suction' ? 'suction' : 'return';
+    _assignBodyForNewFixture(newItem, r, anchor);
   }
   migratePortsOnLoad(state);
   _flowsRerenderAll();
