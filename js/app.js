@@ -1280,6 +1280,20 @@ function pointToSegmentDistance(p, a, b) {
   return Math.hypot(p.x - px, p.y - py);
 }
 
+// Hard cap: a 3-way valve has 3 ports (trunk + A + B). Return true when the
+// valve already has 3 non-conduit/spillover/air pipes connected, so adding a
+// 4th must be rejected. Used by every edge-creation path (Diagram connect,
+// Flows insert) to prevent invalid topologies.
+function valve3IsFull(itemId) {
+  const item = getItem(itemId);
+  if (!item || item.type !== 'valve3') return false;
+  const count = state.edges.filter(e =>
+    (e.from === itemId || e.to === itemId) &&
+    e.type !== 'conduit' && e.type !== 'spillover' && e.type !== 'air'
+  ).length;
+  return count >= 3;
+}
+
 // User tapped on an existing pipe while in connect mode (after picking a source).
 // Splice the existing edge at that point with a new tee node, then make a new edge
 // from the connect source -> the new tee.
@@ -1289,6 +1303,12 @@ function handleConnectTapOnPipe(edgeId, wp) {
   const sourceId = state.connectSourceId;
   if (!sourceId) { cancelConnectMode(); return; }
   if (sourceId === edge.from || sourceId === edge.to) { toast('Pick a different source'); cancelConnectMode(); return; }
+  // Reject if the source is a full 3-way valve (this branch adds 1 new edge from source).
+  if (valve3IsFull(sourceId)) {
+    toast('3-way valve full \u2014 add a Tee or another 3-way to branch further');
+    cancelConnectMode();
+    return;
+  }
   pushUndo();
   // Create the tee node at the tap point
   const teeId = uid();
@@ -1387,6 +1407,13 @@ function handleConnectTap(id, tapPt) {
     if (fromRolePropagated && toRolePropagated &&
         fromRolePropagated !== toRolePropagated && !airOk) {
       toast(`Can't connect ${from.label} (${fromRolePropagated}) to ${to.label} (${toRolePropagated})`);
+      cancelConnectMode();
+      return;
+    }
+    // Hard cap on 3-way valves: 3 ports max (trunk + A + B). Reject 4th pipe.
+    if (valve3IsFull(from.id) || valve3IsFull(to.id)) {
+      const fullOne = valve3IsFull(from.id) ? from.label : to.label;
+      toast(`${fullOne} is full \u2014 a 3-way valve only has 3 ports. Add a Tee or another 3-way to branch further.`);
       cancelConnectMode();
       return;
     }
@@ -7003,6 +7030,11 @@ function _uniqLabel(baseLabel) {
 // Add a new node connected to `junction`. If junction is a tee/manifold/valve,
 // just hang it off. If it has a free valve3 port, use it.
 function _addToJunction(junction, type, label, role) {
+  // Hard cap on 3-way: only 3 ports (trunk + A + B). Reject 4th edge.
+  if (junction && junction.type === 'valve3' && valve3IsFull(junction.id)) {
+    toast(`${junction.label} is full \u2014 a 3-way valve only has 3 ports. Add a Tee after this valve to branch further.`);
+    return;
+  }
   pushUndo();
   const newItem = addItem(type, {
     x: (junction.x || 0) + 120,
