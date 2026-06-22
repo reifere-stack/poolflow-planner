@@ -138,6 +138,17 @@
       flex:1; overflow-y:auto;
       padding:16px 16px 120px;
       background:var(--bg);
+      /* Allow iPhone to scroll vertically AND pinch-zoom in the flows view.
+         Without this the parent body touch-action:none blocks gestures. */
+      touch-action: pan-y pinch-zoom;
+      -webkit-overflow-scrolling: touch;
+      overscroll-behavior: contain;
+    }
+    /* Pinch-zoom transform wrapper inside the flows page. JS sets --flows-scale. */
+    .flows-zoom {
+      transform-origin: 0 0;
+      transform: scale(var(--flows-scale, 1));
+      width: calc(100% / var(--flows-scale, 1));
     }
     body.page-flows .flows-page { display:block; }
     body.page-flows .canvas-area,
@@ -602,6 +613,10 @@
     .sheet-body {
       flex:1; overflow-y:auto; -webkit-overflow-scrolling:touch;
       padding:12px 14px 20px;
+      /* Override the parent body's touch-action:none so iPhone can swipe to
+         scroll the items palette / tabs panels. */
+      touch-action: pan-y;
+      overscroll-behavior: contain;
     }
 
     .panel { padding:0; margin-bottom:14px; }
@@ -866,11 +881,13 @@
 
   <!-- FLOWS PAGE -->
   <section class="flows-page" id="flowsPage">
-    <div class="flows-header">
-      <h2>Flows</h2>
-      <div class="flows-hint">Edit a flow to update the diagram</div>
+    <div class="flows-zoom" id="flowsZoom">
+      <div class="flows-header">
+        <h2>Flows</h2>
+        <div class="flows-hint">Edit a flow to update the diagram. Pinch to zoom on touch devices.</div>
+      </div>
+      <div id="flowsList"></div>
     </div>
-    <div id="flowsList"></div>
   </section>
   <button type="button" class="add-flow-btn" id="addFlowBtn">+ Add Flow</button>
 

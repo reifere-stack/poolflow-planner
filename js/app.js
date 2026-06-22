@@ -7930,4 +7930,65 @@ renderFlows = function renderFlowsWithSpill() {
 // Resize
 window.addEventListener('resize', () => { applyTransform(); });
 
+// ==================================================================
+// ================ FLOWS PINCH-TO-ZOOM (iPhone) ====================
+// ==================================================================
+// Two-finger pinch on the Flows page sets a CSS var --flows-scale on
+// .flows-zoom. Single-finger drags still scroll vertically (touch-action
+// pan-y on .flows-page handles that natively).
+(function setupFlowsPinch() {
+  const page = document.getElementById('flowsPage');
+  const zoom = document.getElementById('flowsZoom');
+  if (!page || !zoom) return;
+  let scale = 1;
+  const MIN = 0.5, MAX = 2.5;
+  let startDist = 0;
+  let startScale = 1;
+  const dist = (a, b) => Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+
+  page.addEventListener('touchstart', (e) => {
+    if (e.touches.length === 2) {
+      startDist = dist(e.touches[0], e.touches[1]);
+      startScale = scale;
+    }
+  }, { passive: true });
+
+  page.addEventListener('touchmove', (e) => {
+    if (e.touches.length === 2 && startDist > 0) {
+      e.preventDefault();
+      const d = dist(e.touches[0], e.touches[1]);
+      const next = Math.max(MIN, Math.min(MAX, startScale * (d / startDist)));
+      scale = next;
+      zoom.style.setProperty('--flows-scale', String(scale));
+    }
+  }, { passive: false });
+
+  page.addEventListener('touchend', (e) => {
+    if (e.touches.length < 2) startDist = 0;
+  }, { passive: true });
+
+  // Double-tap to reset zoom (nice escape hatch).
+  let lastTap = 0;
+  page.addEventListener('touchend', (e) => {
+    if (e.changedTouches.length !== 1) return;
+    const now = Date.now();
+    if (now - lastTap < 320) {
+      scale = 1;
+      zoom.style.setProperty('--flows-scale', '1');
+      lastTap = 0;
+    } else {
+      lastTap = now;
+    }
+  }, { passive: true });
+
+  // Desktop: Ctrl+wheel zooms (matches browser convention).
+  page.addEventListener('wheel', (e) => {
+    if (!e.ctrlKey && !e.metaKey) return;
+    e.preventDefault();
+    const factor = e.deltaY < 0 ? 1.08 : 1 / 1.08;
+    scale = Math.max(MIN, Math.min(MAX, scale * factor));
+    zoom.style.setProperty('--flows-scale', String(scale));
+  }, { passive: false });
+})();
+
 })();
