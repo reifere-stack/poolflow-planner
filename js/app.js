@@ -231,50 +231,52 @@ function migratePortsOnLoad(s) {
       else unassigned.push(e);
     }
     if (!unassigned.length) continue;
-    // Pass 1: trunk preference — the edge touching a pump is the trunk.
-    const isPumpEdge = (e) => {
+    // Geometric assignment: assign each unassigned edge to the closest free
+    // port (trunk = bottom, A = left, B = right of the valve icon). What the
+    // user sees in the diagram is what gets blocked.
+    const portPos = (port) => {
+      if (port === 'trunk') return { x: valve.x + valve.w / 2, y: valve.y + valve.h };
+      if (port === 'a')     return { x: valve.x,               y: valve.y + valve.h / 2 };
+      return                       { x: valve.x + valve.w,     y: valve.y + valve.h / 2 };
+    };
+    const anchorPoint = (e) => {
       const otherId = e.from === valve.id ? e.to : e.from;
       const other = itemById[otherId];
-      return other && other.type === 'pump';
+      if (!other) return { x: valve.x + valve.w / 2, y: valve.y + valve.h / 2 };
+      if (other.type === 'valve3') {
+        const otherPort = (e.from === otherId ? e.fromPort : e.toPort);
+        if (otherPort === 'trunk' || otherPort === 'a' || otherPort === 'b') {
+          if (otherPort === 'trunk') return { x: other.x + other.w / 2, y: other.y + other.h };
+          if (otherPort === 'a')     return { x: other.x,               y: other.y + other.h / 2 };
+          return                            { x: other.x + other.w,     y: other.y + other.h / 2 };
+        }
+      }
+      return { x: (other.x || 0) + (other.w || 0) / 2, y: (other.y || 0) + (other.h || 0) / 2 };
     };
-    for (const e of unassigned.slice()) {
-      if (assigned.trunk.length === 0 && isPumpEdge(e)) {
-        writeP(e, 'trunk');
-        assigned.trunk.push(e);
-        unassigned.splice(unassigned.indexOf(e), 1);
-      }
-    }
-    // Pass 2: if trunk still empty, use direction heuristic — the lone edge
-    // pointing the opposite direction from the branches is the trunk.
-    if (assigned.trunk.length === 0) {
-      const ins  = touching.filter(e => e.to   === valve.id);
-      const outs = touching.filter(e => e.from === valve.id);
-      let candidate = null;
-      if (outs.length === 1 && ins.length >= 2) candidate = outs[0];
-      else if (ins.length === 1 && outs.length >= 2) candidate = ins[0];
-      if (candidate && unassigned.includes(candidate)) {
-        writeP(candidate, 'trunk');
-        assigned.trunk.push(candidate);
-        unassigned.splice(unassigned.indexOf(candidate), 1);
-      }
-    }
-    // Pass 3: fill open slots in order trunk → a → b. Sort the remaining
-    // edges by the OTHER end's (y, x) so top-left becomes A and bottom-right
-    // becomes B — matches the visual layout / labels.
-    const otherEnd = (e) => itemById[e.from === valve.id ? e.to : e.from];
-    unassigned.sort((e1, e2) => {
-      const a = otherEnd(e1), b = otherEnd(e2);
-      if (!a || !b) return 0;
-      return ((a.y||0)*10000 + (a.x||0)) - ((b.y||0)*10000 + (b.x||0));
+    const dist2 = (port, pt) => {
+      const p = portPos(port);
+      return (p.x - pt.x) * (p.x - pt.x) + (p.y - pt.y) * (p.y - pt.y);
+    };
+    const cands = unassigned.map(e => {
+      const pt = anchorPoint(e);
+      const sorted = [['trunk', dist2('trunk', pt)], ['a', dist2('a', pt)], ['b', dist2('b', pt)]].sort((x, y) => x[1] - y[1]);
+      return { edge: e, ranked: sorted.map(x => x[0]), gap: sorted[1][1] - sorted[0][1] };
     });
-    for (const e of unassigned) {
-      let target;
-      if (assigned.trunk.length === 0) target = 'trunk';
-      else if (assigned.a.length === 0) target = 'a';
-      else if (assigned.b.length === 0) target = 'b';
-      else target = 'b'; // overflow — park on b; user can re-edit
-      writeP(e, target);
-      assigned[target].push(e);
+    cands.sort((x, y) => y.gap - x.gap);
+    for (const c of cands) {
+      let placed = false;
+      for (const port of c.ranked) {
+        if (assigned[port].length === 0) {
+          writeP(c.edge, port);
+          assigned[port].push(c.edge);
+          placed = true;
+          break;
+        }
+      }
+      if (!placed) {
+        writeP(c.edge, c.ranked[0]);
+        assigned[c.ranked[0]].push(c.edge);
+      }
     }
   }
 
@@ -1886,50 +1888,74 @@ function repairValvePortsForOne(valve) {
   }
   if (!unassigned.length) return false;
   let changed = false;
-  // Pass 1: trunk = the edge touching a pump.
-  for (const e of unassigned.slice()) {
-    if (assigned.trunk.length === 0) {
-      const otherId = e.from === valve.id ? e.to : e.from;
-      const other = getItem(otherId);
-      if (other && other.type === 'pump') {
-        writeP(e, 'trunk');
-        assigned.trunk.push(e);
-        unassigned.splice(unassigned.indexOf(e), 1);
-        changed = true;
+
+  // Geometry-based assignment. The valve icon has fixed orientation:
+  //   trunk = bottom (y = valve.y + valve.h)
+  //   port A = left  (x = valve.x)
+  //   port B = right (x = valve.x + valve.w)
+  // For each unassigned edge, find the OTHER endpoint's anchor point and pick
+  // the closest valve port (free slots only). What you see in the diagram is
+  // what gets blocked.
+  const cx0 = valve.x + valve.w / 2;
+  const cy0 = valve.y + valve.h / 2;
+  const anchorPoint = (e) => {
+    const otherId = e.from === valve.id ? e.to : e.from;
+    const other = getItem(otherId);
+    if (!other) return { x: cx0, y: cy0 };
+    // If the other end is itself a valve3 with a known port for THIS edge,
+    // use that port's world position (handles back-to-back 3-ways).
+    if (other.type === 'valve3') {
+      const otherPort = (e.from === otherId ? e.fromPort : e.toPort);
+      if (otherPort === 'trunk' || otherPort === 'a' || otherPort === 'b') {
+        const pp = valvePortPos(other, otherPort);
+        if (pp) return pp;
       }
     }
-  }
-  // Pass 2: direction heuristic (lone in vs lone out) for trunk.
-  if (assigned.trunk.length === 0) {
-    const ins  = touching.filter(e => e.to   === valve.id);
-    const outs = touching.filter(e => e.from === valve.id);
-    let candidate = null;
-    if (outs.length === 1 && ins.length >= 2) candidate = outs[0];
-    else if (ins.length === 1 && outs.length >= 2) candidate = ins[0];
-    if (candidate && unassigned.includes(candidate)) {
-      writeP(candidate, 'trunk');
-      assigned.trunk.push(candidate);
-      unassigned.splice(unassigned.indexOf(candidate), 1);
+    return {
+      x: (other.x || 0) + (other.w || 0) / 2,
+      y: (other.y || 0) + (other.h || 0) / 2,
+    };
+  };
+  const distToPort = (port, pt) => {
+    const pp = valvePortPos(valve, port);
+    if (!pp) return Infinity;
+    return (pp.x - pt.x) * (pp.x - pt.x) + (pp.y - pt.y) * (pp.y - pt.y);
+  };
+  // Rank each edge's port preference + how decisively it prefers one port
+  // over the others. Process "most decisive" first so ambiguous edges pick
+  // from whichever slots remain free.
+  const candidates = unassigned.map(e => {
+    const pt = anchorPoint(e);
+    const dT = distToPort('trunk', pt);
+    const dA = distToPort('a',     pt);
+    const dB = distToPort('b',     pt);
+    const sorted = [['trunk', dT], ['a', dA], ['b', dB]].sort((x, y) => x[1] - y[1]);
+    return { edge: e, ranked: sorted.map(x => x[0]), gap: sorted[1][1] - sorted[0][1] };
+  });
+  candidates.sort((x, y) => y.gap - x.gap);
+  for (const c of candidates) {
+    let placed = false;
+    for (const port of c.ranked) {
+      if (assigned[port].length === 0) {
+        writeP(c.edge, port);
+        assigned[port].push(c.edge);
+        const idx = unassigned.indexOf(c.edge);
+        if (idx >= 0) unassigned.splice(idx, 1);
+        changed = true;
+        placed = true;
+        break;
+      }
+    }
+    if (!placed) {
+      // All three ports already filled (overflow on a 3-port valve). Park on
+      // the most-preferred port — the user can re-edit.
+      const port = c.ranked[0];
+      writeP(c.edge, port);
+      assigned[port].push(c.edge);
+      const idx = unassigned.indexOf(c.edge);
+      if (idx >= 0) unassigned.splice(idx, 1);
       changed = true;
     }
-  }
-  // Pass 3: fill trunk → a → b. Sort remaining by other-end (y, x) so
-  // top-left becomes A and bottom-right becomes B (matches visual layout).
-  const otherEnd = (e) => getItem(e.from === valve.id ? e.to : e.from);
-  unassigned.sort((e1, e2) => {
-    const a = otherEnd(e1), b = otherEnd(e2);
-    if (!a || !b) return 0;
-    return ((a.y||0)*10000 + (a.x||0)) - ((b.y||0)*10000 + (b.x||0));
-  });
-  for (const e of unassigned) {
-    let target;
-    if (assigned.trunk.length === 0) target = 'trunk';
-    else if (assigned.a.length === 0) target = 'a';
-    else if (assigned.b.length === 0) target = 'b';
-    else target = 'b';
-    writeP(e, target);
-    assigned[target].push(e);
-    changed = true;
   }
   return changed;
 }
