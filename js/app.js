@@ -231,9 +231,23 @@ function migratePortsOnLoad(s) {
       else unassigned.push(e);
     }
     if (!unassigned.length) continue;
-    // Geometric assignment: assign each unassigned edge to the closest free
-    // port (trunk = bottom, A = left, B = right of the valve icon). What the
-    // user sees in the diagram is what gets blocked.
+    // PASS 1 — topology: lone-direction edge becomes trunk when 2-in-1-out or
+    // 1-in-2-out. Matches the Flows-tab rule and handles back-to-back valves.
+    if (assigned.trunk.length === 0) {
+      const ins  = touching.filter(e => e.to   === valve.id);
+      const outs = touching.filter(e => e.from === valve.id);
+      let cand = null;
+      if (outs.length === 1 && ins.length >= 2) cand = outs[0];
+      else if (ins.length === 1 && outs.length >= 2) cand = ins[0];
+      if (cand && unassigned.includes(cand)) {
+        writeP(cand, 'trunk');
+        assigned.trunk.push(cand);
+        unassigned.splice(unassigned.indexOf(cand), 1);
+      }
+    }
+    if (!unassigned.length) continue;
+    // PASS 2 — geometry: assign each remaining unassigned edge to the closest
+    // free port (trunk = bottom, A = left, B = right of the valve icon).
     const portPos = (port) => {
       if (port === 'trunk') return { x: valve.x + valve.w / 2, y: valve.y + valve.h };
       if (port === 'a')     return { x: valve.x,               y: valve.y + valve.h / 2 };
@@ -1889,13 +1903,28 @@ function repairValvePortsForOne(valve) {
   if (!unassigned.length) return false;
   let changed = false;
 
-  // Geometry-based assignment. The valve icon has fixed orientation:
-  //   trunk = bottom (y = valve.y + valve.h)
-  //   port A = left  (x = valve.x)
-  //   port B = right (x = valve.x + valve.w)
-  // For each unassigned edge, find the OTHER endpoint's anchor point and pick
-  // the closest valve port (free slots only). What you see in the diagram is
-  // what gets blocked.
+  // PASS 1 — topology: if the valve has 2-in-1-out or 1-in-2-out and the lone
+  // side is still unassigned, lock it in as the trunk. Matches the Flows-tab
+  // rule "the part that has one input is the trunk and the tee part is a and b."
+  // This handles return-side valves and chained valves correctly: the lone
+  // direction is always the common (trunk) path.
+  if (assigned.trunk.length === 0) {
+    const ins  = touching.filter(e => e.to   === valve.id);
+    const outs = touching.filter(e => e.from === valve.id);
+    let candidate = null;
+    if (outs.length === 1 && ins.length >= 2) candidate = outs[0];
+    else if (ins.length === 1 && outs.length >= 2) candidate = ins[0];
+    if (candidate && unassigned.includes(candidate)) {
+      writeP(candidate, 'trunk');
+      assigned.trunk.push(candidate);
+      unassigned.splice(unassigned.indexOf(candidate), 1);
+      changed = true;
+    }
+  }
+
+  // PASS 2 — geometry: assign each remaining unassigned edge to the closest
+  // FREE port using the valve icon's fixed orientation (trunk = bottom, A =
+  // left, B = right). What you see in the diagram is what gets blocked.
   const cx0 = valve.x + valve.w / 2;
   const cy0 = valve.y + valve.h / 2;
   const anchorPoint = (e) => {
