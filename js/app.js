@@ -719,10 +719,18 @@ function onPointerMove(e) {
       const dxw = (e.clientX - dragData.startX) / state.view.scale;
       const dyw = (e.clientY - dragData.startY) / state.view.scale;
       const item = dragData.item;
+      const prevX = item.x, prevY = item.y;
       item.x = Math.round((dragData.origX + dxw) / 4) * 4;
       item.y = Math.round((dragData.origY + dyw) / 4) * 4;
       dragData.element.style.left = item.x + 'px';
       dragData.element.style.top  = item.y + 'px';
+      // If a Pool/Spa body is being dragged, drag the attached fixtures with it.
+      if (item.type === 'pool' || item.type === 'spa') {
+        const dx = item.x - prevX, dy = item.y - prevY;
+        if ((dx || dy) && typeof _moveFixturesWithBody === 'function') {
+          _moveFixturesWithBody(item, dx, dy);
+        }
+      }
       drawEdges(); drawDims();
     }
     return;
@@ -756,6 +764,18 @@ function onPointerMove(e) {
       el.style.height = item.h + 'px';
       const meta = el.querySelector('.meta');
       if (meta) meta.textContent = metaText(item);
+    }
+    // If a Pool/Spa is being resized, re-snap attached fixtures so they keep
+    // touching the new perimeter. Snap one suction fixture (redistributes all
+    // suction peers) and one return fixture (redistributes all return peers).
+    if (item.type === 'pool' || item.type === 'spa') {
+      if (typeof _bodyFixtures === 'function' && typeof _snapFixtureToBody === 'function') {
+        const fixtures = _bodyFixtures(item);
+        const suc = fixtures.find(f => SUCTION_FIXTURES.has(f.type));
+        const ret = fixtures.find(f => RETURN_FIXTURES.has(f.type));
+        if (suc) _snapFixtureToBody(suc);
+        if (ret) _snapFixtureToBody(ret);
+      }
     }
     drawEdges(); drawDims();
     return;
@@ -5106,8 +5126,12 @@ renderFlows = function renderFlowsTree() {
 function flowsRemoveTreeStep(itemId) {
   const item = state.items.find(i => i.id === itemId);
   if (!item) return;
-  if (item.type === 'pump' || SUCTION_FIXTURES.has(item.type) || RETURN_FIXTURES.has(item.type)) {
-    toast('Cannot remove that node from here');
+  if (item.type === 'pump') {
+    toast('Use the card menu to delete the pump');
+    return;
+  }
+  if (item.type === 'pool' || item.type === 'spa' || item.type === 'pad') {
+    toast('Cannot remove a body from the Flows tab');
     return;
   }
   pushUndo();
@@ -5702,8 +5726,13 @@ _psRenderPill = function _psRenderPillExt(item, flowId, opts) {
   const isBody = _PSPILL_BODY_TYPES.has(item.type);
   const isFixture = SUCTION_FIXTURES.has(item.type) || RETURN_FIXTURES.has(item.type);
   const isSynthetic = !!item.__synthetic;
-  const removable = editing && !opts.isClosure && !isFixture && !isPump && !isBody && !isSynthetic;
+  // In edit mode, allow removing junctions, equipment, AND fixtures (skimmers,
+  // returns, jets, etc.). The pump and body pills are protected. Closure pills
+  // (the body that appears below a fixture leaf) cannot be removed from here.
+  const removable = editing && !opts.isClosure && !isPump && !isBody && !isSynthetic;
   const branchable = editing && isJunction && !isSynthetic;
+  // Fixtures get an extra "change type" button (skimmer \u2194 main drain \u2194 jet \u2194 return \u2194 water feature).
+  const changeable = editing && !opts.isClosure && isFixture && !isSynthetic;
   const renamable  = !opts.isClosure && !isSynthetic;
   // side: 'suction' (tree above pump, water flowing DOWN to pump) or
   //       'return'  (tree below pump, water flowing DOWN away from pump)
@@ -5743,6 +5772,7 @@ _psRenderPill = function _psRenderPillExt(item, flowId, opts) {
         <span class="pill-label" ${editing && renamable ? `data-act="rename-pill" data-flow-id="${flowId}" data-item-id="${item.id}"` : ''}>${escapeHtml(label)}</span>
         ${swapHint}
         ${branchable ? `<button type="button" class="pill-btn pill-btn-swap" data-act="swap-junction" data-flow-id="${flowId}" data-item-id="${item.id}" title="Change junction type">\u21C4</button>` : ''}
+        ${changeable ? `<button type="button" class="pill-btn pill-btn-swap" data-act="change-fixture-type" data-flow-id="${flowId}" data-item-id="${item.id}" title="Change fixture type">\u21C4</button>` : ''}
         ${branchable ? `<button type="button" class="pill-btn" data-act="branch-step" data-flow-id="${flowId}" data-item-id="${item.id}" title="Add branch">+</button>` : ''}
         ${removable ? `<button type="button" class="pill-btn pill-btn-danger" data-act="remove-tree-step" data-flow-id="${flowId}" data-item-id="${item.id}" title="Remove">\u2715</button>` : ''}
       </div>
@@ -6097,6 +6127,121 @@ function _wizRenderStep3() {
 }
 
 // Materialize: create real items + edges from the wizard config.
+// ==================================================================
+// ========== STICK-TO-BODY HELPERS ================================
+// ==================================================================
+// When a fixture (skimmer, drain, return, jet, water feature) is bound to a
+// pool/spa body via item.bodyId, we keep it visually "glued" to the body's
+// perimeter:
+//   \u2022 Suction sources (skimmer/drain) sit on the BOTTOM edge.
+//   \u2022 Returns/jets/features sit on the TOP edge.
+//   \u2022 If multiple fixtures share an edge, they distribute evenly.
+//   \u2022 When the user drags a Pool/Spa, the attached fixtures move with it,
+//     preserving their slot along the edge.
+//
+// Behavior contract:
+//   \u2022 Dragging an individual fixture frees it from auto-snap (we just leave
+//     it where the user dropped it). The bodyId link is kept, but we don't
+//     re-snap to a slot. The user controls the position.
+//   \u2022 Moving the body moves every attached fixture by the same (dx, dy)
+//     so each fixture stays exactly where it was relative to the body.
+//   \u2022 Calling _snapFixtureToBody(item) snaps the item back to a clean
+//     perimeter slot (used by the wizard and by add-from-flows operations).
+// Pick the best default body for a newly-added fixture. Heuristic:
+//   1. If the tree this fixture is being added to (rooted at `nearItem`) already
+//      has fixtures bound to a single body, use that body.
+//   2. Else fall back to the only available body (if there's just one).
+//   3. Else fall back to the first Pool body, then any body.
+function _pickDefaultBodyFor(role, nearItem) {
+  const bodies = state.items.filter(i => i.type === 'pool' || i.type === 'spa');
+  if (!bodies.length) return null;
+  // Walk the tree around nearItem looking for sibling fixtures with bodyId.
+  if (nearItem) {
+    const seen = new Set([nearItem.id]);
+    const queue = [nearItem.id];
+    const sameRole = (it) => role === 'suction' ? SUCTION_FIXTURES.has(it.type) : RETURN_FIXTURES.has(it.type);
+    const votes = new Map();
+    while (queue.length) {
+      const cur = queue.shift();
+      for (const e of state.edges) {
+        const next = e.from === cur ? e.to : (e.to === cur ? e.from : null);
+        if (!next || seen.has(next)) continue;
+        seen.add(next); queue.push(next);
+        const it = state.items.find(i => i.id === next);
+        if (it && sameRole(it) && it.bodyId) {
+          votes.set(it.bodyId, (votes.get(it.bodyId) || 0) + 1);
+        }
+      }
+    }
+    if (votes.size) {
+      let bestId = null, bestN = 0;
+      for (const [id, n] of votes) if (n > bestN) { bestN = n; bestId = id; }
+      const b = bodies.find(b => b.id === bestId);
+      if (b) return b;
+    }
+  }
+  if (bodies.length === 1) return bodies[0];
+  return bodies.find(b => b.type === 'pool') || bodies[0];
+}
+// Bind a freshly-created fixture to a body and snap it onto the body's perimeter.
+function _bindFixtureToBody(fixture, body) {
+  if (!fixture || !body) return;
+  fixture.bodyId = body.id;
+  fixture.relation = body.type;
+  fixture.relationLocked = true;
+  fixture.relationAuto = false;
+  _snapFixtureToBody(fixture);
+}
+
+function _bodyFixtures(body) {
+  if (!body) return [];
+  return state.items.filter(i =>
+    i.bodyId === body.id &&
+    (SUCTION_FIXTURES.has(i.type) || RETURN_FIXTURES.has(i.type))
+  );
+}
+function _snapFixtureToBody(fixture, opts) {
+  if (!fixture || !fixture.bodyId) return;
+  const body = state.items.find(i => i.id === fixture.bodyId);
+  if (!body) return;
+  opts = opts || {};
+  const isSuc = SUCTION_FIXTURES.has(fixture.type);
+  const side = isSuc ? 'bottom' : 'top';
+  // Find all fixtures (of the same side/role) already on this body, ordered by x.
+  const peers = _bodyFixtures(body).filter(i =>
+    (SUCTION_FIXTURES.has(i.type) === isSuc)
+  );
+  // Order: existing fixtures by their current x, then this fixture at the end
+  // if not already in the list. (It will already be in state.items.)
+  const ordered = peers.slice().sort((a, b) => (a.x || 0) - (b.x || 0));
+  // Make sure fixture is in the list.
+  if (!ordered.find(p => p.id === fixture.id)) ordered.push(fixture);
+  const total = ordered.length;
+  const bw = body.w || 300, bh = body.h || 170;
+  ordered.forEach((p, i) => {
+    const fw = p.w || 28, fh = p.h || 28;
+    const startX = body.x + 12;
+    const span   = bw - 24;
+    const cx = startX + (span * (i + 0.5)) / Math.max(total, 1);
+    p.x = Math.round(cx - fw / 2);
+    p.y = Math.round(side === 'top' ? (body.y - fh + 4) : (body.y + bh - 4));
+  });
+  if (typeof refreshItem === 'function') {
+    for (const p of ordered) refreshItem(p);
+  }
+}
+// When a body is moved by (dx, dy), shift every attached fixture by the same
+// delta so each fixture stays in the exact same spot relative to the body.
+function _moveFixturesWithBody(body, dx, dy) {
+  if (!body || (!dx && !dy)) return;
+  const fixtures = _bodyFixtures(body);
+  for (const f of fixtures) {
+    f.x = Math.round((f.x || 0) + dx);
+    f.y = Math.round((f.y || 0) + dy);
+    if (typeof refreshItem === 'function') refreshItem(f);
+  }
+}
+
 function _wizFinalize() {
   pushUndo();
 
@@ -6468,6 +6613,12 @@ function flowsOpenTreePicker(role, attachToItem, opts) {
       });
       return;
     }
+    if (act === 'change-fixture-type') {
+      const item = state.items.find(i => i.id === itemId);
+      if (!item) return;
+      _psOpenFixtureTypePicker(item);
+      return;
+    }
     if (act === 'swap-junction') {
       const item = state.items.find(i => i.id === itemId);
       if (!item || !_PSBRANCH_TYPES.has(item.type)) return;
@@ -6525,6 +6676,13 @@ function _addToJunction(junction, type, label, role) {
     y: (junction.y || 0) + 80,
     label: _uniqLabel(label),
   });
+  // If the new item is a suction source or return destination, bind it to a body
+  // and snap onto that body's perimeter (so it visually touches Pool/Spa).
+  const isFixture = SUCTION_FIXTURES.has(type) || RETURN_FIXTURES.has(type);
+  if (isFixture) {
+    const body = _pickDefaultBodyFor(role, junction);
+    if (body) _bindFixtureToBody(newItem, body);
+  }
   let portOpts = { fromPort: '', toPort: '' };
   if (junction.type === 'valve3') {
     const used = new Set();
@@ -6593,6 +6751,8 @@ function _addSiblingTo(leaf, type, label, role) {
   _addToJunction(junction, type, label, role);
 }
 
+// When a new fixture is created directly off the pump (no existing siblings),
+// bind it to a body and snap to perimeter.
 function _addAtPump(pump, type, label, role) {
   // Like adding a sibling under the pump's natural input/output.
   // We treat the pump itself as a junction-ish for this purpose: find an
@@ -6615,6 +6775,12 @@ function _addAtPump(pump, type, label, role) {
       state.edges.push({ id: uid(), from: pump.id, to: newItem.id, type: 'return', size: '', label: `${pump.label} \u2192 ${newItem.label}`, active: false, blocked: false, fromPort: 'discharge', toPort: '' });
     } else {
       state.edges.push({ id: uid(), from: newItem.id, to: pump.id, type: 'suction', size: '', label: `${newItem.label} \u2192 ${pump.label}`, active: false, blocked: false, fromPort: '', toPort: 'intake' });
+    }
+    // Bind to body + snap to perimeter when adding a fixture.
+    const isFixture = SUCTION_FIXTURES.has(type) || RETURN_FIXTURES.has(type);
+    if (isFixture) {
+      const body = _pickDefaultBodyFor(role, pump);
+      if (body) _bindFixtureToBody(newItem, body);
     }
     _flowsRerenderAll();
     return;
@@ -6758,6 +6924,13 @@ function _insertRelativeTo(anchor, side, direction, type, label) {
         });
       }
     }
+  }
+  // If the inserted item is a fixture, bind to a body + snap to perimeter.
+  const isFixture = SUCTION_FIXTURES.has(type) || RETURN_FIXTURES.has(type);
+  if (isFixture) {
+    const role = side === 'suction' ? 'suction' : 'return';
+    const body = _pickDefaultBodyFor(role, anchor);
+    if (body) _bindFixtureToBody(newItem, body);
   }
   migratePortsOnLoad(state);
   _flowsRerenderAll();
@@ -7033,6 +7206,77 @@ function _psOpenBodyPicker(leaf) {
       leaf.relationLocked = true;
       leaf.relationAuto = false;
       persist();
+      _flowsRerenderAll();
+      closeModal();
+    };
+  });
+}
+
+// Picker for changing an existing fixture's type (e.g. Return \u2192 Water Feature,
+// Skimmer \u2192 Main Drain). Keeps the same id and all existing pipe connections,
+// just rewrites .type and optionally the label. The fixture role (suction vs.
+// return) is preserved \u2014 you can't flip a skimmer into a jet because that
+// would invert the flow direction; we offer only same-role types.
+function _psOpenFixtureTypePicker(fixture) {
+  if (!fixture) return;
+  if (typeof modalContent === 'undefined' || !modalContent) return;
+  const isSuc = SUCTION_FIXTURES.has(fixture.type);
+  const isRet = RETURN_FIXTURES.has(fixture.type);
+  if (!isSuc && !isRet) { toast('This pill is not a fixture'); return; }
+  const list = isSuc ? _WIZ_SUC_TYPES : _WIZ_RET_TYPES;
+  const rowsHtml = list.map(t => {
+    const isCurrent = t.type === fixture.type;
+    return `<button type="button" class="btn" data-fix-type="${t.type}" data-fix-label="${escapeHtml(t.label)}" style="text-align:left; display:flex; align-items:center; justify-content:space-between; gap:10px;">
+      <span style="font-weight:700;">${escapeHtml(t.label)}</span>
+      ${isCurrent ? '<span style="color:var(--primary); font-weight:600; font-size:12px;">\u2022 current</span>' : ''}
+    </button>`;
+  }).join('');
+  modalContent.innerHTML = `
+    <h3>Change ${escapeHtml(_psPillLabel(fixture))} to\u2026</h3>
+    <p style="color:var(--muted); font-size:13px; margin-top:6px;">Pipe connections and the body assignment stay the same. Only the fixture type and label change.</p>
+    <div style="display:flex; flex-direction:column; gap:8px; margin-top:12px;">
+      ${rowsHtml}
+    </div>
+    <div class="row" style="margin-top:14px; justify-content:flex-end;">
+      <button class="btn" id="fix-type-cancel">Cancel</button>
+    </div>`;
+  modalBackdrop.classList.add('show');
+  $('fix-type-cancel').onclick = closeModal;
+  // Track the auto-generated labels so we know when it's safe to overwrite
+  // (don't overwrite a user-renamed label).
+  const autoLabels = new Set([
+    ..._WIZ_SUC_TYPES.map(t => t.label),
+    ..._WIZ_RET_TYPES.map(t => t.label),
+    // Common body-prefixed variants the wizard generates
+    ..._WIZ_SUC_TYPES.map(t => `Spa ${t.label}`),
+    ..._WIZ_RET_TYPES.map(t => `Spa ${t.label}`),
+  ]);
+  modalContent.querySelectorAll('[data-fix-type]').forEach(b => {
+    b.onclick = () => {
+      const newType = b.getAttribute('data-fix-type');
+      const newLabel = b.getAttribute('data-fix-label') || newType;
+      if (newType === fixture.type) { closeModal(); return; }
+      pushUndo();
+      fixture.type = newType;
+      // Update label only if it looks auto-generated.
+      if (autoLabels.has((fixture.label || '').trim())) {
+        // Honor existing body prefix if any.
+        const wasSpaPrefixed = /^Spa\b/i.test(fixture.label || '');
+        fixture.label = _uniqLabel(wasSpaPrefixed ? `Spa ${newLabel}` : newLabel);
+      }
+      // Sync size to the new type's defaults so it renders correctly.
+      const tool = (typeof TOOLS !== 'undefined') ? TOOLS[newType] : null;
+      if (tool) {
+        fixture.w = tool.w;
+        fixture.h = tool.h;
+      }
+      persist();
+      // If this fixture is stuck to a body, re-snap to the appropriate edge
+      // (suction sources sit below the body, returns sit above).
+      if (typeof _snapFixtureToBody === 'function' && fixture.bodyId) {
+        _snapFixtureToBody(fixture);
+      }
+      refreshItem(fixture);
       _flowsRerenderAll();
       closeModal();
     };
