@@ -1294,6 +1294,103 @@ function valve3IsFull(itemId) {
   return count >= 3;
 }
 
+// ==================================================================
+// =============== EDGE VALIDATION (validate-before-mutate) =========
+// ==================================================================
+// Single choke-point for ALL pipe creation. Every code path that adds a
+// hydraulic/air edge MUST go through addEdgeValidated() so the Diagram and
+// Flows tabs can never desync: both views are pure derivations of
+// state.edges, so if a bad edge is rejected here it never reaches either
+// view. validateEdge() runs the cheap structural checks (self-loop, dup,
+// valve-port overflow, role conflict, and directed-cycle prevention) on a
+// CANDIDATE edge *before* it is pushed into state. It returns
+// { ok, reason } and never mutates state.
+
+// Would adding a directed edge from->to (following the water-flow direction
+// of hydraulic edges) close a directed cycle? We walk forward from `to`
+// along same-or-compatible edges; if we can already reach `from`, the new
+// edge would complete a loop. Air lines are bidirectional plumbing and
+// spillovers are gravity topology, so cycles there are legal (a spa can
+// spill to a pool that pumps back to the spa) — we only guard the
+// pump-driven suction/return graph.
+function edgeWouldCreateCycle(fromId, toId, type) {
+  if (!isHydraulicPipe(type)) return false;
+  if (fromId === toId) return true;
+  // Forward reachability from `toId` over hydraulic edges in flow direction.
+  const adj = new Map();
+  for (const e of state.edges) {
+    if (!isHydraulicPipe(e.type)) continue;
+    if (!adj.has(e.from)) adj.set(e.from, []);
+    adj.get(e.from).push(e.to);
+  }
+  const seen = new Set([toId]);
+  const stack = [toId];
+  while (stack.length) {
+    const cur = stack.pop();
+    if (cur === fromId) return true; // can already reach from -> closing the loop
+    for (const nxt of (adj.get(cur) || [])) {
+      if (!seen.has(nxt)) { seen.add(nxt); stack.push(nxt); }
+    }
+  }
+  return false;
+}
+
+// Validate a CANDIDATE edge against current state. Pure — no mutation.
+// `cand` = { from, to, type, fromPort, toPort }
+function validateEdge(cand) {
+  const from = getItem(cand.from), to = getItem(cand.to);
+  if (!from || !to) return { ok: false, reason: 'One endpoint no longer exists.' };
+  if (cand.from === cand.to) return { ok: false, reason: `${from.label} can't connect to itself.` };
+  // Duplicate pipe between the same two endpoints of the same role.
+  const dup = state.edges.some(e =>
+    e.type === cand.type &&
+    ((e.from === cand.from && e.to === cand.to) || (e.from === cand.to && e.to === cand.from))
+  );
+  if (dup) return { ok: false, reason: `A ${PIPE_TYPES[cand.type]?.label || cand.type} pipe already connects ${from.label} and ${to.label}.` };
+  // 3-way valve hard cap (trunk + A + B). valve3IsFull counts existing edges,
+  // so a candidate that would push a 3-port valve to a 4th pipe is rejected.
+  if (valve3IsFull(cand.from) || valve3IsFull(cand.to)) {
+    const fullOne = valve3IsFull(cand.from) ? from.label : to.label;
+    return { ok: false, reason: `${fullOne} is full — a 3-way valve only has 3 ports. Add a Tee or another 3-way to branch further.` };
+  }
+  // Directed-cycle prevention on the pump-driven water graph.
+  if (edgeWouldCreateCycle(cand.from, cand.to, cand.type)) {
+    return { ok: false, reason: `That pipe would loop ${from.label} back into its own flow path. Water can't flow in a circle — re-route through a body of water instead.` };
+  }
+  return { ok: true };
+}
+
+// The ONE sanctioned way to create an edge. Returns the new edge, or null if
+// rejected (a toast explains why). Callers that previously did
+// state.edges.push({...}) directly should use this so validation can't be
+// bypassed. `opts` carries any extra edge fields (size, waypoints, etc.).
+function addEdgeValidated(fromId, toId, type, opts = {}) {
+  const v = validateEdge({ from: fromId, to: toId, type, fromPort: opts.fromPort, toPort: opts.toPort });
+  if (!v.ok) {
+    if (!opts.silent) toast(v.reason);
+    return null;
+  }
+  const from = getItem(fromId), to = getItem(toId);
+  const edge = {
+    id: uid(),
+    from: fromId,
+    to: toId,
+    type,
+    size: opts.size || '',
+    label: opts.label || `${from.label || from.type} \u2192 ${to.label || to.type}`,
+    active: false,
+    blocked: false,
+    fromPort: opts.fromPort || '',
+    toPort: opts.toPort || '',
+  };
+  // Optional passthrough fields some callers set.
+  for (const k of ['routeStyle', 'waypoints', 'fromSize', 'toSize']) {
+    if (k in opts) edge[k] = opts[k];
+  }
+  state.edges.push(edge);
+  return edge;
+}
+
 // User tapped on an existing pipe while in connect mode (after picking a source).
 // Splice the existing edge at that point with a new tee node, then make a new edge
 // from the connect source -> the new tee.
@@ -1410,14 +1507,6 @@ function handleConnectTap(id, tapPt) {
       cancelConnectMode();
       return;
     }
-    // Hard cap on 3-way valves: 3 ports max (trunk + A + B). Reject 4th pipe.
-    if (valve3IsFull(from.id) || valve3IsFull(to.id)) {
-      const fullOne = valve3IsFull(from.id) ? from.label : to.label;
-      toast(`${fullOne} is full \u2014 a 3-way valve only has 3 ports. Add a Tee or another 3-way to branch further.`);
-      cancelConnectMode();
-      return;
-    }
-    pushUndo();
     // Endpoint-implied pipe type wins over the pending pipe type:
     //   pump intake / skimmer / main drain → suction
     //   pump discharge / return / jet / bubbler / feature → return
@@ -1430,21 +1519,25 @@ function handleConnectTap(id, tapPt) {
       impliedType = toAssign.pipeType || fromAssign.pipeType || null;
     }
     const pipeType = impliedType || state.pendingPipe.type;
-    state.edges.push({
-      id: uid(),
-      from: from.id,
-      to: to.id,
-      type: pipeType,
+    // Validate-before-mutate: run the structural checks (dup, valve overflow,
+    // self-loop, directed-cycle) on the CANDIDATE before touching state. If it
+    // fails we never pushUndo or mutate, so Diagram + Flows stay in lockstep.
+    const probe = validateEdge({ from: from.id, to: to.id, type: pipeType, fromPort: fromAssign.port || '', toPort: toAssign.port || '' });
+    if (!probe.ok) {
+      toast(probe.reason);
+      cancelConnectMode();
+      return;
+    }
+    pushUndo();
+    addEdgeValidated(from.id, to.id, pipeType, {
       size: state.pendingPipe.size,
-      label: `${from.label} → ${to.label}`,
-      active: false,
-      blocked: false,
       routeStyle: state.pendingPipe.routeStyle || 'auto',
       waypoints: [],
       fromSize: '',
       toSize: '',
       fromPort: fromAssign.port || '',
       toPort:   toAssign.port   || '',
+      silent: true,
     });
     toast(`${PIPE_TYPES[pipeType].label} ${state.pendingPipe.size}: ${from.label} → ${to.label}`);
     solveFlow(); persist();
@@ -2421,7 +2514,34 @@ function valveAllows(node, edges, index) {
   if (node.type === 'actuated') return node.valveState !== 'closed';
   return true;
 }
+// Reconcile state.edges into a structurally consistent graph BEFORE anything
+// renders. This is the safety net that backs "validate-before-mutate": even if
+// some legacy code path pushed a bad edge, we sweep it here so the Diagram and
+// Flows tabs (both pure derivations of state) can never disagree about what
+// exists. It is idempotent and only removes provably-invalid edges:
+//   • edges whose endpoint item was deleted (dangling references)
+//   • exact duplicate edges (same from/to/type) — keep the first
+//   • self-loops
+// Returns the number of edges removed (for optional logging/QA).
+function reconcileGraph() {
+  const ids = new Set(state.items.map(i => i.id));
+  const before = state.edges.length;
+  const seen = new Set();
+  state.edges = state.edges.filter(e => {
+    if (!ids.has(e.from) || !ids.has(e.to)) return false; // dangling
+    if (e.from === e.to) return false;                    // self-loop
+    const key = `${e.from}|${e.to}|${e.type}`;
+    if (seen.has(key)) return false;                      // exact duplicate
+    seen.add(key);
+    return true;
+  });
+  return before - state.edges.length;
+}
+
 function solveFlow() {
+  // Reconcile first so the solver, Diagram, and Flows all see one consistent
+  // graph (validate-before-mutate safety net — see reconcileGraph).
+  reconcileGraph();
   // Heal any valve3 that has unassigned edges — without this, edges added via
   // the Flows tab after the valve already had one assigned port stay
   // unrecognized and become un-blockable. (See repairValvePortsForOne.)
@@ -2786,6 +2906,34 @@ function solveFlow() {
         }
       }
     }
+  }
+
+  // Orphan-fixture flagging: any fixture, equipment, or junction sitting on the
+  // Diagram with NO connecting pipe is invisible to the Flows tab (it isn't on
+  // any flow path). Flag it so the user notices the dropped item instead of it
+  // silently vanishing from Flows. Bodies of water (pool/spa/pad) anchor flows
+  // rather than ride on them, and lights/conduit are low-voltage runs, so all
+  // are exempt. A 'conduit'/'spillover' edge alone does NOT count as being
+  // plumbed into the hydraulic/air network.
+  const ORPHAN_EXEMPT = new Set(['pool', 'spa', 'pad', 'light', 'conduit']);
+  // Local copies so this loop never depends on later module-scope `const`
+  // declarations (e.g. _PSBRANCH_TYPES at ~5336): solveFlow() can run during
+  // initial load before those lines execute, and a TDZ ref would throw and
+  // silently abort the whole solve.
+  const _ORPHAN_EQUIP = new Set(['pump', 'filter', 'heater', 'saltcell', 'booster', 'blower', 'manifold', 'customeq']);
+  const _ORPHAN_BRANCH = new Set(['tee', 'manifold', 'valve3']);
+  for (const it of state.items) {
+    if (ORPHAN_EXEMPT.has(it.type)) continue;
+    const plumbed = state.edges.some(e =>
+      (e.from === it.id || e.to === it.id) &&
+      e.type !== 'conduit' && e.type !== 'spillover'
+    );
+    if (plumbed) continue;
+    const kind = _ORPHAN_EQUIP.has(it.type) ? 'equipment'
+               : _ORPHAN_BRANCH.has(it.type) ? 'junction'
+               : (it.type === 'valve2' || it.type === 'valve3') ? 'valve'
+               : 'fixture';
+    issues.push(`${it.label} isn't connected to anything — it won't appear on any flow. Run a pipe to it on the Diagram, or remove it. (Orphaned ${kind}.)`);
   }
 
   state.lastSolve = { issues, results };
@@ -4864,19 +5012,9 @@ function flowsBranchStep(flow, stepIdx, fixtureType, newLabel) {
   }
 
   if (role === 'suction') {
-    state.edges.push({
-      id: uid(), from: item.id, to: step.id, type: 'suction', size: '',
-      label: `${item.label} \u2192 ${step.label}`,
-      active: false, blocked: false,
-      fromPort: '', toPort: connectOpts.toPort || '',
-    });
+    addEdgeValidated(item.id, step.id, 'suction', { toPort: connectOpts.toPort || '' });
   } else {
-    state.edges.push({
-      id: uid(), from: step.id, to: item.id, type: 'return', size: '',
-      label: `${step.label} \u2192 ${item.label}`,
-      active: false, blocked: false,
-      fromPort: connectOpts.fromPort || '', toPort: '',
-    });
+    addEdgeValidated(step.id, item.id, 'return', { fromPort: connectOpts.fromPort || '' });
   }
   _flowsRerenderAll();
 }
@@ -7849,6 +7987,129 @@ renderFlows = function renderFlowsWithSpill() {
   `;
   host.insertBefore(panel, host.firstChild);
 };
+
+// ==================================================================
+// =============== AIR SYSTEM CARDS (blower in Flows) ===============
+// ==================================================================
+// A blower discharges AIR (not water) into spa jets/bubblers for venturi
+// action. Air lines (edge.type === 'air') are deliberately excluded from the
+// pump suction/return trees — weaving them in would muddy the water-flow
+// reading. Instead we render each blower as its own compact "Air System" card
+// at the bottom of the Flows tab: Blower → (air line) → the jets/bubblers it
+// reaches. This is the Poolside-style "what feeds what" view a tech expects,
+// and it fixes the long-standing bug where blowers + air branches simply never
+// appeared on the Flows tab.
+
+// BFS over air edges from a start node; returns the set of reachable item ids.
+function _airReachableFrom(startId) {
+  const visited = new Set([startId]);
+  const queue = [startId];
+  while (queue.length) {
+    const id = queue.shift();
+    for (const e of state.edges) {
+      if (e.type !== 'air') continue;
+      let other = null;
+      if (e.from === id) other = e.to;
+      else if (e.to === id) other = e.from;
+      if (!other || visited.has(other)) continue;
+      visited.add(other);
+      queue.push(other);
+    }
+  }
+  return visited;
+}
+
+// Render one small air pill (blower / jet / bubbler / pass-through).
+function _psRenderAirPill(item) {
+  const icon = (typeof iconMarkup === 'function') ? iconMarkup(item.type) : '';
+  const label = _psPillLabel(item);
+  return `<div class="tree-pill air-pill">
+      <span class="pill-icon">${icon}</span>
+      <span class="pill-label">${escapeHtml(label)}</span>
+    </div>`;
+}
+
+// Build + render an Air System card for a single blower.
+function _psRenderAirCard(blower) {
+  const reach = _airReachableFrom(blower.id);
+  // Air sinks (jets/bubblers) the blower actually reaches over air lines.
+  const sinks = state.items.filter(i =>
+    i.id !== blower.id && AIR_SINKS.has(i.type) && reach.has(i.id)
+  );
+  // Any other air-line endpoints between blower and sinks (e.g. an air tee).
+  const sinkIds = new Set(sinks.map(s => s.id));
+  let sinksHtml;
+  if (!sinks.length) {
+    sinksHtml = `<div class="tree-empty air-empty">No air line to any jet yet — run an air pipe from this blower to the spa jets.</div>`;
+  } else if (sinks.length === 1) {
+    sinksHtml = `<div class="tree-arrow-v"></div>${_psRenderAirPill(sinks[0])}`;
+  } else {
+    sinksHtml = `
+      <div class="tree-arrow-v"></div>
+      <div class="tree-fork tree-fork-down">
+        <div class="tree-fork-line"></div>
+        <div class="tree-fork-cols">
+          ${sinks.map(s => `
+            <div class="tree-fork-col">
+              <div class="tree-fork-stem"></div>
+              ${_psRenderAirPill(s)}
+            </div>`).join('')}
+        </div>
+      </div>`;
+  }
+  const count = sinks.length;
+  const sub = count ? `Air to ${count} jet${count === 1 ? '' : 's'}` : 'Not connected';
+  return `
+    <div class="flow-card pump-card air-card" data-air-id="${blower.id}">
+      <div class="flow-card-head">
+        <div class="flow-card-title">${escapeHtml(blower.label || 'Blower')} — Air System</div>
+        <div class="flow-card-actions"><span class="air-card-sub">${sub}</span></div>
+      </div>
+      <div class="pump-tree">
+        ${_psRenderAirPill(blower)}
+        ${sinksHtml}
+      </div>
+    </div>`;
+}
+
+// Final renderFlows wrapper: after water (pump) cards + spillover panel are
+// drawn, append one Air System card per blower so air branches are visible.
+const _renderFlowsBeforeAir = renderFlows;
+renderFlows = function renderFlowsWithAir() {
+  _renderFlowsBeforeAir();
+  const host = $('flowsList');
+  if (!host) return;
+  const blowers = state.items.filter(i => i.type === 'blower');
+  if (!blowers.length) return;
+  const airHtml = blowers.map(_psRenderAirCard).join('');
+  host.insertAdjacentHTML('beforeend', airHtml);
+};
+
+// Style the air cards.
+(function injectAirCss() {
+  const css = `
+    .air-card { border-left:3px solid var(--pipe-air, #f59e0b); }
+    .air-card .air-card-sub {
+      font-size:12px; font-weight:600; color:var(--pipe-air, #f59e0b);
+    }
+    .air-card .air-pill {
+      border-color:var(--pipe-air, #f59e0b);
+      background:rgba(245,158,11,0.07);
+    }
+    .air-card .air-pill .pill-icon { color:var(--pipe-air, #f59e0b); }
+    .air-card .air-empty {
+      font-size:12px; color:var(--muted); padding:8px 4px;
+    }
+    .air-card .tree-arrow-v, .air-card .tree-fork-line,
+    .air-card .tree-fork-stem { background:var(--pipe-air, #f59e0b); opacity:.55; }
+    .air-card .tree-arrow-v::after {
+      border-color:var(--pipe-air, #f59e0b);
+    }
+  `;
+  const style = document.createElement('style');
+  style.textContent = css;
+  document.head.appendChild(style);
+})();
 
 // Style the new pieces.
 (function injectSpilloverCss() {

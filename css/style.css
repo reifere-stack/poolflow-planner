@@ -39,6 +39,7 @@
   --pipe-feature:#7c4dff;   /* purple */
   --pipe-gas:#e0a800;       /* yellow */
   --pipe-drain:#3a4a5c;     /* gray */
+  /* --pipe-air and --pipe-spillover are defined inline in index.html (theme). */
 
   --radius-sm:.375rem; --radius-md:.5rem; --radius-lg:.75rem; --radius-full:9999px;
   --shadow-md:0 6px 20px rgba(0,0,0,.35);
