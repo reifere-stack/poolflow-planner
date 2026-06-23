@@ -2960,32 +2960,81 @@ sheetTabs.querySelectorAll('button').forEach(btn => {
   });
 });
 
-// drag-handle to toggle sheet states
+// ----- Swipe gestures on the sheet header -----
+// A downward swipe should ALWAYS take you home: leave the Flows page (if on it),
+// collapse the sheet to its resting tab-bar position, and show the Diagram. The
+// grab zone covers the handle AND the tab row so it's an easy target on iPhone
+// (the old 5px handle was nearly impossible to hit). Horizontal swipes on the
+// tab row still scroll the tabs, and taps still switch tabs.
+function goHomeDiagram() {
+  if (typeof setPage === 'function') setPage('diagram');
+  // Resting position: sheet pulled down so only the handle + tab bar peek up.
+  closeSheet();
+}
+
 let sheetDragStart = null;
+let sheetDragAxis = null; // 'v' once we commit to a vertical drag
 const sheetHandle = $('sheetHandle');
-sheetHandle.addEventListener('pointerdown', (e) => {
-  sheetDragStart = { y: e.clientY, ts: Date.now() };
-  sheetHandle.setPointerCapture(e.pointerId);
-});
-sheetHandle.addEventListener('pointermove', (e) => {
+const sheetTabsEl = $('sheetTabs');
+
+function sheetDragDown(e, lockAxis) {
+  sheetDragStart = { x: e.clientX, y: e.clientY, ts: Date.now(), pid: e.pointerId, el: e.currentTarget };
+  // On the bare handle we know it's a drag immediately; on the tab row we wait
+  // to see if the motion is mostly vertical before hijacking it. NOTE: we do
+  // NOT capture the pointer here — capturing on pointerdown would swallow the
+  // child tab's click event and break tab switching. We only capture once a
+  // vertical drag is actually committed (in sheetDragMove).
+  sheetDragAxis = lockAxis ? 'v' : null;
+  if (lockAxis) { try { e.currentTarget.setPointerCapture(e.pointerId); } catch (_) {} }
+}
+function sheetDragMove(e) {
   if (!sheetDragStart) return;
   const dy = e.clientY - sheetDragStart.y;
-  if (Math.abs(dy) > 10) {
+  const dx = e.clientX - sheetDragStart.x;
+  if (sheetDragAxis === null) {
+    if (Math.abs(dy) < 8 && Math.abs(dx) < 8) return; // not enough movement yet
+    // Commit to vertical only if it clearly dominates; otherwise let the tab
+    // row scroll horizontally as normal.
+    if (Math.abs(dy) > Math.abs(dx) * 1.2) {
+      sheetDragAxis = 'v';
+      try { sheetDragStart.el.setPointerCapture(sheetDragStart.pid); } catch (_) {}
+    } else { sheetDragStart = null; return; }
+  }
+  if (sheetDragAxis !== 'v') return;
+  if (Math.abs(dy) > 6) {
     sheet.style.transition = 'none';
     sheet.style.transform = `translateY(calc(${dy}px + (var(--current-y, 0px))))`;
   }
-});
-sheetHandle.addEventListener('pointerup', (e) => {
+}
+function sheetDragUp(e) {
   if (!sheetDragStart) return;
   const dy = e.clientY - sheetDragStart.y;
+  const committed = sheetDragAxis === 'v';
+  sheetDragStart = null;
+  sheetDragAxis = null;
   sheet.style.transition = '';
   sheet.style.transform = '';
+  if (!committed) return;
   if (dy < -40) openSheet();
-  else if (dy > 60) closeSheet();
+  else if (dy > 60) goHomeDiagram();           // swipe down -> Diagram, resting sheet
   else if (sheet.classList.contains('open')) midSheet();
   else openSheet();
-  sheetDragStart = null;
-});
+}
+
+// Handle bar: any drag is a sheet gesture.
+sheetHandle.addEventListener('pointerdown', (e) => sheetDragDown(e, true));
+sheetHandle.addEventListener('pointermove', sheetDragMove);
+sheetHandle.addEventListener('pointerup', sheetDragUp);
+sheetHandle.addEventListener('pointercancel', sheetDragUp);
+
+// Tab row: only a clearly-vertical drag becomes a sheet gesture; horizontal
+// stays a normal scroll and a tap (no movement) still selects a tab.
+if (sheetTabsEl) {
+  sheetTabsEl.addEventListener('pointerdown', (e) => sheetDragDown(e, false));
+  sheetTabsEl.addEventListener('pointermove', sheetDragMove);
+  sheetTabsEl.addEventListener('pointerup', sheetDragUp);
+  sheetTabsEl.addEventListener('pointercancel', sheetDragUp);
+}
 
 function renderSheet() {
   if (activeTab === 'parts')      sheetBody.innerHTML = renderParts();
@@ -4770,6 +4819,33 @@ document.querySelectorAll('#pageTabs button').forEach(btn => {
     setPage(page);
   });
 });
+
+// Pull-down-to-go-back on the Flows page. On Flows the bottom sheet is hidden,
+// so the sheet-header swipe can't reach it; this lets a downward pull (while
+// already scrolled to the top) drop you back onto the Diagram, matching the
+// swipe-down-goes-home behavior everywhere else.
+(function () {
+  const flowsPage = $('flowsPage');
+  if (!flowsPage) return;
+  let pullStart = null;
+  flowsPage.addEventListener('pointerdown', (e) => {
+    pullStart = (flowsPage.scrollTop <= 0) ? { x: e.clientX, y: e.clientY } : null;
+  });
+  flowsPage.addEventListener('pointermove', (e) => {
+    if (!pullStart) return;
+    const dy = e.clientY - pullStart.y;
+    const dx = e.clientX - pullStart.x;
+    // Abandon if the content started scrolling or the motion turned horizontal.
+    if (flowsPage.scrollTop > 0 || Math.abs(dx) > Math.abs(dy)) pullStart = null;
+  });
+  flowsPage.addEventListener('pointerup', (e) => {
+    if (!pullStart) return;
+    const dy = e.clientY - pullStart.y;
+    pullStart = null;
+    if (dy > 70 && flowsPage.scrollTop <= 0) setPage('diagram');
+  });
+  flowsPage.addEventListener('pointercancel', () => { pullStart = null; });
+})();
 
 const flowsListEl = $('flowsList');
 if (flowsListEl) {
